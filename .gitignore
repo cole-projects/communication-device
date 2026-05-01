@@ -1,0 +1,28 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Tanya's vault — stays on Railway persistent volume, not in repo
+../tanya_brain/
+
+# Usage logs and runtime files
+logs/
+*.pid
+*.sqlite
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
