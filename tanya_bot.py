@@ -93,15 +93,20 @@ OPENER_INTRO = (
     "Hi, I'm Tanya. I've spent years helping people work through what's on their mind, "
     "and I'm here for you too. Everything here is built with my heart, so you always "
     "have someone to come to whenever you need it, 24/7.\n\n"
-    "Your privacy matters deeply to me. Conversations may be privately reviewed only "
-    "when necessary by me or a trusted technical team member to maintain quality, "
-    "functionality, and improve the TanyaTalk experience. They are not casually read or shared.\n\n"
+    "Your privacy matters deeply to me. All conversations are encrypted for your security. "
+    "They may be privately reviewed only when necessary by me or a trusted technical team member "
+    "to maintain quality, functionality, and improve the tanyatalk experience. "
+    "They are not casually read or shared. So by continuing, you acknowledge and agree to these terms.\n\n"
     "TanyaTalk supports reflection, clarity, and growth, but it is not medical, legal, "
     "financial or emergency advice. Use of TanyaTalk is at your own discretion, and you "
-    "are solely responsible for any decisions or actions you take based on her guidance.\n\n"
+    "are solely responsible for any decisions or actions you take based on her guidance. "
+    "By sending your first message, you are confirming your agreement to our terms.\n\n"
     "When you're ready, the more you share with me, the deeper we can go together. "
     "You don't have to have everything figured out, just start wherever you are."
 )
+
+# Brief pause between separate new-client opener bubbles (after typing delay).
+NEW_CLIENT_OPENER_BEAT_SEC = 1.0
 
 FREE_TRIAL_VOICE_SCRIPT = (
     "This is where your free time with me wraps. I hope you felt something real in it. "
@@ -1204,6 +1209,8 @@ async def update_client_profile(client_name: str, session_num: int, history: lis
 
 **Session Framework Routing:** Under ## Session Framework Routing, list wikilinked frameworks from the Wound-to-Framework Map below that match the client's primary and secondary wounds (copy the framework links from the map rows). Cross-reference ## Frameworks Used so routing leans toward what is still relevant, not only what was already heavily used.
 
+**Vault integrity (non-negotiable):** Only use wikilinks to frameworks that appear verbatim in the Wound-to-Framework Map below. Never invent a framework name or wikilink that is not in that map. If a concept is relevant but has no entry in the map, describe it in plain text — do not create a link for it.
+
 **After each session:** If the wound becomes clearer or a secondary wound surfaces, update both ## Core Wound and ## Session Framework Routing accordingly.
 
 **First session / new profile:** Always attempt to name the core wound (best guess is OK if refined later). Do not leave Primary wound blank if the transcript gives enough signal for a reasonable call. If you cannot justify any wound, write "Unclear — needs exploration" for Primary only.
@@ -1387,16 +1394,21 @@ This is a returning client only. Never imply a first meeting. Return only the gr
         return f"Hey {client_name}, good to have you back. What's on your mind today?"
 
 
-async def generate_new_client_closing_line(first_message: str) -> str:
-    system = """You are writing one single sentence for Tanya, a life coach, to close a voice note to a new client.
+async def generate_new_client_opener_bridge(first_message: str) -> str:
+    """Short lead-in before OPENER_INTRO for every new client — same two-message flow for all first lines."""
+    system = """You are Tanya, a life coach, on Telegram. A brand-new client just sent their first message (below).
 
-The sentence should say "tell me more" in a way that naturally references what the client said in their first message. It should feel warm and inviting, not clinical or over-coached.
+Write a SHORT opening (1–2 sentences max) they will see immediately BEFORE her fixed welcome text. That welcome always starts with "Hi, I'm Tanya" and then covers privacy, terms, and how she works — you must NOT quote or repeat any of that welcome.
+
+If they shared something concrete (a worry, a person, a situation, something they want help with), respond briefly and warmly in plain language — the vibe of "yes, that's absolutely something we can talk about" — without coaching, solving, or asking a deep question yet.
+If they only said hi/hello or something minimal, give a brief warm line (e.g. glad they reached out). Do not invent details they didn't mention.
 
 Rules:
-- One sentence only
+- 1–2 sentences only
 - No em dashes
 - Do not start with "I"
-- Do not add anything else"""
+- No privacy, terms, legal, or encryption talk
+- Return only this opening, nothing else"""
 
     try:
         response = await claude.messages.create(
@@ -1407,13 +1419,84 @@ Rules:
         )
         return response.content[0].text.strip().replace("\u2014", ",").replace("\u2013", ",")
     except Exception as e:
-        logger.error("New client closing line generation failed: %s", e)
-        return "What would you like to share next?"
+        logger.error("New client opener bridge failed: %s", e)
+        return "Thanks for being here."
 
 
-async def build_new_client_opener_script(first_message: str) -> str:
-    closing_line = await generate_new_client_closing_line(first_message)
-    return f"{OPENER_ACKNOWLEDGMENT} {OPENER_INTRO} {closing_line}"
+async def generate_new_client_opener_followup_line(first_message: str) -> str:
+    """Second bubble only: one simple line in the spirit of 'What's been on your mind lately?'."""
+    system = """Tanya already sent one message that included a short personal line and her full welcome. You write ONLY the second Telegram message from her: one very short line.
+
+It should read like a gentle check-in in the same spirit as "What's been on your mind lately?" — warm, simple, not clever.
+
+Rules:
+- One short sentence, at most 12 words
+- No em dashes
+- Do not start with "I"
+- Return only that line, nothing else"""
+
+    try:
+        response = await claude.messages.create(
+            model=CLAUDE_HAIKU_MODEL,
+            max_tokens=80,
+            system=system,
+            messages=[{"role": "user", "content": first_message}],
+        )
+        return response.content[0].text.strip().replace("\u2014", ",").replace("\u2013", ",")
+    except Exception as e:
+        logger.error("New client opener follow-up line failed: %s", e)
+        return "What's been on your mind lately?"
+
+
+async def prepare_new_client_opener_parts(user_text: str) -> tuple[str, str]:
+    """Bridge + second-line Haiku in parallel (always two outbound messages total from Tanya)."""
+    bridge, followup = await asyncio.gather(
+        generate_new_client_opener_bridge(user_text),
+        generate_new_client_opener_followup_line(user_text),
+    )
+    return bridge, followup
+
+
+async def deliver_new_client_opener_messages(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_name: str,
+    bridge: str,
+    followup: str,
+) -> str:
+    """Exactly two sends: (1) bridge + hard-coded OPENER_INTRO, (2) Haiku check-in line."""
+    main_combined = f"{bridge}\n\n{OPENER_INTRO}"
+
+    await safe_send_chat_action(context.bot, chat_id, "record_voice")
+    audio_main = await synthesize_voice(main_combined)
+    if audio_main:
+        await context.bot.send_voice(
+            chat_id=chat_id,
+            voice=io.BytesIO(audio_main),
+            filename="tanya.mp3",
+        )
+        logger.info("New client opener: combined main voice sent for %s", user_name)
+    else:
+        await update.message.reply_text(main_combined)
+        logger.info("New client opener: combined main text sent for %s (no TTS)", user_name)
+
+    await asyncio.sleep(NEW_CLIENT_OPENER_BEAT_SEC)
+
+    await safe_send_chat_action(context.bot, chat_id, "record_voice")
+    audio_follow = await synthesize_voice(followup)
+    if audio_follow:
+        await context.bot.send_voice(
+            chat_id=chat_id,
+            voice=io.BytesIO(audio_follow),
+            filename="tanya.mp3",
+        )
+        logger.info("New client opener: follow-up voice sent for %s", user_name)
+    else:
+        await update.message.reply_text(followup)
+        logger.info("New client opener: follow-up text sent for %s (no TTS)", user_name)
+
+    return f"{main_combined}\n\n{followup}"
 
 
 def _parse_stripe_confirmation_label(raw: str) -> str:
@@ -2224,47 +2307,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         user_name,
                     )
 
-                if is_ret:
-                    opener_script = await generate_returning_greeting(
-                        user_name,
-                        session_profiles.get(chat_id, ""),
-                    )
-                    logger.info("Returning client greeting prepared for: %s", user_name)
-                else:
-                    opener_script = await build_new_client_opener_script(user_text)
-
-                elapsed_open = asyncio.get_event_loop().time() - session_turn_anchor_time
-                remaining_open = RESPONSE_DELAY_SECONDS - elapsed_open
-                if remaining_open > 0:
-                    await asyncio.sleep(remaining_open)
-
-                audio_bytes = await synthesize_voice(opener_script)
-                if audio_bytes:
-                    await context.bot.send_voice(
-                        chat_id=chat_id,
-                        voice=io.BytesIO(audio_bytes),
-                        filename="tanya.mp3",
-                    )
-                    if is_ret:
-                        logger.info("Returning client opener: voice note sent for %s", user_name)
-                    else:
-                        logger.info("New client opener: voice note sent for %s", user_name)
-                else:
-                    await update.message.reply_text(opener_script)
-                    if is_ret:
-                        logger.info(
-                            "Returning client opener: ElevenLabs failed, sent as text for %s",
-                            user_name,
-                        )
-                    else:
-                        logger.info(
-                            "New client opener: ElevenLabs failed, sent as text for %s",
-                            user_name,
-                        )
-
-                pending_first_message_opener.pop(chat_id, None)
-
                 if not is_ret:
+                    bridge, followup = await prepare_new_client_opener_parts(user_text)
+                    elapsed_since_anchor = (
+                        asyncio.get_event_loop().time() - session_turn_anchor_time
+                    )
+                    remaining_open = RESPONSE_DELAY_SECONDS - elapsed_since_anchor
+                    if remaining_open > 0:
+                        await asyncio.sleep(remaining_open)
+                    opener_script = await deliver_new_client_opener_messages(
+                        update, context, chat_id, user_name, bridge, followup
+                    )
+                    pending_first_message_opener.pop(chat_id, None)
                     conversations[chat_id].append({"role": "assistant", "content": opener_script})
                     if len(conversations[chat_id]) > MAX_HISTORY * 2:
                         conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2):]
@@ -2279,6 +2333,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         free_trial_user_msg_count[chat_id] = n_ft
                     return
 
+                opener_script = await generate_returning_greeting(
+                    user_name,
+                    session_profiles.get(chat_id, ""),
+                )
+                logger.info("Returning client greeting prepared for: %s", user_name)
+
+                elapsed_open = asyncio.get_event_loop().time() - session_turn_anchor_time
+                remaining_open = RESPONSE_DELAY_SECONDS - elapsed_open
+                if remaining_open > 0:
+                    await asyncio.sleep(remaining_open)
+
+                audio_bytes = await synthesize_voice(opener_script)
+                if audio_bytes:
+                    await context.bot.send_voice(
+                        chat_id=chat_id,
+                        voice=io.BytesIO(audio_bytes),
+                        filename="tanya.mp3",
+                    )
+                    logger.info("Returning client opener: voice note sent for %s", user_name)
+                else:
+                    await update.message.reply_text(opener_script)
+                    logger.info(
+                        "Returning client opener: ElevenLabs failed, sent as text for %s",
+                        user_name,
+                    )
+
+                pending_first_message_opener.pop(chat_id, None)
                 await asyncio.to_thread(append_tanya_message, session_files[chat_id], opener_script)
                 voice_opener_script = opener_script
 
