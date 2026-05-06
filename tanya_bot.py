@@ -6,6 +6,7 @@ import asyncio
 import logging
 import datetime
 import json
+import shutil
 import threading
 from datetime import timezone
 from pathlib import Path
@@ -93,10 +94,11 @@ OPENER_INTRO = (
     "Hi, I'm Tanya. I've spent years helping people work through what's on their mind, "
     "and I'm here for you too. Everything here is built with my heart, so you always "
     "have someone to come to whenever you need it, 24/7.\n\n"
-    "Your privacy matters deeply to me. All conversations are encrypted for your security. "
+    "Your privacy matters deeply to me. All conversations are stored securely and encrypted. "
     "They may be privately reviewed only when necessary by me or a trusted technical team member "
     "to maintain quality, functionality, and improve the tanyatalk experience. "
-    "They are not casually read or shared. So by continuing, you acknowledge and agree to these terms.\n\n"
+    "They are not casually read or shared. You can request permanent deletion of all your data "
+    "at any time by sending 'delete my data'. So by continuing, you acknowledge and agree to these terms.\n\n"
     "TanyaTalk supports reflection, clarity, and growth, but it is not medical, legal, "
     "financial or emergency advice. Use of TanyaTalk is at your own discretion, and you "
     "are solely responsible for any decisions or actions you take based on her guidance. "
@@ -137,6 +139,30 @@ REFERRAL_NUDGE_MARKER = "<<<REFERRAL_NUDGE>>>"
 
 # Debounce window: rapid messages arriving within this window are merged into one Claude call.
 DEBOUNCE_SECONDS = 5.0
+
+# Right-to-deletion flow.
+DELETE_TRIGGERS: frozenset[str] = frozenset({
+    "delete my data",
+    "delete my information",
+    "delete my account",
+    "erase my data",
+    "remove my data",
+    "forget me",
+    "delete everything",
+})
+DELETE_CONFIRMATION_PROMPT = (
+    "I want to make sure I get this right. Deleting your data is permanent — your session "
+    "history, profile, and everything we've built together will be gone and can't be recovered. "
+    "If you're sure, reply 'yes, delete everything'. If you'd like to keep going instead, "
+    "just say so or send any other message."
+)
+DELETE_CONFIRMED_MESSAGE = (
+    "Done. All of your data has been permanently deleted. Your conversations, profile, and "
+    "history are gone. If you ever want to start fresh with me, I'll be here. Take care of yourself."
+)
+DELETE_CANCELLED_MESSAGE = (
+    "No worries — nothing was deleted. I'm still here whenever you need me."
+)
 
 # Monthly message cap for paid subscribers ($20/month = 250 messages).
 MONTHLY_MESSAGE_CAP = 250
@@ -481,6 +507,7 @@ _cached_static_prompts: dict[int, str] = {}  # static prompt per chat for warmin
 _pending_messages: dict[int, list[str]] = {}  # debounce buffer: messages waiting to be combined
 _pending_updates: dict[int, object] = {}       # latest Telegram Update per chat (for replying)
 _debounce_tasks: dict[int, asyncio.Task] = {}  # active debounce timer per chat
+awaiting_delete_confirmation: dict[int, bool] = {}  # True when client has triggered delete flow
 
 MAX_HISTORY = 40
 
@@ -1781,6 +1808,68 @@ async def end_session(chat_id: int):
     last_activity.pop(chat_id, None)
 
 
+async def delete_client_data(chat_id: int) -> None:
+    """Anonymize all data for a client who requested deletion.
+
+    The session folder is renamed to an unguessable UUID-based name so the bot
+    can never find it again (treating the user as new on return), while the raw
+    files remain on disk for any audit/legal need. All other state tied to
+    chat_id is also cleared.
+    """
+    import uuid
+
+    client_name = client_names.get(chat_id, "")
+
+    # End any live session cleanly first (writes transcript, clears state).
+    if chat_id in conversations:
+        await end_session(chat_id)
+
+    # Rename session folder to unguessable name so the bot can never read it again.
+    if client_name:
+        client_dir = Path(VAULT_PATH) / "02-Client-Sessions" / client_name
+        if client_dir.exists():
+            deleted_name = f"_deleted_{uuid.uuid4().hex}"
+            deleted_dir = client_dir.parent / deleted_name
+            await asyncio.to_thread(client_dir.rename, deleted_dir)
+            logger.info("Anonymized session folder for chat_id=%d → %s", chat_id, deleted_name)
+
+    # Remove monthly usage entry so the user starts completely fresh on return.
+    def _scrub_monthly_usage():
+        with _MONTHLY_USAGE_LOCK:
+            usage = _load_monthly_usage_unlocked()
+            key = str(chat_id)
+            if key in usage:
+                del usage[key]
+                MONTHLY_USAGE_PATH.write_text(json.dumps(usage, indent=2))
+
+    await asyncio.to_thread(_scrub_monthly_usage)
+
+    # Cancel any pending follow-up jobs for this client.
+    try:
+        tanya_followup.cancel_all_followup_jobs_for_chat(chat_id)
+    except Exception:
+        pass
+
+    # Clear all remaining in-memory state.
+    for state_dict in (
+        client_names,
+        paid_tanyatalk_access,
+        mesh_tanyatalk_included,
+        awaiting_stripe_confirmation,
+        awaiting_delete_confirmation,
+        pending_first_message_opener,
+        referral_nudge_used_this_session,
+        cache_warm_tasks,
+        _cached_static_prompts,
+        _pending_messages,
+        _pending_updates,
+        _debounce_tasks,
+    ):
+        state_dict.pop(chat_id, None)
+
+    logger.info("Deletion complete for chat_id=%d", chat_id)
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -2563,6 +2652,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if any(normalized == a or normalized.startswith(a) for a in affirmatives):
             await perform_session_close(update, context)
             return
+
+    # Delete confirmation: client already triggered the delete flow, waiting on yes/no.
+    if awaiting_delete_confirmation.get(chat_id):
+        normalized_del = user_text.strip().lower().rstrip("!.? ")
+        if normalized_del in ("yes, delete everything", "yes delete everything",
+                              "yes, delete", "yes delete", "yes"):
+            awaiting_delete_confirmation.pop(chat_id, None)
+            await delete_client_data(chat_id)
+            await update.message.reply_text(DELETE_CONFIRMED_MESSAGE)
+        else:
+            awaiting_delete_confirmation.pop(chat_id, None)
+            await update.message.reply_text(DELETE_CANCELLED_MESSAGE)
+        return
+
+    # Delete trigger: client asks to erase their data — enter confirmation flow.
+    user_text_lower = user_text.strip().lower()
+    if any(trigger in user_text_lower for trigger in DELETE_TRIGGERS):
+        awaiting_delete_confirmation[chat_id] = True
+        await update.message.reply_text(DELETE_CONFIRMATION_PROMPT)
+        return
 
     # Session end: whole message matches SESSION_END_NORMALIZED; not model-decided.
     if is_session_end_message(user_text):
