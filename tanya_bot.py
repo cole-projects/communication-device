@@ -135,6 +135,33 @@ REFERRAL_NUDGE_FIRST_ELIGIBLE_SESSION = 4
 REFERRAL_NUDGE_MIN_SESSIONS_BETWEEN = 4
 REFERRAL_NUDGE_MARKER = "<<<REFERRAL_NUDGE>>>"
 
+# Debounce window: rapid messages arriving within this window are merged into one Claude call.
+DEBOUNCE_SECONDS = 5.0
+
+# Monthly message cap for paid subscribers ($20/month = 250 messages).
+MONTHLY_MESSAGE_CAP = 250
+MONTHLY_CAP_WARNING_AT = 230
+MONTHLY_CAP_WARNING_MESSAGE = (
+    "Just so you know, we're getting close to your 250 messages for this month. "
+    "A little room left, so let's make it count."
+)
+MONTHLY_CAP_BLOCK_MESSAGE = (
+    "You've reached your 250 messages for this month. "
+    "I'll be right here when your next month starts."
+)
+
+# Per-session message cap — prevents marathon sessions from eating the monthly budget.
+# 60 is roughly 3x a typical coaching session; hard to reach naturally.
+SESSION_MESSAGE_CAP = 60
+SESSION_CAP_WARNING_AT = 50
+SESSION_CAP_WARNING_MESSAGE = (
+    "We've been going deep today. Just so you know, we have a little room left in this session."
+)
+SESSION_CAP_BLOCK_MESSAGE = (
+    "We've covered a lot of ground together today. I'm saving our session now. "
+    "Come back when you're ready and we'll pick up from here."
+)
+
 # Stay well under Anthropic's ~5 min prompt-cache TTL if a ping is skipped.
 CACHE_WARM_INTERVAL_SEC = 120
 
@@ -184,6 +211,8 @@ REFERRAL_STATE_PATH = _BOT_DIR / "logs" / "referral_nudges.json"
 
 _USAGE_CSV_LOCK = threading.Lock()
 _REFERRAL_STATE_LOCK = threading.Lock()
+_MONTHLY_USAGE_LOCK = threading.Lock()
+MONTHLY_USAGE_PATH = _BOT_DIR / "logs" / "monthly_usage.json"
 USAGE_CSV_FIELDNAMES = [
     "log_id",
     "timestamp",
@@ -397,6 +426,37 @@ def record_coaching_usage(chat_id: int, username: str, response) -> None:
         logger.error("Could not write %s: %s", USAGE_CSV_PATH, e)
 
 
+def _monthly_key() -> str:
+    return datetime.date.today().strftime("%Y-%m")
+
+
+def _load_monthly_usage_unlocked() -> dict:
+    if not MONTHLY_USAGE_PATH.exists():
+        return {}
+    try:
+        return json.loads(MONTHLY_USAGE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def get_monthly_message_count(chat_id: int) -> int:
+    with _MONTHLY_USAGE_LOCK:
+        return _load_monthly_usage_unlocked().get(str(chat_id), {}).get(_monthly_key(), 0)
+
+
+def increment_monthly_message_count(chat_id: int) -> int:
+    """Increment this month's count for chat_id and return the new total."""
+    key = _monthly_key()
+    with _MONTHLY_USAGE_LOCK:
+        data = _load_monthly_usage_unlocked()
+        user_data = data.setdefault(str(chat_id), {})
+        count = user_data.get(key, 0) + 1
+        user_data[key] = count
+        MONTHLY_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MONTHLY_USAGE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return count
+
+
 conversations: dict[int, list[dict]] = {}
 voice_enabled: dict[int, bool] = {}
 client_names: dict[int, str] = {}
@@ -418,6 +478,9 @@ mesh_tanyatalk_included: dict[int, bool] = {}  # True when client is in MESH wit
 referral_nudge_used_this_session: dict[int, bool] = {}  # at most one optional referral line per session
 cache_warm_tasks: dict[int, asyncio.Task] = {}
 _cached_static_prompts: dict[int, str] = {}  # static prompt per chat for warming pings
+_pending_messages: dict[int, list[str]] = {}  # debounce buffer: messages waiting to be combined
+_pending_updates: dict[int, object] = {}       # latest Telegram Update per chat (for replying)
+_debounce_tasks: dict[int, asyncio.Task] = {}  # active debounce timer per chat
 
 MAX_HISTORY = 40
 
@@ -434,6 +497,15 @@ SESSION_END_NORMALIZED = frozenset(
         "lets end session",
     }
 )
+
+
+def sanitize_name_for_path(name: str) -> str:
+    """Remove path-traversal characters from a Telegram first_name before using it in file paths."""
+    cleaned = re.sub(r'[/\\\x00]', '', name)    # strip directory separators and null bytes
+    cleaned = re.sub(r'\.{2,}', '.', cleaned)   # collapse .. to prevent traversal
+    cleaned = cleaned.strip('. ')               # remove leading/trailing dots and spaces
+    cleaned = cleaned[:60]                      # cap length
+    return cleaned or "Client"
 
 
 def normalize_session_end_candidate(text: str) -> str:
@@ -1534,10 +1606,9 @@ Reply with exactly one word on the first line: affirmative OR negative OR unclea
         await asyncio.to_thread(record_coaching_usage, chat_id, username, response)
         label = _parse_stripe_confirmation_label(response.content[0].text)
         logger.info(
-            "Stripe confirmation intent chat=%s label=%s preview=%s",
+            "Stripe confirmation intent chat=%s label=%s",
             chat_id,
             label,
-            (user_text[:80] + "…") if len(user_text) > 80 else user_text,
         )
         return label
     except Exception as e:
@@ -1678,7 +1749,7 @@ async def end_session(chat_id: int):
             transcript_lines.append(f"{role}: {msg['content']}")
         transcript = "\n".join(transcript_lines)
 
-        if session_path and len(history) >= MIN_EXCHANGES_FOR_FOLLOWUP:
+        if session_path and len(history) >= MIN_EXCHANGES_FOR_FOLLOWUP and has_tanyatalk_access(chat_id):
             ended_at = datetime.datetime.now(timezone.utc)
             await append_follow_up_extraction(
                 session_path, client_name, session_num, history, ended_at
@@ -1997,7 +2068,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This bot is private.")
         return
     chat_id = update.effective_chat.id
-    client_name = update.effective_user.first_name or "Client"
+    client_name = sanitize_name_for_path(update.effective_user.first_name or "Client")
     lock = await _get_chat_message_lock(chat_id)
     async with lock:
         if should_block_unpaid_after_free_trial(chat_id):
@@ -2084,9 +2155,9 @@ async def open_coaching_session_after_mini(
     lock = await _get_chat_message_lock(chat_id)
     async with lock:
         conversations[chat_id] = []
-        client_names[chat_id] = client_name
+        client_names[chat_id] = sanitize_name_for_path(client_name)
         last_activity[chat_id] = datetime.datetime.now()
-        await begin_session_with_opening(update, context, client_name)
+        await begin_session_with_opening(update, context, client_names[chat_id])
 
 
 async def handle_set_ratio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2138,80 +2209,21 @@ async def handle_voice_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(VOICE_REDIRECT_REPEAT)
 
 
-async def handle_unsupported_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-    chat_id = update.effective_chat.id
-    if should_block_unpaid_after_free_trial(chat_id):
-        await update.message.reply_text(POST_FREE_TRIAL_BLOCK_MESSAGE)
-        return
-    await update.message.reply_text(UNSUPPORTED_MESSAGE_REPLY)
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-
-    chat_id = update.effective_chat.id
-    user_text = update.message.text
-    if re.search(r'https?://\S+|www\.\S+', user_text, re.IGNORECASE):
-        await update.message.reply_text(LINK_RESPONSE)
-        return
-    user_name = update.effective_user.first_name or "Client"
-    client_names[chat_id] = user_name
-    last_activity[chat_id] = datetime.datetime.now()
-
-    if tanya_followup.on_user_message_cancel_fu2(chat_id):
-        tanya_followup.enter_mini_session_after_fu1(chat_id, None)
-    if tanya_followup.in_mini_session(chat_id):
-        lock = await _get_chat_message_lock(chat_id)
-        async with lock:
-            await tanya_followup.handle_mini_session_turn(update, context, user_text)
-        return
-
-    if awaiting_stripe_confirmation.get(chat_id):
-        lock = await _get_chat_message_lock(chat_id)
-        async with lock:
-            intent = await classify_stripe_confirmation_intent(chat_id, user_name, user_text)
-            if intent == "affirmative":
-                awaiting_stripe_confirmation.pop(chat_id, None)
-                if STRIPE_PAYMENT_LINK:
-                    await update.message.reply_text(
-                        "Here's your link, I'll be waiting for you on the "
-                        f"other side: {STRIPE_PAYMENT_LINK}"
-                    )
-                elif STRIPE_PAYMENT_LINK_PLACEHOLDER:
-                    await update.message.reply_text(
-                        "Live checkout is not wired up yet. Here is a neutral placeholder for now "
-                        f"(tap to preview, not a charge): {STRIPE_PAYMENT_LINK_PLACEHOLDER}"
-                    )
-                else:
-                    await update.message.reply_text(
-                        "The payment link isn't set up yet, but I'll be right "
-                        "here when it is."
-                    )
-            elif intent == "negative":
-                awaiting_stripe_confirmation.pop(chat_id, None)
-                await update.message.reply_text(FREE_TRIAL_STRIPE_DECLINED)
-            else:
-                await update.message.reply_text(STRIPE_CONFIRMATION_UNCLEAR_REPLY)
-        return
-
-    if awaiting_completion.get(chat_id):
-        awaiting_completion.pop(chat_id, None)
-        affirmatives = {"yes", "yeah", "yep", "yup", "i am",
-            "i'm complete", "i'm done", "i'm good", "completed",
-            "complete", "that's it", "sure", "absolutely", "yes i am",
-            "yes i'm complete"}
-        normalized = user_text.strip().lower().rstrip("!.?")
-        if any(normalized == a or normalized.startswith(a) for a in affirmatives):
-            await perform_session_close(update, context)
+async def _fire_coaching_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_name: str, user_text: str
+) -> None:
+    """Process one coaching turn. Called by the debounce timer with potentially combined user text."""
+    # Monthly cap (paid users only; free trial has its own 25-message hard stop)
+    if has_tanyatalk_access(chat_id) and chat_id not in _POST_TRIAL_BYPASS_CHAT_IDS:
+        count = get_monthly_message_count(chat_id)
+        if count >= MONTHLY_MESSAGE_CAP:
+            if count == MONTHLY_MESSAGE_CAP:
+                increment_monthly_message_count(chat_id)
+                await update.message.reply_text(MONTHLY_CAP_BLOCK_MESSAGE)
             return
-
-    # Session end: whole message matches SESSION_END_NORMALIZED (see is_session_end_message); not model-decided.
-    if is_session_end_message(user_text):
-        await perform_session_close(update, context)
-        return
+        new_count = increment_monthly_message_count(chat_id)
+        if new_count == MONTHLY_CAP_WARNING_AT:
+            await update.message.reply_text(MONTHLY_CAP_WARNING_MESSAGE)
 
     lock = await _get_chat_message_lock(chat_id)
     async with lock:
@@ -2220,7 +2232,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         session_turn_anchor_time = asyncio.get_event_loop().time()
-
         await safe_send_chat_action(context.bot, chat_id, "typing")
 
         voice_opener_script = ""
@@ -2242,6 +2253,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2):]
 
             reset_timeout(chat_id, context.bot)
+
+            # Per-session message cap
+            session_user_msgs = sum(1 for m in conversations[chat_id] if m["role"] == "user")
+            if session_user_msgs >= SESSION_MESSAGE_CAP:
+                await asyncio.to_thread(
+                    append_exchange, session_files[chat_id], user_name, user_text, SESSION_CAP_BLOCK_MESSAGE
+                )
+                await update.message.reply_text(SESSION_CAP_BLOCK_MESSAGE)
+                cancel_session_timeout(chat_id)
+                await end_session(chat_id)
+                return
+            if session_user_msgs == SESSION_CAP_WARNING_AT:
+                await update.message.reply_text(SESSION_CAP_WARNING_MESSAGE)
 
             prev_ft = free_trial_user_msg_count.get(chat_id, 0)
             n_ft = prev_ft + 1
@@ -2373,7 +2397,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _cached_static_prompts[chat_id] = static_prompt
             start_cache_warming(context.application, chat_id)
 
-            # Dynamic part: frameworks vary per message — never cached
             relevant_frameworks = select_frameworks_for_session(
                 session_profiles.get(chat_id, ""),
                 user_text,
@@ -2431,7 +2454,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 raw_reply = response.content[0].text
                 reply, referral_marked = strip_referral_nudge_marker(raw_reply)
-                reply = reply.replace("\u2014", ",").replace("\u2013", ",").replace(" - ", ", ")
+                reply = reply.replace("—", ",").replace("–", ",").replace(" - ", ", ")
                 await asyncio.to_thread(record_coaching_usage, chat_id, user_name, response)
                 if referral_marked:
                     referral_nudge_used_this_session[chat_id] = True
@@ -2469,6 +2492,106 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await typing_task
             except Exception:
                 pass
+
+
+async def handle_unsupported_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    if should_block_unpaid_after_free_trial(chat_id):
+        await update.message.reply_text(POST_FREE_TRIAL_BLOCK_MESSAGE)
+        return
+    await update.message.reply_text(UNSUPPORTED_MESSAGE_REPLY)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = update.message.text
+    if re.search(r'https?://\S+|www\.\S+', user_text, re.IGNORECASE):
+        await update.message.reply_text(LINK_RESPONSE)
+        return
+    user_name = sanitize_name_for_path(update.effective_user.first_name or "Client")
+    client_names[chat_id] = user_name
+    last_activity[chat_id] = datetime.datetime.now()
+
+    if tanya_followup.on_user_message_cancel_fu2(chat_id):
+        tanya_followup.enter_mini_session_after_fu1(chat_id, None)
+    if tanya_followup.in_mini_session(chat_id):
+        lock = await _get_chat_message_lock(chat_id)
+        async with lock:
+            await tanya_followup.handle_mini_session_turn(update, context, user_text)
+        return
+
+    if awaiting_stripe_confirmation.get(chat_id):
+        lock = await _get_chat_message_lock(chat_id)
+        async with lock:
+            intent = await classify_stripe_confirmation_intent(chat_id, user_name, user_text)
+            if intent == "affirmative":
+                awaiting_stripe_confirmation.pop(chat_id, None)
+                if STRIPE_PAYMENT_LINK:
+                    await update.message.reply_text(
+                        "Here's your link, I'll be waiting for you on the "
+                        f"other side: {STRIPE_PAYMENT_LINK}"
+                    )
+                elif STRIPE_PAYMENT_LINK_PLACEHOLDER:
+                    await update.message.reply_text(
+                        "Live checkout is not wired up yet. Here is a neutral placeholder for now "
+                        f"(tap to preview, not a charge): {STRIPE_PAYMENT_LINK_PLACEHOLDER}"
+                    )
+                else:
+                    await update.message.reply_text(
+                        "The payment link isn't set up yet, but I'll be right "
+                        "here when it is."
+                    )
+            elif intent == "negative":
+                awaiting_stripe_confirmation.pop(chat_id, None)
+                await update.message.reply_text(FREE_TRIAL_STRIPE_DECLINED)
+            else:
+                await update.message.reply_text(STRIPE_CONFIRMATION_UNCLEAR_REPLY)
+        return
+
+    if awaiting_completion.get(chat_id):
+        awaiting_completion.pop(chat_id, None)
+        affirmatives = {"yes", "yeah", "yep", "yup", "i am",
+            "i'm complete", "i'm done", "i'm good", "completed",
+            "complete", "that's it", "sure", "absolutely", "yes i am",
+            "yes i'm complete"}
+        normalized = user_text.strip().lower().rstrip("!.?")
+        if any(normalized == a or normalized.startswith(a) for a in affirmatives):
+            await perform_session_close(update, context)
+            return
+
+    # Session end: whole message matches SESSION_END_NORMALIZED; not model-decided.
+    if is_session_end_message(user_text):
+        await perform_session_close(update, context)
+        return
+
+    # Debounce: buffer this message and wait for more before firing to Claude.
+    # If another message arrives within DEBOUNCE_SECONDS, the timer resets and both
+    # messages are combined into a single Claude call.
+    _pending_messages.setdefault(chat_id, []).append(user_text)
+    _pending_updates[chat_id] = update
+
+    existing = _debounce_tasks.pop(chat_id, None)
+    if existing and not existing.done():
+        existing.cancel()
+
+    async def _fire() -> None:
+        try:
+            await asyncio.sleep(DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        _debounce_tasks.pop(chat_id, None)
+        msgs = _pending_messages.pop(chat_id, [])
+        upd = _pending_updates.pop(chat_id, update)
+        if msgs:
+            combined = "\n\n".join(msgs)
+            await _fire_coaching_message(upd, context, chat_id, user_name, combined)
+
+    _debounce_tasks[chat_id] = asyncio.ensure_future(_fire())
 
 
 # ---------------------------------------------------------------------------
