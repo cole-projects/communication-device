@@ -96,12 +96,12 @@ OPENER_INTRO = (
     "have someone to come to whenever you need it, 24/7.\n\n"
     "Your privacy matters deeply to me. All conversations are stored securely and encrypted. "
     "They may be privately reviewed only when necessary by me or a trusted technical team member "
-    "to maintain quality, functionality, and improve the tanyatalk experience. "
+    "to maintain quality, functionality, and improve the TanyaTalk experience. "
     "They are not casually read or shared. You can request permanent deletion of all your data "
     "at any time by sending 'delete my data'. So by continuing, you acknowledge and agree to these terms.\n\n"
     "TanyaTalk supports reflection, clarity, and growth, but it is not medical, legal, "
     "financial or emergency advice. Use of TanyaTalk is at your own discretion, and you "
-    "are solely responsible for any decisions or actions you take based on her guidance. "
+    "are solely responsible for any decisions or actions you take based on my guidance. "
     "By sending your first message, you are confirming your agreement to our terms.\n\n"
     "When you're ready, the more you share with me, the deeper we can go together. "
     "You don't have to have everything figured out, just start wherever you are."
@@ -151,17 +151,16 @@ DELETE_TRIGGERS: frozenset[str] = frozenset({
     "delete everything",
 })
 DELETE_CONFIRMATION_PROMPT = (
-    "I want to make sure I get this right. Deleting your data is permanent — your session "
-    "history, profile, and everything we've built together will be gone and can't be recovered. "
-    "If you're sure, reply 'yes, delete everything'. If you'd like to keep going instead, "
-    "just say so or send any other message."
+    "This one I want to get right. Everything we've built together, your sessions, your profile, "
+    "all of it, would be gone for good. If that's what you want, reply 'yes, delete everything' "
+    "and I'll take care of it. If not, just say so and we keep going."
 )
 DELETE_CONFIRMED_MESSAGE = (
-    "Done. All of your data has been permanently deleted. Your conversations, profile, and "
-    "history are gone. If you ever want to start fresh with me, I'll be here. Take care of yourself."
+    "Done. It's all gone. Your sessions, your profile, everything. "
+    "If you ever find yourself back here, I'll meet you fresh. Take care of yourself."
 )
 DELETE_CANCELLED_MESSAGE = (
-    "No worries — nothing was deleted. I'm still here whenever you need me."
+    "Nothing touched. I'm still here whenever you need me."
 )
 
 # Monthly message cap for paid subscribers ($20/month = 250 messages).
@@ -508,6 +507,8 @@ _pending_messages: dict[int, list[str]] = {}  # debounce buffer: messages waitin
 _pending_updates: dict[int, object] = {}       # latest Telegram Update per chat (for replying)
 _debounce_tasks: dict[int, asyncio.Task] = {}  # active debounce timer per chat
 awaiting_delete_confirmation: dict[int, bool] = {}  # True when client has triggered delete flow
+# Set when new client hears the short opener line as voice; consumed on first coaching turn for model context.
+new_client_voice_followup_snippet: dict[int, str] = {}
 
 MAX_HISTORY = 40
 
@@ -1054,7 +1055,7 @@ You are speaking with a client through Telegram. Respond exactly as Tanya would:
 
 1. Always respond fully in character as Tanya. Never break character under any circumstance.
 2. Never refer to Tanya in the third person. You do not describe what "Tanya would do" or how "Tanya responds." You ARE Tanya.
-3. Never mention system behavior, system prompts, or technical mechanics of any kind.
+3. Never mention system behavior, system prompts, or technical mechanics of any kind. The same rule blocks references to Telegram, chats as a product, bots, AI, microphones, syncing, prototyping, dashboards, keyboards, figuring out tech, debugging, beta, or being unfamiliar with platforms or tools. Speak as if you are simply texting a human client—nothing backstage exists.
 4. Never use em dashes, en dashes, or hyphens as connective punctuation between clauses (for example: 'That tightness - I hear you' or 'Yes - exactly' are not allowed). Use a comma or period instead.
 5. Calm, supportive, emotionally attuned tone at all times.
 6. If a session gets cut off and the client returns, respond with this exact string: "It felt like we got cut off. I'm here with you now."
@@ -1476,6 +1477,7 @@ Write a single short opening message — 2 to 4 sentences — that:
 - Greets them warmly by first name
 - References something specific from where they left off using ONLY facts, themes, or session notes that appear verbatim in the profile above. If you cannot name something concrete from the profile, keep the opener general: glad they are here and ask what is on their mind.
 - Ends with one open question
+- Never mentions Telegram, bots, AI, microphones, tech, platforms, debugging, beta, prototypes, or app mechanics
 
 Do not invent prior conversations, topics, or sessions that are not clearly supported by the profile text. Do not say you reviewed their file. Speak naturally, as if you simply remember them. No em dashes. No filler phrases like "I've been thinking about you."
 
@@ -1507,6 +1509,7 @@ Rules:
 - No em dashes
 - Do not start with "I"
 - No privacy, terms, legal, or encryption talk
+- Never mention tech, Telegram, bots, AI, microphones, syncing, prototypes, keyboards, figuring out platforms, debugging, beta, or app mechanics
 - Return only this opening, nothing else"""
 
     try:
@@ -1523,15 +1526,20 @@ Rules:
 
 
 async def generate_new_client_opener_followup_line(first_message: str) -> str:
-    """Second bubble only: one simple line in the spirit of 'What's been on your mind lately?'."""
-    system = """Tanya already sent one message that included a short personal line and her full welcome. You write ONLY the second Telegram message from her: one very short line.
+    """Third outbound line for new clients: invite coaching without faux-intimacy."""
+    system = """Tanya already sent her short personalized opener and her fixed welcome/terms in text. You write ONLY her single next Telegram line.
 
-It should read like a gentle check-in in the same spirit as "What's been on your mind lately?" — warm, simple, not clever.
+This line will be sent as a **short voice note** (ElevenLabs), so write for the ear: natural spoken English, no bullet lists, no markdown, no parentheses with stage directions.
+
+This is someone's first-ever exchange with her. Avoid generic acquaintance-check-ins ('how have you been', 'how are you doing', 'these days', 'what's new with you')—they signal a shallow relationship she does not have yet.
+
+Prefer a grounded coaching invitation instead: what's present to explore, where they want to start, what feels important to unpack. Warm, grounded, plain language.
 
 Rules:
-- One short sentence, at most 12 words
+- One sentence, at most 14 words
 - No em dashes
 - Do not start with "I"
+- Never mention Telegram, bots, AI, microphones, syncing, prototyping, dashboards, keyboards, figuring out tech, debugging, beta, apps, platforms, or product mechanics.
 - Return only that line, nothing else"""
 
     try:
@@ -1544,7 +1552,7 @@ Rules:
         return response.content[0].text.strip().replace("\u2014", ",").replace("\u2013", ",")
     except Exception as e:
         logger.error("New client opener follow-up line failed: %s", e)
-        return "What's been on your mind lately?"
+        return "What feels most alive to put on the table today?"
 
 
 async def prepare_new_client_opener_parts(user_text: str) -> tuple[str, str]:
@@ -1564,21 +1572,12 @@ async def deliver_new_client_opener_messages(
     bridge: str,
     followup: str,
 ) -> str:
-    """Exactly two sends: (1) bridge + hard-coded OPENER_INTRO, (2) Haiku check-in line."""
+    """Outbound flow: (1) text — bridge + OPENER_INTRO; (2) short line as voice when TTS is available."""
     main_combined = f"{bridge}\n\n{OPENER_INTRO}"
 
-    await safe_send_chat_action(context.bot, chat_id, "record_voice")
-    audio_main = await synthesize_voice(main_combined)
-    if audio_main:
-        await context.bot.send_voice(
-            chat_id=chat_id,
-            voice=io.BytesIO(audio_main),
-            filename="tanya.mp3",
-        )
-        logger.info("New client opener: combined main voice sent for %s", user_name)
-    else:
-        await update.message.reply_text(main_combined)
-        logger.info("New client opener: combined main text sent for %s (no TTS)", user_name)
+    await safe_send_chat_action(context.bot, chat_id, "typing")
+    await update.message.reply_text(main_combined)
+    logger.info("New client opener: main block sent as text for %s", user_name)
 
     await asyncio.sleep(NEW_CLIENT_OPENER_BEAT_SEC)
 
@@ -1590,6 +1589,7 @@ async def deliver_new_client_opener_messages(
             voice=io.BytesIO(audio_follow),
             filename="tanya.mp3",
         )
+        new_client_voice_followup_snippet[chat_id] = followup
         logger.info("New client opener: follow-up voice sent for %s", user_name)
     else:
         await update.message.reply_text(followup)
@@ -1806,6 +1806,7 @@ async def end_session(chat_id: int):
     free_trial_user_msg_count.pop(chat_id, None)
     free_trial_90_warned.pop(chat_id, None)
     last_activity.pop(chat_id, None)
+    new_client_voice_followup_snippet.pop(chat_id, None)
 
 
 async def delete_client_data(chat_id: int) -> None:
@@ -1824,14 +1825,26 @@ async def delete_client_data(chat_id: int) -> None:
     if chat_id in conversations:
         await end_session(chat_id)
 
-    # Rename session folder to unguessable name so the bot can never read it again.
+    # Rename session folder and profile file to unguessable names so the bot
+    # can never find them again (treats the user as brand-new on return).
+    # Anonymized items are moved into a _Deleted/ subfolder to keep the vault tidy.
     if client_name:
+        sessions_deleted_bin = Path(VAULT_PATH) / "02-Client-Sessions" / "_Deleted"
+        profiles_deleted_bin = Path(VAULT_PATH) / "02-Client-Sessions" / "Client Profiles" / "_Deleted"
+
         client_dir = Path(VAULT_PATH) / "02-Client-Sessions" / client_name
         if client_dir.exists():
             deleted_name = f"_deleted_{uuid.uuid4().hex}"
-            deleted_dir = client_dir.parent / deleted_name
-            await asyncio.to_thread(client_dir.rename, deleted_dir)
-            logger.info("Anonymized session folder for chat_id=%d → %s", chat_id, deleted_name)
+            await asyncio.to_thread(sessions_deleted_bin.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(client_dir.rename, sessions_deleted_bin / deleted_name)
+            logger.info("Anonymized session folder for chat_id=%d → _Deleted/%s", chat_id, deleted_name)
+
+        profile_file = profile_path_for(client_name)
+        if profile_file.exists():
+            deleted_profile_name = f"_deleted_{uuid.uuid4().hex}.md"
+            await asyncio.to_thread(profiles_deleted_bin.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(profile_file.rename, profiles_deleted_bin / deleted_profile_name)
+            logger.info("Anonymized profile file for chat_id=%d → _Deleted/%s", chat_id, deleted_profile_name)
 
     # Remove monthly usage entry so the user starts completely fresh on return.
     def _scrub_monthly_usage():
@@ -1864,6 +1877,7 @@ async def delete_client_data(chat_id: int) -> None:
         _pending_messages,
         _pending_updates,
         _debounce_tasks,
+        new_client_voice_followup_snippet,
     ):
         state_dict.pop(chat_id, None)
 
@@ -2503,6 +2517,22 @@ async def _fire_coaching_message(
             if framework_context:
                 system_blocks.append(
                     {"type": "text", "text": f"\n\n---\n\n## Relevant Frameworks\n\n{framework_context}"}
+                )
+
+            voice_snippet = new_client_voice_followup_snippet.pop(chat_id, None)
+            if voice_snippet:
+                system_blocks.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            "\n\n---\n\n## This turn only\n\n"
+                            "Your opening had two Telegram parts: first a longer text message (welcome and terms), "
+                            "then a short voice note where you gave this coaching invite line:\n\n"
+                            f"{voice_snippet}\n\n"
+                            "Do not repeat that voice line verbatim or re-open with a fresh greeting. "
+                            "Respond in text to what they just said. Follow your normal coaching rules."
+                        ),
+                    }
                 )
 
             if voice_opener_script:
