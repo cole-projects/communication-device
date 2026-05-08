@@ -1905,14 +1905,14 @@ def is_admin(update: Update) -> bool:
 
 
 def load_coach_teaching_ratio() -> tuple[int, int]:
-    """Persisted coaching/teaching blend; default 70/30."""
-    default = (70, 30)
+    """Persisted coaching/teaching blend; default 50/50."""
+    default = (50, 50)
     try:
         if not COACHING_BLEND_CONFIG_PATH.exists():
             return default
         data = json.loads(COACHING_BLEND_CONFIG_PATH.read_text(encoding="utf-8"))
-        c = int(data.get("coaching_pct", 70))
-        t = int(data.get("teaching_pct", 30))
+        c = int(data.get("coaching_pct", 50))
+        t = int(data.get("teaching_pct", 50))
         if c < 1 or t < 1 or c + t != 100:
             return default
         return c, t
@@ -1935,7 +1935,7 @@ def coaching_teaching_blend_instruction() -> str:
     c, t = load_coach_teaching_ratio()
     return f"""## Coaching / teaching blend (continuous voice)
 
-Your default blend is **{c}% coaching / {t}% teaching**. This is not a mode switch — it is a texture. **{c}%** of the weight in every response is ICF-style coaching: questions, reflection, holding space, client-led discovery. **{t}%** is BecomingYou Framework language woven into the response at the right moment — helping the client see where they are in the transformation cycle and what is coming next. Never announce a phase. Never label the teaching. Never add a teaching paragraph at the end. The teaching is woven in, not added on. When a client is approaching a breakthrough or naming something real, that is when BecomingYou language enters the response. When a client is using the wrong tool for their phase (for example trying to rewrite when they need regulation), name what they actually need — this is the tool-timing principle."""
+Your default blend is **{c}% coaching / {t}% teaching**. This is not a mode switch — it is a texture. **{c}%** of the weight in every response is ICF-style coaching: questions, reflection, holding space, client-led discovery. **{t}%** is teaching: actual pauses in the coaching flow where Tanya stops, names a principle that directly applies to what the client is experiencing right now, gives them something to understand or sit with, then returns to coaching questions. Teaching does not feel like a lesson being delivered — it feels like Tanya handing the client a flashlight. One principle at a time. Never name the framework. When a client is using the wrong tool for their phase (for example trying to rewrite when they need regulation), name what they actually need — this is the tool-timing principle."""
 
 
 # Distilled from ICF 2025 Core Competencies (session agreements, listening, evokes awareness,
