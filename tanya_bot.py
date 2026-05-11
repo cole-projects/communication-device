@@ -110,16 +110,10 @@ OPENER_INTRO = (
 # Brief pause between separate new-client opener bubbles (after typing delay).
 NEW_CLIENT_OPENER_BEAT_SEC = 1.0
 
-FREE_TRIAL_VOICE_SCRIPT = (
-    "This is where your free time with me wraps. I hope you felt something real in it. "
-    "You showed up, and that matters. If you want to keep going, I can send a secure "
-    "Stripe payment option. Just say the word."
-)
-
-FREE_TRIAL_OFFER_TEXT = (
-    "TanyaTalk is $20 a month for 250 messages. "
-    "When you are ready for the Stripe option, reply once with yes so I send only that link next "
-    "(details are on that page). Want to continue? Just let me know."
+FREE_TRIAL_CLOSE_TEXT = (
+    "Unfortunately, this is where our time wraps up. That was a great session. "
+    "If you want to keep going, it's $20 a month for 250 messages. "
+    "Reply yes and I'll send you the link."
 )
 
 FREE_TRIAL_STRIPE_DECLINED = (
@@ -1978,16 +1972,22 @@ async def session_timeout_task(chat_id: int, bot):
     await asyncio.sleep(SESSION_TIMEOUT_MINUTES * 60)
     lock = await _get_chat_message_lock(chat_id)
     ended = False
+    is_ft = False
     async with lock:
         if chat_id in conversations and conversations[chat_id]:
             logger.info("Session timeout for chat_id %d", chat_id)
+            is_ft = in_first_free_trial_session(chat_id)
+            if is_ft:
+                free_trial_completed[chat_id] = True
+                awaiting_stripe_confirmation[chat_id] = True
             await end_session(chat_id)
             ended = True
     if ended:
+        close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
         try:
             await bot.send_message(
                 chat_id=chat_id,
-                text=SESSION_CLOSE_CONFIRMATION,
+                text=close_text,
             )
         except Exception:
             pass
@@ -2085,25 +2085,32 @@ async def perform_session_close(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return False
 
+        is_ft = in_first_free_trial_session(chat_id)
+        close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
+
         client_name = client_names.get(chat_id, update.effective_user.first_name or "Client")
         client_names[chat_id] = client_name
         user_close = (msg.text or "").strip() or "/endsession"
 
         session_path = session_files[chat_id]
         await asyncio.to_thread(
-            append_exchange, session_path, client_name, user_close, SESSION_CLOSE_CONFIRMATION
+            append_exchange, session_path, client_name, user_close, close_text
         )
 
         if chat_id not in conversations:
             conversations[chat_id] = []
         conversations[chat_id].append({"role": "user", "content": user_close})
-        conversations[chat_id].append({"role": "assistant", "content": SESSION_CLOSE_CONFIRMATION})
+        conversations[chat_id].append({"role": "assistant", "content": close_text})
         if len(conversations[chat_id]) > MAX_HISTORY * 2:
             conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2) :]
 
+        if is_ft:
+            free_trial_completed[chat_id] = True
+            awaiting_stripe_confirmation[chat_id] = True
+
         cancel_session_timeout(chat_id)
         await end_session(chat_id)
-    await msg.reply_text(SESSION_CLOSE_CONFIRMATION)
+    await msg.reply_text(close_text)
     return True
 
 
@@ -2120,26 +2127,6 @@ async def send_with_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 filename="tanya.mp3",
             )
 
-
-async def send_free_trial_session_voice_close(
-    update: Update, context: ContextTypes.DEFAULT_TYPE,
-) -> bool:
-    """End of free trial: voice only when ElevenLabs succeeds; paywall text sent separately."""
-    chat_id = update.effective_chat.id
-    if not ELEVENLABS_API_KEY:
-        logger.warning("Free trial close: no ELEVENLABS_API_KEY")
-        return False
-    await safe_send_chat_action(context.bot, chat_id, "record_voice")
-    audio_bytes = await synthesize_voice(FREE_TRIAL_VOICE_SCRIPT)
-    if audio_bytes:
-        await context.bot.send_voice(
-            chat_id=chat_id,
-            voice=io.BytesIO(audio_bytes),
-            filename="tanya.mp3",
-        )
-        return True
-    logger.warning("Free trial close: ElevenLabs failed")
-    return False
 
 
 async def begin_session_with_opening(
@@ -2403,8 +2390,7 @@ async def _fire_coaching_message(
                 }
 
             if in_ft and n_ft == FREE_TRIAL_USER_MESSAGE_CAP:
-                assistant_close = f"{FREE_TRIAL_VOICE_SCRIPT}\n\n{FREE_TRIAL_OFFER_TEXT}"
-                conversations[chat_id].append({"role": "assistant", "content": assistant_close})
+                conversations[chat_id].append({"role": "assistant", "content": FREE_TRIAL_CLOSE_TEXT})
                 if len(conversations[chat_id]) > MAX_HISTORY * 2:
                     conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2):]
                 await asyncio.to_thread(
@@ -2412,12 +2398,9 @@ async def _fire_coaching_message(
                     session_files[chat_id],
                     user_name,
                     user_text,
-                    FREE_TRIAL_OFFER_TEXT,
+                    FREE_TRIAL_CLOSE_TEXT,
                 )
-                voice_ok = await send_free_trial_session_voice_close(update, context)
-                if not voice_ok:
-                    await update.message.reply_text(FREE_TRIAL_VOICE_SCRIPT)
-                await update.message.reply_text(FREE_TRIAL_OFFER_TEXT)
+                await update.message.reply_text(FREE_TRIAL_CLOSE_TEXT)
                 free_trial_completed[chat_id] = True
                 free_trial_user_msg_count[chat_id] = FREE_TRIAL_USER_MESSAGE_CAP
                 awaiting_stripe_confirmation[chat_id] = True
