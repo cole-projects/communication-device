@@ -486,7 +486,6 @@ session_numbers: dict[int, int] = {}   # current session number per chat
 session_outlines: dict[int, str] = {}  # coaching outline loaded once per session
 session_profiles: dict[int, str] = {}  # client profile loaded once per session
 voice_note_redirects: dict[int, int] = {}  # count of voice note redirects this session
-awaiting_completion: dict[int, bool] = {}
 free_trial_user_msg_count: dict[int, int] = {}  # completed user coaching turns in current session 1
 free_trial_90_warned: dict[int, bool] = {}
 free_trial_completed: dict[int, bool] = {}  # survives end_session; do not pop
@@ -1054,8 +1053,7 @@ You are speaking with a client through Telegram. Respond exactly as Tanya would:
 5. Calm, supportive, emotionally attuned tone at all times.
 6. If a session gets cut off and the client returns, respond with this exact string: "It felt like we got cut off. I'm here with you now."
 7. The session-end sign-off is handled by the system. Do not write your own closing or goodbye when a session ends. The system sends a fixed message automatically.
-8. After a client names a clear takeaway or you help them land on one and confirm it, ask: 'Are you complete?', exact phrase, nothing added. Do not ask this during active excavation, before a takeaway has emerged, or more than once per natural close point. If the client says no or asks another question, continue the session normally.
-9. If a client sends a voice note or audio message, redirect warmly as a personal preference, never as a technical limitation. First redirect: "I'd love to hear your voice, but right now I connect best through text. Would you mind typing that out for me?" If they send a second voice note in the same session, use: "I really do want to hear what you're sharing. Text helps me be fully present with you. Take your time." Never repeat the first redirect verbatim. Never imply she cannot process audio.
+8. If a client sends a voice note or audio message, redirect warmly as a personal preference, never as a technical limitation. First redirect: "I'd love to hear your voice, but right now I connect best through text. Would you mind typing that out for me?" If they send a second voice note in the same session, use: "I really do want to hear what you're sharing. Text helps me be fully present with you. Take your time." Never repeat the first redirect verbatim. Never imply she cannot process audio.
 
 ---
 
@@ -1795,7 +1793,6 @@ async def end_session(chat_id: int):
     session_outlines.pop(chat_id, None)
     session_profiles.pop(chat_id, None)
     voice_note_redirects.pop(chat_id, None)
-    awaiting_completion.pop(chat_id, None)
     pending_first_message_opener.pop(chat_id, None)
     free_trial_user_msg_count.pop(chat_id, None)
     free_trial_90_warned.pop(chat_id, None)
@@ -2570,9 +2567,6 @@ async def _fire_coaching_message(
                 logger.error("Anthropic API error: %s", e)
                 reply = "I'm having a little trouble right now. Give me a moment and try again."
 
-            if "are you complete" in reply.lower():
-                awaiting_completion[chat_id] = True
-
             conversations[chat_id].append({"role": "assistant", "content": reply})
 
             await asyncio.to_thread(
@@ -2635,8 +2629,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 awaiting_stripe_confirmation.pop(chat_id, None)
                 if STRIPE_PAYMENT_LINK:
                     await update.message.reply_text(
-                        "Here's your link, I'll be waiting for you on the "
-                        f"other side: {STRIPE_PAYMENT_LINK}"
+                        f"Here it is: {STRIPE_PAYMENT_LINK}. Come back when you're ready and we'll pick up right where we left off."
                     )
                 elif STRIPE_PAYMENT_LINK_PLACEHOLDER:
                     await update.message.reply_text(
@@ -2655,16 +2648,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(STRIPE_CONFIRMATION_UNCLEAR_REPLY)
         return
 
-    if awaiting_completion.get(chat_id):
-        awaiting_completion.pop(chat_id, None)
-        affirmatives = {"yes", "yeah", "yep", "yup", "i am",
-            "i'm complete", "i'm done", "i'm good", "completed",
-            "complete", "that's it", "sure", "absolutely", "yes i am",
-            "yes i'm complete"}
-        normalized = user_text.strip().lower().rstrip("!.?")
-        if any(normalized == a or normalized.startswith(a) for a in affirmatives):
-            await perform_session_close(update, context)
-            return
 
     # Delete confirmation: client already triggered the delete flow, waiting on yes/no.
     if awaiting_delete_confirmation.get(chat_id):
