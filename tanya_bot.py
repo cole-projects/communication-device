@@ -57,6 +57,7 @@ STRIPE_PORTAL_LINK = os.getenv("STRIPE_PORTAL_LINK", "").strip()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_TOPUP_PRICE_ID = os.getenv("STRIPE_TOPUP_PRICE_ID", "").strip()
+STRIPE_SUBSCRIPTION_PRICE_ID = os.getenv("STRIPE_SUBSCRIPTION_PRICE_ID", "").strip()
 TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip()
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
@@ -266,6 +267,7 @@ _USAGE_CSV_LOCK = threading.Lock()
 _REFERRAL_STATE_LOCK = threading.Lock()
 _MONTHLY_USAGE_LOCK = threading.Lock()
 MONTHLY_USAGE_PATH = _BOT_DIR / "logs" / "monthly_usage.json"
+PAID_ACCESS_PATH = _BOT_DIR / "logs" / "paid_access.json"
 USAGE_CSV_FIELDNAMES = [
     "log_id",
     "timestamp",
@@ -521,6 +523,32 @@ def credit_monthly_messages(chat_id: int, amount: int) -> int:
         MONTHLY_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
         MONTHLY_USAGE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return count
+
+
+_PAID_ACCESS_LOCK = threading.Lock()
+
+
+def _load_paid_access() -> set[int]:
+    if not PAID_ACCESS_PATH.exists():
+        return set()
+    try:
+        return set(json.loads(PAID_ACCESS_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def grant_tanyatalk_access(chat_id: int) -> None:
+    with _PAID_ACCESS_LOCK:
+        ids = _load_paid_access()
+        ids.add(chat_id)
+        PAID_ACCESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PAID_ACCESS_PATH.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
+    paid_tanyatalk_access[chat_id] = True
+
+
+def load_paid_access_into_memory() -> None:
+    for chat_id in _load_paid_access():
+        paid_tanyatalk_access[chat_id] = True
 
 
 conversations: dict[int, list[dict]] = {}
@@ -2710,19 +2738,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             intent = await classify_stripe_confirmation_intent(chat_id, user_name, user_text)
             if intent == "affirmative":
                 awaiting_stripe_confirmation.pop(chat_id, None)
-                if STRIPE_PAYMENT_LINK:
+                if STRIPE_SECRET_KEY and STRIPE_SUBSCRIPTION_PRICE_ID:
+                    try:
+                        checkout_url = await create_subscription_checkout_url(chat_id)
+                        await update.message.reply_text(
+                            f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}"
+                        )
+                    except Exception as e:
+                        logger.error("Failed to create subscription checkout URL: %s", e)
+                        if STRIPE_PAYMENT_LINK:
+                            await update.message.reply_text(
+                                f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}"
+                            )
+                elif STRIPE_PAYMENT_LINK:
                     await update.message.reply_text(
-                        f"Here it is: {STRIPE_PAYMENT_LINK}. Come back when you're ready and we'll pick up right where we left off."
-                    )
-                elif STRIPE_PAYMENT_LINK_PLACEHOLDER:
-                    await update.message.reply_text(
-                        "Live checkout is not wired up yet. Here is a neutral placeholder for now "
-                        f"(tap to preview, not a charge): {STRIPE_PAYMENT_LINK_PLACEHOLDER}"
-                    )
-                else:
-                    await update.message.reply_text(
-                        "The payment link isn't set up yet, but I'll be right "
-                        "here when it is."
+                        f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}"
                     )
             elif intent == "negative":
                 awaiting_stripe_confirmation.pop(chat_id, None)
@@ -2865,6 +2895,21 @@ async def create_topup_checkout_url(chat_id: int) -> str:
     return session.url
 
 
+async def create_subscription_checkout_url(chat_id: int) -> str:
+    import stripe as stripe_lib
+    stripe_lib.api_key = STRIPE_SECRET_KEY
+    return_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}" if TELEGRAM_BOT_USERNAME else "https://telegram.org"
+    session = await asyncio.to_thread(
+        stripe_lib.checkout.Session.create,
+        line_items=[{"price": STRIPE_SUBSCRIPTION_PRICE_ID, "quantity": 1}],
+        mode="subscription",
+        metadata={"chat_id": str(chat_id), "product_type": "subscription"},
+        success_url=return_url,
+        cancel_url=return_url,
+    )
+    return session.url
+
+
 async def handle_stripe_webhook(request):
     from aiohttp import web
     import stripe as stripe_lib
@@ -2878,18 +2923,32 @@ async def handle_stripe_webhook(request):
 
     if event["type"] == "checkout.session.completed":
         session_obj = event["data"]["object"]
-        chat_id_str = (session_obj.get("metadata") or {}).get("chat_id", "")
+        metadata = session_obj.get("metadata") or {}
+        chat_id_str = metadata.get("chat_id", "")
+        product_type = metadata.get("product_type", "topup")
         if chat_id_str:
             try:
                 chat_id = int(chat_id_str)
-                amount_cents = session_obj.get("amount_total", 0)
-                qty = max(1, amount_cents // 500)
-                credited = credit_monthly_messages(chat_id, qty * 60)
-                logger.info("Top-up: credited %d messages to chat_id=%d (count now %d)", qty * 60, chat_id, credited)
-                if _telegram_bot:
-                    await _telegram_bot.send_message(chat_id=chat_id, text=TOPUP_CREDITED_MESSAGE)
+                if product_type == "subscription":
+                    grant_tanyatalk_access(chat_id)
+                    logger.info("Subscription granted for chat_id=%d", chat_id)
+                    if _telegram_bot:
+                        await _telegram_bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                "You're in. Your subscription is active and your 250 messages are ready. "
+                                "Come back whenever you are and we will pick up right where we left off."
+                            ),
+                        )
+                else:
+                    amount_cents = session_obj.get("amount_total", 0)
+                    qty = max(1, amount_cents // 500)
+                    credited = credit_monthly_messages(chat_id, qty * 60)
+                    logger.info("Top-up: credited %d messages to chat_id=%d (count now %d)", qty * 60, chat_id, credited)
+                    if _telegram_bot:
+                        await _telegram_bot.send_message(chat_id=chat_id, text=TOPUP_CREDITED_MESSAGE)
             except (ValueError, TypeError) as e:
-                logger.error("Top-up credit failed: %s", e)
+                logger.error("Stripe webhook processing failed: %s", e)
 
     return web.Response(status=200)
 
@@ -2922,6 +2981,7 @@ def main():
     try:
         ensure_vault()
         acquire_single_instance_lock()
+        load_paid_access_into_memory()
         init_usage_csv_file()
         telegram_http = HTTPXRequest(
             connect_timeout=20.0,
