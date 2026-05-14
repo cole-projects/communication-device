@@ -1151,6 +1151,7 @@ def load_frameworks(framework_files: list[str]) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+ensure_vault()
 CORE_CONTEXT = load_core_context()
 logger.info("Core context loaded (%d chars)", len(CORE_CONTEXT))
 
@@ -3115,7 +3116,6 @@ async def stop_stripe_webhook_server() -> None:
 
 def main():
     try:
-        ensure_vault()
         acquire_single_instance_lock()
         load_paid_access_into_memory()
         load_free_trial_completed_into_memory()
