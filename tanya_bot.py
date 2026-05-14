@@ -2721,26 +2721,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def ensure_vault() -> None:
-    """Clone or pull the tanya-brain vault from GitHub if GITHUB_PAT is set."""
+    """Download the tanya-brain vault from GitHub as a zip if GITHUB_PAT is set."""
     if not GITHUB_PAT:
         return
+    import zipfile
+    import io
     vault = Path(VAULT_PATH)
-    auth_url = GITHUB_VAULT_REPO.replace("https://", f"https://cole-projects:{GITHUB_PAT}@")
-    if not vault.exists():
-        logger.info("Vault not found — cloning from GitHub...")
-        result = shutil.which("git")
-        if not result:
-            logger.error("git not found — cannot clone vault")
-            return
-        import subprocess
-        subprocess.run(["git", "clone", auth_url, str(vault)], check=True)
-        logger.info("Vault cloned to %s", vault)
-    else:
-        logger.info("Vault exists — pulling latest from GitHub...")
-        import subprocess
-        subprocess.run(["git", "-C", str(vault), "remote", "set-url", "origin", auth_url], check=True)
-        subprocess.run(["git", "-C", str(vault), "pull", "--ff-only"], check=True)
-        logger.info("Vault updated")
+    logger.info("Downloading vault from GitHub...")
+    url = "https://api.github.com/repos/cole-projects/tanya-brain/zipball/main"
+    headers = {"Authorization": f"token {GITHUB_PAT}", "Accept": "application/vnd.github+json"}
+    try:
+        response = httpx.get(url, headers=headers, follow_redirects=True, timeout=60)
+        response.raise_for_status()
+    except Exception as e:
+        logger.error("Failed to download vault: %s", e)
+        return
+    try:
+        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+            top = zf.namelist()[0].split("/")[0]
+            parent = vault.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            if vault.exists():
+                shutil.rmtree(vault)
+            zf.extractall(parent)
+            (parent / top).rename(vault)
+        logger.info("Vault ready at %s", vault)
+    except Exception as e:
+        logger.error("Failed to extract vault: %s", e)
 
 
 def main():
