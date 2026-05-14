@@ -50,6 +50,7 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "JZWiJzVBxv3K7zOcItDy")
 STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "").strip()
 # Optional harmless URL shown when STRIPE_PAYMENT_LINK is unset (e.g. Stripe docs home); not a live checkout.
 STRIPE_PAYMENT_LINK_PLACEHOLDER = os.getenv("STRIPE_PAYMENT_LINK_PLACEHOLDER", "https://stripe.com").strip()
+STRIPE_TOPUP_LINK = os.getenv("STRIPE_TOPUP_LINK", "").strip()
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
 _POST_TRIAL_BYPASS_CHAT_IDS = frozenset(
@@ -110,11 +111,20 @@ OPENER_INTRO = (
 # Brief pause between separate new-client opener bubbles (after typing delay).
 NEW_CLIENT_OPENER_BEAT_SEC = 1.0
 
-FREE_TRIAL_CLOSE_TEXT = (
-    "Unfortunately, this is where our time wraps up. That was a great session. "
-    "If you want to keep going, it's $20 a month for 250 messages. "
-    "Reply yes and I'll send you the link."
-)
+
+def free_trial_close_text() -> str:
+    """Copy when the first-session free trial ends (25 messages, idle timeout, or explicit end). Uses STRIPE_PAYMENT_LINK from env when set."""
+    base = (
+        "Unfortunately, this is where our time wraps up. That was a great session. "
+        "If you want to keep going, it's $20 a month for 250 messages."
+    )
+    if STRIPE_PAYMENT_LINK:
+        return (
+            f"{base}\n\n"
+            f"Here's your secure checkout link: {STRIPE_PAYMENT_LINK}\n\n"
+            "Reply yes if you'd like me to send the link again, or no if you're not ready to continue."
+        )
+    return f"{base} Reply yes and I'll send you the link."
 
 FREE_TRIAL_STRIPE_DECLINED = (
     "That's completely okay. Whenever you feel ready, I'll be right here. "
@@ -122,7 +132,7 @@ FREE_TRIAL_STRIPE_DECLINED = (
 )
 
 STRIPE_CONFIRMATION_UNCLEAR_REPLY = (
-    "I want to be sure I understood. Reply yes if you want me to send the secure payment link now, "
+    "I want to be sure I understood. Reply yes if you want the payment link again, "
     "or no if you are not ready yet."
 )
 
@@ -166,7 +176,8 @@ MONTHLY_CAP_WARNING_MESSAGE = (
 )
 MONTHLY_CAP_BLOCK_MESSAGE = (
     "You've reached your 250 messages for this month. "
-    "I'll be right here when your next month starts."
+    "If you'd like to keep going, you can add more messages now. Each $5 adds 60. "
+    "Otherwise I'll be right here when your next month starts."
 )
 
 # Per-session message cap — prevents marathon sessions from eating the monthly budget.
@@ -1980,7 +1991,7 @@ async def session_timeout_task(chat_id: int, bot):
             await end_session(chat_id)
             ended = True
     if ended:
-        close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
+        close_text = free_trial_close_text() if is_ft else SESSION_CLOSE_CONFIRMATION
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -2083,7 +2094,7 @@ async def perform_session_close(update: Update, context: ContextTypes.DEFAULT_TY
             return False
 
         is_ft = in_first_free_trial_session(chat_id)
-        close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
+        close_text = free_trial_close_text() if is_ft else SESSION_CLOSE_CONFIRMATION
 
         client_name = client_names.get(chat_id, update.effective_user.first_name or "Client")
         client_names[chat_id] = client_name
@@ -2306,7 +2317,10 @@ async def _fire_coaching_message(
         if count >= MONTHLY_MESSAGE_CAP:
             if count == MONTHLY_MESSAGE_CAP:
                 increment_monthly_message_count(chat_id)
-                await update.message.reply_text(MONTHLY_CAP_BLOCK_MESSAGE)
+                msg = MONTHLY_CAP_BLOCK_MESSAGE
+                if STRIPE_TOPUP_LINK:
+                    msg += f"\n\n{STRIPE_TOPUP_LINK}"
+                await update.message.reply_text(msg)
             return
         new_count = increment_monthly_message_count(chat_id)
         if new_count == MONTHLY_CAP_WARNING_AT:
@@ -2387,7 +2401,8 @@ async def _fire_coaching_message(
                 }
 
             if in_ft and n_ft == FREE_TRIAL_USER_MESSAGE_CAP:
-                conversations[chat_id].append({"role": "assistant", "content": FREE_TRIAL_CLOSE_TEXT})
+                trial_close = free_trial_close_text()
+                conversations[chat_id].append({"role": "assistant", "content": trial_close})
                 if len(conversations[chat_id]) > MAX_HISTORY * 2:
                     conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2):]
                 await asyncio.to_thread(
@@ -2395,9 +2410,9 @@ async def _fire_coaching_message(
                     session_files[chat_id],
                     user_name,
                     user_text,
-                    FREE_TRIAL_CLOSE_TEXT,
+                    trial_close,
                 )
-                await update.message.reply_text(FREE_TRIAL_CLOSE_TEXT)
+                await update.message.reply_text(trial_close)
                 free_trial_completed[chat_id] = True
                 free_trial_user_msg_count[chat_id] = FREE_TRIAL_USER_MESSAGE_CAP
                 awaiting_stripe_confirmation[chat_id] = True
