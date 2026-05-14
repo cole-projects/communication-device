@@ -1813,6 +1813,23 @@ async def end_session(chat_id: int):
     new_client_voice_followup_snippet.pop(chat_id, None)
 
 
+async def ai_detects_delete_intent(text: str) -> bool:
+    """Return True if Claude thinks the message is a data-deletion request."""
+    try:
+        response = await claude.messages.create(
+            model=CLAUDE_HAIKU_MODEL,
+            max_tokens=5,
+            system="Reply with only 'yes' or 'no'. No other text.",
+            messages=[{"role": "user", "content": (
+                f"Does this message express a desire to delete, erase, or remove the person's data, "
+                f"account, or information from the system?\n\nMessage: {text}"
+            )}],
+        )
+        return response.content[0].text.strip().lower().startswith("yes")
+    except Exception:
+        return False
+
+
 async def delete_client_data(chat_id: int) -> None:
     """Anonymize all data for a client who requested deletion.
 
@@ -2679,9 +2696,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(DELETE_CANCELLED_MESSAGE)
         return
 
-    # Delete trigger: client asks to erase their data — enter confirmation flow.
+    # Delete trigger: phrase match first (free), then AI fallback to catch natural phrasing.
     user_text_lower = user_text.strip().lower()
-    if any(trigger in user_text_lower for trigger in DELETE_TRIGGERS):
+    if any(trigger in user_text_lower for trigger in DELETE_TRIGGERS) or await ai_detects_delete_intent(user_text):
         awaiting_delete_confirmation[chat_id] = True
         await update.message.reply_text(DELETE_CONFIRMATION_PROMPT)
         return
