@@ -53,6 +53,7 @@ STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "").strip()
 # Optional harmless URL shown when STRIPE_PAYMENT_LINK is unset (e.g. Stripe docs home); not a live checkout.
 STRIPE_PAYMENT_LINK_PLACEHOLDER = os.getenv("STRIPE_PAYMENT_LINK_PLACEHOLDER", "https://stripe.com").strip()
 STRIPE_TOPUP_LINK = os.getenv("STRIPE_TOPUP_LINK", "").strip()
+STRIPE_PORTAL_LINK = os.getenv("STRIPE_PORTAL_LINK", "").strip()
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
 _POST_TRIAL_BYPASS_CHAT_IDS = frozenset(
@@ -100,8 +101,10 @@ OPENER_INTRO = (
     "Your privacy matters deeply to me. All conversations are stored securely and encrypted. "
     "They may be privately reviewed only when necessary by me or a trusted technical team member "
     "to maintain quality, functionality, and improve the TanyaTalk experience. "
-    "They are not casually read or shared. You can request permanent deletion of all your data "
-    "at any time by sending 'delete my data'. So by continuing, you acknowledge and agree to these terms.\n\n"
+    "They are not casually read or shared. You can cancel your subscription at any time by sending "
+    "'cancel subscription' and your profile and conversations will be kept so I remember you if you return. "
+    "If you ever want everything permanently deleted, send 'delete my data' and it will all be wiped. "
+    "So by continuing, you acknowledge and agree to these terms.\n\n"
     "TanyaTalk supports reflection, clarity, and growth, but it is not medical, legal, "
     "financial or emergency advice. Use of TanyaTalk is at your own discretion, and you "
     "are solely responsible for any decisions or actions you take based on my guidance. "
@@ -146,6 +149,20 @@ REFERRAL_NUDGE_MARKER = "<<<REFERRAL_NUDGE>>>"
 # Debounce window: rapid messages arriving within this window are merged into one Claude call.
 DEBOUNCE_SECONDS = 5.0
 
+# Subscription cancellation flow.
+CANCEL_TRIGGERS: frozenset[str] = frozenset({
+    "cancel subscription",
+    "cancel my subscription",
+    "unsubscribe",
+    "stop my subscription",
+    "end my subscription",
+    "i want to cancel",
+})
+CANCEL_MESSAGE_WITH_LINK = (
+    "Of course. You can cancel anytime through your billing portal. "
+    "Your conversations and profile will still be here if you ever come back.\n\n"
+    "{portal_link}"
+)
 # Right-to-deletion flow.
 DELETE_TRIGGERS: frozenset[str] = frozenset({
     "delete my data",
@@ -2691,13 +2708,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             awaiting_delete_confirmation.pop(chat_id, None)
             await delete_client_data(chat_id)
             await update.message.reply_text(DELETE_CONFIRMED_MESSAGE)
+            if STRIPE_PORTAL_LINK:
+                await update.message.reply_text(
+                    "One more thing. Your data is gone but your billing is still active. "
+                    "Use the link below to cancel so you are not charged again.\n\n"
+                    f"{STRIPE_PORTAL_LINK}"
+                )
         else:
             awaiting_delete_confirmation.pop(chat_id, None)
             await update.message.reply_text(DELETE_CANCELLED_MESSAGE)
         return
 
-    # Delete trigger: phrase match first (free), then AI fallback to catch natural phrasing.
+    # Cancel subscription trigger.
     user_text_lower = user_text.strip().lower()
+    if any(trigger in user_text_lower for trigger in CANCEL_TRIGGERS):
+        msg = CANCEL_MESSAGE_WITH_LINK.format(portal_link=STRIPE_PORTAL_LINK)
+        await update.message.reply_text(msg)
+        return
+
+    # Delete trigger: phrase match first (free), then AI fallback to catch natural phrasing.
     if any(trigger in user_text_lower for trigger in DELETE_TRIGGERS) or await ai_detects_delete_intent(user_text):
         awaiting_delete_confirmation[chat_id] = True
         await update.message.reply_text(DELETE_CONFIRMATION_PROMPT)
