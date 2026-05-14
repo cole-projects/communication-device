@@ -274,6 +274,91 @@ _MONTHLY_USAGE_LOCK = threading.Lock()
 _EXTRA_MESSAGES_LOCK = threading.Lock()
 _FREE_TRIAL_LOCK = threading.Lock()
 _VAULT_GIT_LOCK = threading.Lock()
+
+
+def ensure_vault() -> None:
+    """Clone the tanya-brain vault from GitHub using git so changes can be pushed back."""
+    if not GITHUB_PAT:
+        return
+    vault = Path(VAULT_PATH)
+    repo_url = GITHUB_VAULT_REPO.replace("https://", f"https://{GITHUB_PAT}@")
+
+    if vault.exists() and (vault / ".git").exists():
+        logger.info("Vault exists, pulling latest...")
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(vault), "pull", "--ff-only"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                logger.error("git pull failed: %s", result.stderr)
+            else:
+                logger.info("Vault updated: %s", result.stdout.strip())
+        except Exception as e:
+            logger.error("Failed to pull vault: %s", e)
+        return
+
+    logger.info("Cloning vault from GitHub...")
+    if vault.exists():
+        shutil.rmtree(vault)
+    vault.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            ["git", "clone", repo_url, str(vault)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            logger.error("git clone failed: %s", result.stderr)
+            return
+        subprocess.run(["git", "-C", str(vault), "config", "user.email", "tanyabot@railway.app"], capture_output=True)
+        subprocess.run(["git", "-C", str(vault), "config", "user.name", "TanyaBot"], capture_output=True)
+        logger.info("Vault cloned to %s", vault)
+    except Exception as e:
+        logger.error("Failed to clone vault: %s", e)
+
+
+async def push_vault_changes(client_name: str, session_num: int) -> None:
+    """Push session and profile updates back to GitHub after session end."""
+    if not GITHUB_PAT:
+        return
+    vault = Path(VAULT_PATH)
+    if not (vault / ".git").exists():
+        logger.warning("Vault is not a git repo — skipping push")
+        return
+
+    def _do_push() -> None:
+        with _VAULT_GIT_LOCK:
+            try:
+                subprocess.run(["git", "-C", str(vault), "add", "."], capture_output=True, timeout=30)
+                status = subprocess.run(
+                    ["git", "-C", str(vault), "status", "--porcelain"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if not status.stdout.strip():
+                    logger.info("No vault changes to push")
+                    return
+                commit_msg = f"Session update: {client_name} Session {session_num}"
+                result = subprocess.run(
+                    ["git", "-C", str(vault), "commit", "-m", commit_msg],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode != 0:
+                    logger.error("git commit failed: %s", result.stderr)
+                    return
+                result = subprocess.run(
+                    ["git", "-C", str(vault), "push"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0:
+                    logger.error("git push failed: %s", result.stderr)
+                else:
+                    logger.info("Vault pushed: %s session %d", client_name, session_num)
+            except Exception as e:
+                logger.error("Failed to push vault changes: %s", e)
+
+    await asyncio.to_thread(_do_push)
+
+
 MONTHLY_USAGE_PATH = _BOT_DIR / "logs" / "monthly_usage.json"
 EXTRA_MESSAGES_PATH = _BOT_DIR / "logs" / "extra_messages.json"
 PAID_ACCESS_PATH = _BOT_DIR / "logs" / "paid_access.json"
@@ -2923,89 +3008,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-def ensure_vault() -> None:
-    """Clone the tanya-brain vault from GitHub using git so changes can be pushed back."""
-    if not GITHUB_PAT:
-        return
-    vault = Path(VAULT_PATH)
-    repo_url = GITHUB_VAULT_REPO.replace("https://", f"https://{GITHUB_PAT}@")
-
-    if vault.exists() and (vault / ".git").exists():
-        logger.info("Vault exists, pulling latest...")
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(vault), "pull", "--ff-only"],
-                capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode != 0:
-                logger.error("git pull failed: %s", result.stderr)
-            else:
-                logger.info("Vault updated: %s", result.stdout.strip())
-        except Exception as e:
-            logger.error("Failed to pull vault: %s", e)
-        return
-
-    logger.info("Cloning vault from GitHub...")
-    if vault.exists():
-        shutil.rmtree(vault)
-    vault.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        result = subprocess.run(
-            ["git", "clone", repo_url, str(vault)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
-            logger.error("git clone failed: %s", result.stderr)
-            return
-        subprocess.run(["git", "-C", str(vault), "config", "user.email", "tanyabot@railway.app"], capture_output=True)
-        subprocess.run(["git", "-C", str(vault), "config", "user.name", "TanyaBot"], capture_output=True)
-        logger.info("Vault cloned to %s", vault)
-    except Exception as e:
-        logger.error("Failed to clone vault: %s", e)
-
-
-async def push_vault_changes(client_name: str, session_num: int) -> None:
-    """Push session and profile updates back to GitHub after session end."""
-    if not GITHUB_PAT:
-        return
-    vault = Path(VAULT_PATH)
-    if not (vault / ".git").exists():
-        logger.warning("Vault is not a git repo — skipping push")
-        return
-
-    def _do_push() -> None:
-        with _VAULT_GIT_LOCK:
-            try:
-                subprocess.run(["git", "-C", str(vault), "add", "."], capture_output=True, timeout=30)
-                status = subprocess.run(
-                    ["git", "-C", str(vault), "status", "--porcelain"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if not status.stdout.strip():
-                    logger.info("No vault changes to push")
-                    return
-                commit_msg = f"Session update: {client_name} Session {session_num}"
-                result = subprocess.run(
-                    ["git", "-C", str(vault), "commit", "-m", commit_msg],
-                    capture_output=True, text=True, timeout=30,
-                )
-                if result.returncode != 0:
-                    logger.error("git commit failed: %s", result.stderr)
-                    return
-                result = subprocess.run(
-                    ["git", "-C", str(vault), "push"],
-                    capture_output=True, text=True, timeout=60,
-                )
-                if result.returncode != 0:
-                    logger.error("git push failed: %s", result.stderr)
-                else:
-                    logger.info("Vault pushed: %s session %d", client_name, session_num)
-            except Exception as e:
-                logger.error("Failed to push vault changes: %s", e)
-
-    await asyncio.to_thread(_do_push)
-
 
 async def create_topup_checkout_url(chat_id: int) -> str:
     import stripe as stripe_lib
