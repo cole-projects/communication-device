@@ -59,6 +59,9 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_TOPUP_PRICE_ID = os.getenv("STRIPE_TOPUP_PRICE_ID", "").strip()
 STRIPE_SUBSCRIPTION_PRICE_ID = os.getenv("STRIPE_SUBSCRIPTION_PRICE_ID", "").strip()
 TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip()
+PROMO_CODES: frozenset[str] = frozenset(
+    c.strip().upper() for c in os.getenv("PROMO_CODES", "").split(",") if c.strip()
+)
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
 _POST_TRIAL_BYPASS_CHAT_IDS = frozenset(
@@ -271,9 +274,11 @@ _USAGE_CSV_LOCK = threading.Lock()
 _REFERRAL_STATE_LOCK = threading.Lock()
 _MONTHLY_USAGE_LOCK = threading.Lock()
 _EXTRA_MESSAGES_LOCK = threading.Lock()
+_FREE_TRIAL_LOCK = threading.Lock()
 MONTHLY_USAGE_PATH = _BOT_DIR / "logs" / "monthly_usage.json"
 EXTRA_MESSAGES_PATH = _BOT_DIR / "logs" / "extra_messages.json"
 PAID_ACCESS_PATH = _BOT_DIR / "logs" / "paid_access.json"
+FREE_TRIAL_COMPLETED_PATH = _BOT_DIR / "logs" / "free_trial_completed.json"
 USAGE_CSV_FIELDNAMES = [
     "log_id",
     "timestamp",
@@ -589,6 +594,29 @@ def grant_tanyatalk_access(chat_id: int) -> None:
 def load_paid_access_into_memory() -> None:
     for chat_id in _load_paid_access():
         paid_tanyatalk_access[chat_id] = True
+
+
+def _load_free_trial_completed_ids() -> set[int]:
+    if not FREE_TRIAL_COMPLETED_PATH.exists():
+        return set()
+    try:
+        return set(json.loads(FREE_TRIAL_COMPLETED_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def mark_free_trial_completed(chat_id: int) -> None:
+    mark_free_trial_completed(chat_id)
+    with _FREE_TRIAL_LOCK:
+        ids = _load_free_trial_completed_ids()
+        ids.add(chat_id)
+        FREE_TRIAL_COMPLETED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        FREE_TRIAL_COMPLETED_PATH.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
+
+
+def load_free_trial_completed_into_memory() -> None:
+    for chat_id in _load_free_trial_completed_ids():
+        mark_free_trial_completed(chat_id)
 
 
 conversations: dict[int, list[dict]] = {}
@@ -2124,7 +2152,7 @@ async def session_timeout_task(chat_id: int, bot):
             logger.info("Session timeout for chat_id %d", chat_id)
             is_ft = in_first_free_trial_session(chat_id)
             if is_ft:
-                free_trial_completed[chat_id] = True
+                mark_free_trial_completed(chat_id)
                 awaiting_stripe_confirmation[chat_id] = True
             await end_session(chat_id)
             ended = True
@@ -2251,7 +2279,7 @@ async def perform_session_close(update: Update, context: ContextTypes.DEFAULT_TY
             conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2) :]
 
         if is_ft:
-            free_trial_completed[chat_id] = True
+            mark_free_trial_completed(chat_id)
             awaiting_stripe_confirmation[chat_id] = True
 
         cancel_session_timeout(chat_id)
@@ -2553,7 +2581,7 @@ async def _fire_coaching_message(
                     trial_close,
                 )
                 await update.message.reply_text(trial_close)
-                free_trial_completed[chat_id] = True
+                mark_free_trial_completed(chat_id)
                 free_trial_user_msg_count[chat_id] = FREE_TRIAL_USER_MESSAGE_CAP
                 awaiting_stripe_confirmation[chat_id] = True
                 cancel_session_timeout(chat_id)
@@ -2848,6 +2876,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(TOPUP_UNCLEAR_REPLY)
         return
 
+    # Promo code: grant full access without payment.
+    if PROMO_CODES and user_text.strip().upper() in PROMO_CODES:
+        grant_tanyatalk_access(chat_id)
+        mark_free_trial_completed(chat_id)
+        await update.message.reply_text(
+            "You're all set. Your access is active and your 250 messages are ready. "
+            "Come back whenever you are ready and we will pick up right where we left off."
+        )
+        return
+
     # Cancel subscription trigger: phrase match first, then AI fallback.
     user_text_lower = user_text.strip().lower()
     if any(trigger in user_text_lower for trigger in CANCEL_TRIGGERS) or await ai_detects_cancel_intent(user_text):
@@ -2990,8 +3028,14 @@ async def handle_stripe_webhook(request):
                             ),
                         )
                 else:
-                    amount_cents = session_obj.get("amount_total", 0)
-                    qty = max(1, amount_cents // 500)
+                    import stripe as stripe_lib
+                    stripe_lib.api_key = STRIPE_SECRET_KEY
+                    session_expanded = await asyncio.to_thread(
+                        stripe_lib.checkout.Session.retrieve,
+                        session_obj["id"],
+                        expand=["line_items"],
+                    )
+                    qty = session_expanded.line_items.data[0].quantity if session_expanded.line_items.data else 1
                     total_extra = add_extra_messages(chat_id, qty * 60)
                     logger.info("Top-up: added %d bonus messages to chat_id=%d (total bonus now %d)", qty * 60, chat_id, total_extra)
                     if _telegram_bot:
@@ -3031,6 +3075,7 @@ def main():
         ensure_vault()
         acquire_single_instance_lock()
         load_paid_access_into_memory()
+        load_free_trial_completed_into_memory()
         init_usage_csv_file()
         telegram_http = HTTPXRequest(
             connect_timeout=20.0,
