@@ -41,6 +41,8 @@ VAULT_PATH = os.getenv(
     "VAULT_PATH",
     str(Path(__file__).resolve().parent.parent / "tanya_brain"),
 )
+GITHUB_PAT = os.getenv("GITHUB_PAT", "").strip()
+GITHUB_VAULT_REPO = os.getenv("GITHUB_VAULT_REPO", "https://github.com/cole-projects/tanya-brain.git")
 ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
 ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
@@ -2718,8 +2720,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ---------------------------------------------------------------------------
 
+def ensure_vault() -> None:
+    """Clone or pull the tanya-brain vault from GitHub if GITHUB_PAT is set."""
+    if not GITHUB_PAT:
+        return
+    vault = Path(VAULT_PATH)
+    auth_url = GITHUB_VAULT_REPO.replace("https://", f"https://cole-projects:{GITHUB_PAT}@")
+    if not vault.exists():
+        logger.info("Vault not found — cloning from GitHub...")
+        result = shutil.which("git")
+        if not result:
+            logger.error("git not found — cannot clone vault")
+            return
+        import subprocess
+        subprocess.run(["git", "clone", auth_url, str(vault)], check=True)
+        logger.info("Vault cloned to %s", vault)
+    else:
+        logger.info("Vault exists — pulling latest from GitHub...")
+        import subprocess
+        subprocess.run(["git", "-C", str(vault), "remote", "set-url", "origin", auth_url], check=True)
+        subprocess.run(["git", "-C", str(vault), "pull", "--ff-only"], check=True)
+        logger.info("Vault updated")
+
+
 def main():
     try:
+        ensure_vault()
         acquire_single_instance_lock()
         init_usage_csv_file()
         telegram_http = HTTPXRequest(
