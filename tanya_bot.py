@@ -193,8 +193,14 @@ MONTHLY_CAP_WARNING_MESSAGE = (
 )
 MONTHLY_CAP_BLOCK_MESSAGE = (
     "You've reached your 250 messages for this month. "
-    "If you'd like to keep going, you can add more messages now. Each $5 adds 60. "
-    "Otherwise I'll be right here when your next month starts."
+    "Each $5 adds 60 more if you'd like to keep going. "
+    "Would you like me to send you the link?"
+)
+TOPUP_LINK_DECLINED = (
+    "No problem at all. I'll be right here when your next month starts."
+)
+TOPUP_CREDITED_MESSAGE = (
+    "You're all set. Your messages have been added and we can keep going whenever you're ready."
 )
 
 # Per-session message cap — prevents marathon sessions from eating the monthly budget.
@@ -541,6 +547,7 @@ _pending_messages: dict[int, list[str]] = {}  # debounce buffer: messages waitin
 _pending_updates: dict[int, object] = {}       # latest Telegram Update per chat (for replying)
 _debounce_tasks: dict[int, asyncio.Task] = {}  # active debounce timer per chat
 awaiting_delete_confirmation: dict[int, bool] = {}  # True when client has triggered delete flow
+awaiting_topup_confirmation: dict[int, bool] = {}  # True when client hit cap and we asked if they want the top-up link
 # Set when new client hears the short opener line as voice; consumed on first coaching turn for model context.
 new_client_voice_followup_snippet: dict[int, str] = {}
 
@@ -2380,18 +2387,8 @@ async def _fire_coaching_message(
         if count >= MONTHLY_MESSAGE_CAP:
             if count == MONTHLY_MESSAGE_CAP:
                 increment_monthly_message_count(chat_id)
-                msg = MONTHLY_CAP_BLOCK_MESSAGE
-                if STRIPE_SECRET_KEY and STRIPE_TOPUP_PRICE_ID:
-                    try:
-                        checkout_url = await create_topup_checkout_url(chat_id)
-                        msg += f"\n\n{checkout_url}"
-                    except Exception as e:
-                        logger.error("Failed to create top-up checkout URL: %s", e)
-                        if STRIPE_TOPUP_LINK:
-                            msg += f"\n\n{STRIPE_TOPUP_LINK}"
-                elif STRIPE_TOPUP_LINK:
-                    msg += f"\n\n{STRIPE_TOPUP_LINK}"
-                await update.message.reply_text(msg)
+                awaiting_topup_confirmation[chat_id] = True
+                await update.message.reply_text(MONTHLY_CAP_BLOCK_MESSAGE)
             return
         new_count = increment_monthly_message_count(chat_id)
         if new_count == MONTHLY_CAP_WARNING_AT:
@@ -2754,6 +2751,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(DELETE_CANCELLED_MESSAGE)
         return
 
+    # Top-up confirmation: client hit monthly cap and we asked if they want the link.
+    if awaiting_topup_confirmation.get(chat_id):
+        awaiting_topup_confirmation.pop(chat_id, None)
+        normalized = user_text.strip().lower().rstrip("!.? ")
+        if any(word in normalized for word in ("yes", "yeah", "yep", "sure", "send", "ok", "okay")):
+            try:
+                checkout_url = await create_topup_checkout_url(chat_id)
+                await update.message.reply_text(
+                    f"Here you go. Each $5 adds 60 messages and you can add as many as you'd like.\n\n{checkout_url}"
+                )
+            except Exception as e:
+                logger.error("Failed to create top-up checkout URL: %s", e)
+                if STRIPE_TOPUP_LINK:
+                    await update.message.reply_text(f"Here you go.\n\n{STRIPE_TOPUP_LINK}")
+        else:
+            await update.message.reply_text(TOPUP_LINK_DECLINED)
+        return
+
     # Cancel subscription trigger: phrase match first, then AI fallback.
     user_text_lower = user_text.strip().lower()
     if any(trigger in user_text_lower for trigger in CANCEL_TRIGGERS) or await ai_detects_cancel_intent(user_text):
@@ -2871,6 +2886,8 @@ async def handle_stripe_webhook(request):
                 qty = max(1, amount_cents // 500)
                 credited = credit_monthly_messages(chat_id, qty * 60)
                 logger.info("Top-up: credited %d messages to chat_id=%d (count now %d)", qty * 60, chat_id, credited)
+                if _telegram_bot:
+                    await _telegram_bot.send_message(chat_id=chat_id, text=TOPUP_CREDITED_MESSAGE)
             except (ValueError, TypeError) as e:
                 logger.error("Top-up credit failed: %s", e)
 
@@ -2878,6 +2895,7 @@ async def handle_stripe_webhook(request):
 
 
 _webhook_runner = None
+_telegram_bot = None
 
 
 async def start_stripe_webhook_server() -> None:
@@ -2912,6 +2930,8 @@ def main():
             pool_timeout=5.0,
         )
         async def post_init(app: Application) -> None:
+            global _telegram_bot
+            _telegram_bot = app.bot
             tanya_followup.init_scheduler(_BOT_DIR / "logs" / "apscheduler.sqlite")
 
             async def send_msg(cid: int, txt: str) -> None:
