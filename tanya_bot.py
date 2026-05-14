@@ -8,6 +8,7 @@ import datetime
 import json
 import shutil
 import threading
+import subprocess
 from datetime import timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -272,6 +273,7 @@ _REFERRAL_STATE_LOCK = threading.Lock()
 _MONTHLY_USAGE_LOCK = threading.Lock()
 _EXTRA_MESSAGES_LOCK = threading.Lock()
 _FREE_TRIAL_LOCK = threading.Lock()
+_VAULT_GIT_LOCK = threading.Lock()
 MONTHLY_USAGE_PATH = _BOT_DIR / "logs" / "monthly_usage.json"
 EXTRA_MESSAGES_PATH = _BOT_DIR / "logs" / "extra_messages.json"
 PAID_ACCESS_PATH = _BOT_DIR / "logs" / "paid_access.json"
@@ -1924,6 +1926,7 @@ async def end_session(chat_id: int):
             )
 
         await update_vault_index_files(client_name, session_num, today, profile, transcript)
+        asyncio.create_task(push_vault_changes(client_name, session_num))
 
     cancel_cache_warming(chat_id)
     _cached_static_prompts.pop(chat_id, None)
@@ -2921,33 +2924,86 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def ensure_vault() -> None:
-    """Download the tanya-brain vault from GitHub as a zip if GITHUB_PAT is set."""
+    """Clone the tanya-brain vault from GitHub using git so changes can be pushed back."""
     if not GITHUB_PAT:
         return
-    import zipfile
-    import io
     vault = Path(VAULT_PATH)
-    logger.info("Downloading vault from GitHub...")
-    url = "https://api.github.com/repos/cole-projects/tanya-brain/zipball/main"
-    headers = {"Authorization": f"token {GITHUB_PAT}", "Accept": "application/vnd.github+json"}
-    try:
-        response = httpx.get(url, headers=headers, follow_redirects=True, timeout=60)
-        response.raise_for_status()
-    except Exception as e:
-        logger.error("Failed to download vault: %s", e)
+    repo_url = GITHUB_VAULT_REPO.replace("https://", f"https://{GITHUB_PAT}@")
+
+    if vault.exists() and (vault / ".git").exists():
+        logger.info("Vault exists, pulling latest...")
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(vault), "pull", "--ff-only"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                logger.error("git pull failed: %s", result.stderr)
+            else:
+                logger.info("Vault updated: %s", result.stdout.strip())
+        except Exception as e:
+            logger.error("Failed to pull vault: %s", e)
         return
+
+    logger.info("Cloning vault from GitHub...")
+    if vault.exists():
+        shutil.rmtree(vault)
+    vault.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
-            top = zf.namelist()[0].split("/")[0]
-            parent = vault.parent
-            parent.mkdir(parents=True, exist_ok=True)
-            if vault.exists():
-                shutil.rmtree(vault)
-            zf.extractall(parent)
-            (parent / top).rename(vault)
-        logger.info("Vault ready at %s", vault)
+        result = subprocess.run(
+            ["git", "clone", repo_url, str(vault)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            logger.error("git clone failed: %s", result.stderr)
+            return
+        subprocess.run(["git", "-C", str(vault), "config", "user.email", "tanyabot@railway.app"], capture_output=True)
+        subprocess.run(["git", "-C", str(vault), "config", "user.name", "TanyaBot"], capture_output=True)
+        logger.info("Vault cloned to %s", vault)
     except Exception as e:
-        logger.error("Failed to extract vault: %s", e)
+        logger.error("Failed to clone vault: %s", e)
+
+
+async def push_vault_changes(client_name: str, session_num: int) -> None:
+    """Push session and profile updates back to GitHub after session end."""
+    if not GITHUB_PAT:
+        return
+    vault = Path(VAULT_PATH)
+    if not (vault / ".git").exists():
+        logger.warning("Vault is not a git repo — skipping push")
+        return
+
+    def _do_push() -> None:
+        with _VAULT_GIT_LOCK:
+            try:
+                subprocess.run(["git", "-C", str(vault), "add", "."], capture_output=True, timeout=30)
+                status = subprocess.run(
+                    ["git", "-C", str(vault), "status", "--porcelain"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if not status.stdout.strip():
+                    logger.info("No vault changes to push")
+                    return
+                commit_msg = f"Session update: {client_name} Session {session_num}"
+                result = subprocess.run(
+                    ["git", "-C", str(vault), "commit", "-m", commit_msg],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode != 0:
+                    logger.error("git commit failed: %s", result.stderr)
+                    return
+                result = subprocess.run(
+                    ["git", "-C", str(vault), "push"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0:
+                    logger.error("git push failed: %s", result.stderr)
+                else:
+                    logger.info("Vault pushed: %s session %d", client_name, session_num)
+            except Exception as e:
+                logger.error("Failed to push vault changes: %s", e)
+
+    await asyncio.to_thread(_do_push)
 
 
 async def create_topup_checkout_url(chat_id: int) -> str:
