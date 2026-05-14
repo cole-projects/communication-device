@@ -200,6 +200,10 @@ MONTHLY_CAP_BLOCK_MESSAGE = (
 TOPUP_LINK_DECLINED = (
     "No problem at all. I'll be right here when your next month starts."
 )
+TOPUP_UNCLEAR_REPLY = (
+    "The link has the details on what is included. "
+    "Just say yes if you would like me to send it, or no if you would like to wait until your subscription refills."
+)
 TOPUP_CREDITED_MESSAGE = (
     "You're all set. Your messages have been added and we can keep going whenever you're ready."
 )
@@ -2783,9 +2787,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Top-up confirmation: client hit monthly cap and we asked if they want the link.
     if awaiting_topup_confirmation.get(chat_id):
-        awaiting_topup_confirmation.pop(chat_id, None)
         normalized = user_text.strip().lower().rstrip("!.? ")
-        if any(word in normalized for word in ("yes", "yeah", "yep", "sure", "send", "ok", "okay")):
+        is_yes = any(word in normalized for word in ("yes", "yeah", "yep", "sure", "send", "ok", "okay"))
+        is_no = any(word in normalized for word in ("no", "nope", "not", "wait", "later", "next month"))
+        if is_yes:
+            awaiting_topup_confirmation.pop(chat_id, None)
             try:
                 checkout_url = await create_topup_checkout_url(chat_id)
                 await update.message.reply_text(
@@ -2795,8 +2801,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error("Failed to create top-up checkout URL: %s", e)
                 if STRIPE_TOPUP_LINK:
                     await update.message.reply_text(f"Here you go.\n\n{STRIPE_TOPUP_LINK}")
-        else:
+        elif is_no:
+            awaiting_topup_confirmation.pop(chat_id, None)
             await update.message.reply_text(TOPUP_LINK_DECLINED)
+        else:
+            await update.message.reply_text(TOPUP_UNCLEAR_REPLY)
         return
 
     # Cancel subscription trigger: phrase match first, then AI fallback.
