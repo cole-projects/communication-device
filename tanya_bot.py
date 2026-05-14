@@ -270,7 +270,9 @@ REFERRAL_STATE_PATH = _BOT_DIR / "logs" / "referral_nudges.json"
 _USAGE_CSV_LOCK = threading.Lock()
 _REFERRAL_STATE_LOCK = threading.Lock()
 _MONTHLY_USAGE_LOCK = threading.Lock()
+_EXTRA_MESSAGES_LOCK = threading.Lock()
 MONTHLY_USAGE_PATH = _BOT_DIR / "logs" / "monthly_usage.json"
+EXTRA_MESSAGES_PATH = _BOT_DIR / "logs" / "extra_messages.json"
 PAID_ACCESS_PATH = _BOT_DIR / "logs" / "paid_access.json"
 USAGE_CSV_FIELDNAMES = [
     "log_id",
@@ -527,6 +529,40 @@ def credit_monthly_messages(chat_id: int, amount: int) -> int:
         MONTHLY_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
         MONTHLY_USAGE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return count
+
+
+def _load_extra_messages_unlocked() -> dict:
+    if not EXTRA_MESSAGES_PATH.exists():
+        return {}
+    try:
+        return json.loads(EXTRA_MESSAGES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def get_extra_messages(chat_id: int) -> int:
+    with _EXTRA_MESSAGES_LOCK:
+        return _load_extra_messages_unlocked().get(str(chat_id), 0)
+
+
+def add_extra_messages(chat_id: int, amount: int) -> int:
+    with _EXTRA_MESSAGES_LOCK:
+        data = _load_extra_messages_unlocked()
+        total = data.get(str(chat_id), 0) + amount
+        data[str(chat_id)] = total
+        EXTRA_MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        EXTRA_MESSAGES_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return total
+
+
+def consume_extra_message(chat_id: int) -> None:
+    with _EXTRA_MESSAGES_LOCK:
+        data = _load_extra_messages_unlocked()
+        current = data.get(str(chat_id), 0)
+        if current > 0:
+            data[str(chat_id)] = current - 1
+            EXTRA_MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            EXTRA_MESSAGES_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 _PAID_ACCESS_LOCK = threading.Lock()
@@ -2416,13 +2452,17 @@ async def _fire_coaching_message(
     # Monthly cap (paid users only; free trial has its own 25-message hard stop)
     if has_tanyatalk_access(chat_id) and chat_id not in _POST_TRIAL_BYPASS_CHAT_IDS:
         count = get_monthly_message_count(chat_id)
-        if count >= MONTHLY_MESSAGE_CAP:
-            if count == MONTHLY_MESSAGE_CAP:
+        extra = get_extra_messages(chat_id)
+        effective_cap = MONTHLY_MESSAGE_CAP + extra
+        if count >= effective_cap:
+            if count == effective_cap:
                 increment_monthly_message_count(chat_id)
                 awaiting_topup_confirmation[chat_id] = True
                 await update.message.reply_text(MONTHLY_CAP_BLOCK_MESSAGE)
             return
         new_count = increment_monthly_message_count(chat_id)
+        if new_count > MONTHLY_MESSAGE_CAP:
+            consume_extra_message(chat_id)
         if new_count == MONTHLY_CAP_WARNING_AT:
             await update.message.reply_text(MONTHLY_CAP_WARNING_MESSAGE)
 
@@ -2952,8 +2992,8 @@ async def handle_stripe_webhook(request):
                 else:
                     amount_cents = session_obj.get("amount_total", 0)
                     qty = max(1, amount_cents // 500)
-                    credited = credit_monthly_messages(chat_id, qty * 60)
-                    logger.info("Top-up: credited %d messages to chat_id=%d (count now %d)", qty * 60, chat_id, credited)
+                    total_extra = add_extra_messages(chat_id, qty * 60)
+                    logger.info("Top-up: added %d bonus messages to chat_id=%d (total bonus now %d)", qty * 60, chat_id, total_extra)
                     if _telegram_bot:
                         await _telegram_bot.send_message(chat_id=chat_id, text=TOPUP_CREDITED_MESSAGE)
             except (ValueError, TypeError) as e:
