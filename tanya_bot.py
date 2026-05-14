@@ -54,6 +54,10 @@ STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "").strip()
 STRIPE_PAYMENT_LINK_PLACEHOLDER = os.getenv("STRIPE_PAYMENT_LINK_PLACEHOLDER", "https://stripe.com").strip()
 STRIPE_TOPUP_LINK = os.getenv("STRIPE_TOPUP_LINK", "").strip()
 STRIPE_PORTAL_LINK = os.getenv("STRIPE_PORTAL_LINK", "").strip()
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+STRIPE_TOPUP_PRICE_ID = os.getenv("STRIPE_TOPUP_PRICE_ID", "").strip()
+TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip()
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
 _POST_TRIAL_BYPASS_CHAT_IDS = frozenset(
@@ -119,17 +123,11 @@ NEW_CLIENT_OPENER_BEAT_SEC = 1.0
 
 def free_trial_close_text() -> str:
     """Copy when the first-session free trial ends (25 messages, idle timeout, or explicit end). Uses STRIPE_PAYMENT_LINK from env when set."""
-    base = (
+    return (
         "Unfortunately, this is where our time wraps up. That was a great session. "
-        "If you want to keep going, it's $20 a month for 250 messages."
+        "If you want to keep going, it's $20 a month for 250 messages. "
+        "Would you like me to send you the link?"
     )
-    if STRIPE_PAYMENT_LINK:
-        return (
-            f"{base}\n\n"
-            f"Here's your secure checkout link: {STRIPE_PAYMENT_LINK}\n\n"
-            "Reply yes if you'd like me to send the link again, or no if you're not ready to continue."
-        )
-    return f"{base} Reply yes and I'll send you the link."
 
 FREE_TRIAL_STRIPE_DECLINED = (
     "That's completely okay. Whenever you feel ready, I'll be right here. "
@@ -500,6 +498,19 @@ def increment_monthly_message_count(chat_id: int) -> int:
         data = _load_monthly_usage_unlocked()
         user_data = data.setdefault(str(chat_id), {})
         count = user_data.get(key, 0) + 1
+        user_data[key] = count
+        MONTHLY_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MONTHLY_USAGE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return count
+
+
+def credit_monthly_messages(chat_id: int, amount: int) -> int:
+    """Decrease this month's count by amount to reflect a top-up purchase. Returns new count."""
+    key = _monthly_key()
+    with _MONTHLY_USAGE_LOCK:
+        data = _load_monthly_usage_unlocked()
+        user_data = data.setdefault(str(chat_id), {})
+        count = max(0, user_data.get(key, 0) - amount)
         user_data[key] = count
         MONTHLY_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
         MONTHLY_USAGE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -2370,7 +2381,15 @@ async def _fire_coaching_message(
             if count == MONTHLY_MESSAGE_CAP:
                 increment_monthly_message_count(chat_id)
                 msg = MONTHLY_CAP_BLOCK_MESSAGE
-                if STRIPE_TOPUP_LINK:
+                if STRIPE_SECRET_KEY and STRIPE_TOPUP_PRICE_ID:
+                    try:
+                        checkout_url = await create_topup_checkout_url(chat_id)
+                        msg += f"\n\n{checkout_url}"
+                    except Exception as e:
+                        logger.error("Failed to create top-up checkout URL: %s", e)
+                        if STRIPE_TOPUP_LINK:
+                            msg += f"\n\n{STRIPE_TOPUP_LINK}"
+                elif STRIPE_TOPUP_LINK:
                     msg += f"\n\n{STRIPE_TOPUP_LINK}"
                 await update.message.reply_text(msg)
             return
@@ -2812,6 +2831,75 @@ def ensure_vault() -> None:
         logger.error("Failed to extract vault: %s", e)
 
 
+async def create_topup_checkout_url(chat_id: int) -> str:
+    import stripe as stripe_lib
+    stripe_lib.api_key = STRIPE_SECRET_KEY
+    return_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}" if TELEGRAM_BOT_USERNAME else "https://telegram.org"
+    session = await asyncio.to_thread(
+        stripe_lib.checkout.Session.create,
+        line_items=[{
+            "price": STRIPE_TOPUP_PRICE_ID,
+            "quantity": 1,
+            "adjustable_quantity": {"enabled": True, "minimum": 1, "maximum": 99},
+        }],
+        mode="payment",
+        metadata={"chat_id": str(chat_id)},
+        success_url=return_url,
+        cancel_url=return_url,
+    )
+    return session.url
+
+
+async def handle_stripe_webhook(request):
+    from aiohttp import web
+    import stripe as stripe_lib
+    payload = await request.read()
+    sig_header = request.headers.get("Stripe-Signature", "")
+    try:
+        event = stripe_lib.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        logger.warning("Stripe webhook verification failed: %s", e)
+        return web.Response(status=400)
+
+    if event["type"] == "checkout.session.completed":
+        session_obj = event["data"]["object"]
+        chat_id_str = (session_obj.get("metadata") or {}).get("chat_id", "")
+        if chat_id_str:
+            try:
+                chat_id = int(chat_id_str)
+                amount_cents = session_obj.get("amount_total", 0)
+                qty = max(1, amount_cents // 500)
+                credited = credit_monthly_messages(chat_id, qty * 60)
+                logger.info("Top-up: credited %d messages to chat_id=%d (count now %d)", qty * 60, chat_id, credited)
+            except (ValueError, TypeError) as e:
+                logger.error("Top-up credit failed: %s", e)
+
+    return web.Response(status=200)
+
+
+_webhook_runner = None
+
+
+async def start_stripe_webhook_server() -> None:
+    global _webhook_runner
+    from aiohttp import web
+    app = web.Application()
+    app.router.add_post("/stripe/webhook", handle_stripe_webhook)
+    _webhook_runner = web.AppRunner(app)
+    await _webhook_runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(_webhook_runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Stripe webhook server listening on port %d", port)
+
+
+async def stop_stripe_webhook_server() -> None:
+    global _webhook_runner
+    if _webhook_runner:
+        await _webhook_runner.cleanup()
+        _webhook_runner = None
+
+
 def main():
     try:
         ensure_vault()
@@ -2838,9 +2926,12 @@ def main():
                 open_coaching_session=open_coaching_session_after_mini,
             )
             await tanya_followup.start_scheduler()
+            if STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET:
+                await start_stripe_webhook_server()
 
         async def post_shutdown(app: Application) -> None:
             await tanya_followup.shutdown_scheduler()
+            await stop_stripe_webhook_server()
 
         app = (
             ApplicationBuilder()
