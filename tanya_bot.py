@@ -136,8 +136,8 @@ FREE_TRIAL_STRIPE_DECLINED = (
 )
 
 STRIPE_CONFIRMATION_UNCLEAR_REPLY = (
-    "I want to be sure I understood. Reply yes if you want the payment link again, "
-    "or no if you are not ready yet."
+    "The link has the details on what is included. "
+    "Just say yes if you would like me to send it, or no if you are not ready yet."
 )
 
 # Optional mid-session referral line: first eligible session number, minimum sessions between nudges.
