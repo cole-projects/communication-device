@@ -59,9 +59,6 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_TOPUP_PRICE_ID = os.getenv("STRIPE_TOPUP_PRICE_ID", "").strip()
 STRIPE_SUBSCRIPTION_PRICE_ID = os.getenv("STRIPE_SUBSCRIPTION_PRICE_ID", "").strip()
 TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip()
-PROMO_CODES: frozenset[str] = frozenset(
-    c.strip().upper() for c in os.getenv("PROMO_CODES", "").split(",") if c.strip()
-)
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
 _POST_TRIAL_BYPASS_CHAT_IDS = frozenset(
@@ -2874,16 +2871,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(TOPUP_LINK_DECLINED)
         else:
             await update.message.reply_text(TOPUP_UNCLEAR_REPLY)
-        return
-
-    # Promo code: grant full access without payment.
-    if PROMO_CODES and user_text.strip().upper() in PROMO_CODES:
-        grant_tanyatalk_access(chat_id)
-        mark_free_trial_completed(chat_id)
-        await update.message.reply_text(
-            "You're all set. Your access is active and your 250 messages are ready. "
-            "Come back whenever you are ready and we will pick up right where we left off."
-        )
         return
 
     # Cancel subscription trigger: phrase match first, then AI fallback.
