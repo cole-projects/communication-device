@@ -160,7 +160,7 @@ CANCEL_TRIGGERS: frozenset[str] = frozenset({
 })
 CANCEL_MESSAGE_WITH_LINK = (
     "Of course. You can cancel anytime through your billing portal. "
-    "Your conversations and profile will still be here if you ever come back.\n\n"
+    "Everything will still be here if you ever want to come back.\n\n"
     "{portal_link}"
 )
 # Right-to-deletion flow.
@@ -1830,6 +1830,22 @@ async def end_session(chat_id: int):
     new_client_voice_followup_snippet.pop(chat_id, None)
 
 
+async def ai_detects_cancel_intent(text: str) -> bool:
+    """Return True if Claude thinks the message is a subscription cancellation request."""
+    try:
+        response = await claude.messages.create(
+            model=CLAUDE_HAIKU_MODEL,
+            max_tokens=5,
+            system="Reply with only 'yes' or 'no'. No other text.",
+            messages=[{"role": "user", "content": (
+                f"Does this message express a desire to cancel, stop, or end a subscription or billing?\n\nMessage: {text}"
+            )}],
+        )
+        return response.content[0].text.strip().lower().startswith("yes")
+    except Exception:
+        return False
+
+
 async def ai_detects_delete_intent(text: str) -> bool:
     """Return True if Claude thinks the message is a data-deletion request."""
     try:
@@ -2719,9 +2735,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(DELETE_CANCELLED_MESSAGE)
         return
 
-    # Cancel subscription trigger.
+    # Cancel subscription trigger: phrase match first, then AI fallback.
     user_text_lower = user_text.strip().lower()
-    if any(trigger in user_text_lower for trigger in CANCEL_TRIGGERS):
+    if any(trigger in user_text_lower for trigger in CANCEL_TRIGGERS) or await ai_detects_cancel_intent(user_text):
         msg = CANCEL_MESSAGE_WITH_LINK.format(portal_link=STRIPE_PORTAL_LINK)
         await update.message.reply_text(msg)
         return
