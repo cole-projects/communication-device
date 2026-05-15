@@ -1070,6 +1070,16 @@ FRAMEWORK_ROUTES = [
      ["Scaffolding vs Bypassing.md"]),
     (["deserve", "worthy", "not enough", "enough", "imposter", "fraud", "who am i"],
      ["Belief Excavation.md"]),
+    (["deflect", "can't receive", "can't take a compliment", "block it", "can't let it in",
+      "scanning for approval", "need their approval", "performing for", "prove myself",
+      "shrink", "over-explain", "feel like i belong", "feel worthy", "claim my worth",
+      "embody worth", "belong to myself"],
+     ["FutureYou/FutureYou on Self Worth Presentation.md", "Belief Excavation.md"]),
+    (["i know i can but", "believe it but", "ready but", "hesitant", "doesn't feel like me",
+      "feels weird", "feels foreign", "feels unfamiliar", "feels strange", "step into",
+      "rehearse", "freeze when", "freeze in the moment", "can't seem to start",
+      "cognitively i know", "mentally i know", "i get it but"],
+     ["FYF/FYF The Born Identity.md", "FutureYou/FutureYou Actualization vs Acquisition.md"]),
     (["exhaust", "overwhelm", "burned out", "burnout", "tired", "too much"],
      ["Dips and Sips.md", "Alignment Formula.md"]),
     (["alone", "nobody", "no support", "unsupported", "no one gets it"],
@@ -1097,6 +1107,129 @@ FRAMEWORK_ROUTES = [
     (["neutral", "accept", "resistance", "allow", "letting go"],
      ["Neutrality and Wholness.md"]),
 ]
+
+# Full vault registry: relative path under 01-Frameworks/ → 1-line coaching description.
+# Used by the Haiku framework-selection call so it can reason across every framework,
+# not just the keyword-routed subset.
+FRAMEWORK_DESCRIPTIONS: dict[str, str] = {
+    "4 step reset.md": "Four-step process for interrupting a spiral and resetting emotional state",
+    "Alignment Formula.md": "Formula for returning to alignment when life feels off-track",
+    "Alignment.md": "Core alignment principles — living from true values and direction",
+    "Belief Excavation.md": "Excavating and rewriting limiting beliefs at the root level",
+    "Coherence Protocol.md": "Restoring inner coherence when energy feels scattered or flat",
+    "Dips and Sips.md": "Understanding energy dips and how to restore without bypassing",
+    "Emotion vs Feeling.md": "Distinguishing emotions (body signals) from feelings (mental interpretations)",
+    "Emotions vs Feelings.md": "Distinguishing emotions (body signals) from feelings (mental interpretations)",
+    "Expectations.md": "Examining how unspoken expectations create disappointment and disconnect",
+    "Frequency choices.md": "Making decisions from frequency alignment rather than fear or logic alone",
+    "Future casting vs Rewriting.md": "When to future-cast vs. rewrite — knowing which tool the moment calls for",
+    "Meditation Alignment RYTE Origin.md": "Origin meditation for alignment and nervous system anchoring",
+    "Negative manifestations.md": "Understanding how negative beliefs attract unwanted outcomes",
+    "Neutrality and Wholness.md": "Finding neutrality and wholeness — releasing resistance, accepting what is",
+    "Origin.md": "Tracing recurring patterns back to their original source wound",
+    "Patience Embodiment_.md": "Embodying patience as a frequency, not just a behavior",
+    "Power Reclamation (Franks question).md": "Reclaiming personal power when it has been given away to others",
+    "Scaffolding vs Bypassing.md": "Knowing when to build gradually (scaffold) vs. when bypassing is happening",
+    "The Alignment Arc.md": "The arc of alignment across a full coaching journey",
+    "Ubiquitous Assimilation.md": "Integrating new identity so it becomes the default, not the exception",
+    "Yin Yang.md": "Balancing masculine and feminine energy, effort and surrender",
+    "FutureYou/FutureYou 7 Day Challenge.md": "7-day future-casting challenge for accelerating identity shift",
+    "FutureYou/FutureYou Actualization vs Acquisition.md": "Distinguishing becoming (actualization) from getting (acquisition)",
+    "FutureYou/FutureYou Anchoring.md": "Anchoring a breakthrough or shifted state so it sticks after the session",
+    "FutureYou/FutureYou Belonging.md": "Future-casting belonging — stepping into a version of self that belongs",
+    "FutureYou/FutureYou Billionaire Clarity.md": "Clarity exercise using an abundance and expansion mindset lens",
+    "FutureYou/FutureYou Dealers Choice V1.md": "Open-format future-casting — client chooses the focus area (V1)",
+    "FutureYou/FutureYou Dealers Choice V2.md": "Open-format future-casting — client chooses the focus area (V2)",
+    "FutureYou/FutureYou Dealers Choice V3.md": "Open-format future-casting — client chooses the focus area (V3)",
+    "FutureYou/FutureYou EASE.md": "Future-casting ease — experiencing what effortless forward motion feels like",
+    "FutureYou/FutureYou Fear as Motivator.md": "Reframing fear as a compass pointing toward growth, not a stop sign",
+    "FutureYou/FutureYou Frequency 101.md": "Introduction to frequency — how energy and vibration shape reality",
+    "FutureYou/FutureYou Frequency meditation on space between thoughts.md": "Meditation on the space between thoughts as a portal to frequency",
+    "FutureYou/FutureYou Glimpses.md": "Recognizing and amplifying glimpses where the future self is already showing up",
+    "FutureYou/FutureYou on Health & Vitality Presentation.md": "Future-casting health and vitality — embodying a thriving, well version of self",
+    "FutureYou/FutureYou on Self Worth Presentation.md": "Future-casting self-worth and deservedness — embodying inherent worth as a felt reality",
+    "FutureYou/FutureYou Past Cast.md": "Casting from the past — using past evidence of strength as a springboard forward",
+    "FutureYou/FutureYou Purpose of Goals.md": "Reframing goals as direction-setters, not worth-validators",
+    "FutureYou/FutureYou Q&A after 7 Day Challenge.md": "Integration Q&A after completing the 7-day future-casting challenge",
+    "FutureYou/FutureYou Quantum Healing Experiment.md": "Quantum healing experiment — using consciousness to shift physical state",
+    "FutureYou/FutureYou Quantum Healing.md": "Quantum healing — the intersection of belief, frequency, and physical wellbeing",
+    "FutureYou/FutureYou Quantum Zeno Effect.md": "Quantum Zeno Effect — how consistent observation locks in identity",
+    "FutureYou/FutureYou Scaffolding.md": "Future-casting with scaffolding — building new identity in small, safe steps",
+    "FutureYou/FutureYou SEE.md": "SEE framework — State, Embody, Express as the identity shift cycle",
+    "FutureYou/FutureYou Strained Relationships.md": "Future-casting strained relationships — who does the future self show up as",
+    "FutureYou/FutureYou The After State.md": "The After State — what life feels and looks like once the transformation has landed",
+    "FutureYou/FutureYou Thriving Business.md": "Future-casting a thriving business — identity first, strategy second",
+    "FutureYou/FutureYou Upper Limits.md": "Upper limit patterns — how success triggers self-sabotage and how to move through it",
+    "FYF/FYF BE the Source.md": "BE the Source — becoming the energy you want to attract, not chasing it externally",
+    "FYF/FYF Desire Excavation.md": "Excavating true desire beneath the surface want or stated goal",
+    "FYF/FYF Energy Check.md": "Quick energy audit — where energy is leaking or blocked right now",
+    "FYF/FYF Manifestation Proof.md": "Finding proof of manifestation already at work — shifting focus to evidence",
+    "FYF/FYF Meditation Alignment.md": "Alignment meditation for centering before a session or important decision",
+    "FYF/FYF Moments of Me2.0.md": "Capturing and amplifying moments where the new identity already showed up",
+    "FYF/FYF The Born Identity.md": "Identity rehearsal — when belief is there but embodiment and action haven't caught up yet",
+    "FYF/FYF Upgraded Problems.md": "Reframing problems as proof of leveling up — upgraded problems signal an upgraded self",
+    "FYF/FYF Vision Timeline.md": "Creating a vision timeline — mapping the becoming across a concrete future arc",
+    "Core-Program/Week-1-Circumstance-vs-Thought.md": "Week 1: Separating circumstance from thought — facts vs. the story we tell about them",
+    "Core-Program/Week-2-Catch-Call-Choose.md": "Week 2: Catch the thought, call it out, choose a new one — the basic rewrite cycle",
+    "Core-Program/Week-3-Bypassing-vs-Rewriting.md": "Week 3: Knowing when you're bypassing an emotion vs. genuinely rewriting a belief",
+    "Core-Program/Week-4-Emotional-Holding.md": "Week 4: Holding emotions without collapsing into or suppressing them",
+    "Core-Program/Week-5-Regulation-Stabilization.md": "Week 5: Nervous system regulation and stabilization practices",
+    "Core-Program/Week-6-Integration.md": "Week 6: Integrating new beliefs into daily life and lived identity",
+    "Core-Program/Week-7-Belief-Formation.md": "Week 7: How beliefs form and how to install new ones intentionally",
+}
+
+
+async def select_frameworks_via_claude(
+    message: str,
+    history: list,
+    routing_hint: list[str],
+) -> list[str]:
+    """Ask Claude Haiku to select the 2 most relevant frameworks using coaching intuition."""
+    recent_msgs = [m for m in history[-4:] if isinstance(m.get("content"), str)]
+    recent_text = "\n".join(
+        f"{'CLIENT' if m['role'] == 'user' else 'TANYA'}: {m['content'][:300]}"
+        for m in recent_msgs
+    )
+    fw_lines = "\n".join(
+        f"{path} — {desc}" for path, desc in FRAMEWORK_DESCRIPTIONS.items()
+    )
+    routing_note = ""
+    if routing_hint:
+        routing_note = (
+            f"\nThis client's wound profile flags these as priority frameworks: "
+            f"{', '.join(routing_hint)}\n"
+            "Draw from them when relevant, but don't be constrained if something else fits better.\n"
+        )
+    prompt = (
+        "You are Tanya, a master life coach. A client just sent you this message:\n\n"
+        f"CLIENT: {message}\n\n"
+        f"Recent exchange:\n{recent_text}\n"
+        f"{routing_note}\n"
+        "Your full coaching toolkit (framework file — what it addresses):\n"
+        f"{fw_lines}\n\n"
+        "Which 2 frameworks would you reach for right now to guide your response? "
+        "Trust your coaching instinct — not just what matches the words, but what this client "
+        "actually needs in this moment.\n\n"
+        "Reply with ONLY the 2 framework filenames, one per line. Exact filenames, no explanation."
+    )
+    try:
+        response = await claude.messages.create(
+            model=CLAUDE_HAIKU_MODEL,
+            max_tokens=80,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        lines = response.content[0].text.strip().splitlines()
+        selected: list[str] = []
+        for line in lines:
+            name = line.strip().lstrip("- 0123456789.").strip()
+            if name in FRAMEWORK_DESCRIPTIONS and name not in selected:
+                selected.append(name)
+        if selected:
+            logger.info("Haiku framework selection: %s", selected)
+            return selected[:2]
+    except Exception as exc:
+        logger.warning("Haiku framework selection failed (%s), falling back to keyword triage", exc)
+    return []
 
 
 def select_frameworks(message: str, history: list) -> list[str]:
@@ -1192,35 +1325,28 @@ def framework_paths_in_frameworks_used(profile: str) -> set[str]:
     return out
 
 
-def select_frameworks_for_session(profile: str, message: str, history: list) -> list[str]:
-    """Prefer Session Framework Routing from profile; fall back to keyword triage if empty."""
+async def select_frameworks_for_session(profile: str, message: str, history: list) -> list[str]:
+    """Select frameworks using Haiku coaching intuition; fall back to keyword triage on failure."""
     routing = frameworks_from_session_routing(profile)
+
+    # Primary: Claude Haiku reads the conversation and picks from the full vault
+    chosen = await select_frameworks_via_claude(message, history, routing)
+    if chosen:
+        return chosen
+
+    # Fallback: keyword triage, constrained to routing list when present
     if not routing:
         return select_frameworks(message, history)
 
     used = framework_paths_in_frameworks_used(profile)
-    chosen: list[str] = []
-    if used:
-        for f in routing:
-            if len(chosen) >= 2:
-                break
-            if f not in used:
-                chosen.append(f)
-    if not chosen:
-        chosen = list(routing[:2])
-    elif len(chosen) < 2:
-        for f in routing:
-            if len(chosen) >= 2:
-                break
-            if f not in chosen:
-                chosen.append(f)
-
-    for f in select_frameworks(message, history):
-        if len(chosen) >= 2:
-            break
-        if f not in chosen:
-            chosen.append(f)
-    return chosen[:2]
+    keyword_ranked = select_frameworks(message, history)
+    ordered: list[str] = [f for f in keyword_ranked if f in routing]
+    for f in routing:
+        if f not in ordered:
+            ordered.append(f)
+    unused = [f for f in ordered if f not in used]
+    candidates = unused if unused else ordered
+    return candidates[:2]
 
 
 def load_frameworks(framework_files: list[str]) -> str:
@@ -2749,7 +2875,7 @@ async def _fire_coaching_message(
             _cached_static_prompts[chat_id] = static_prompt
             start_cache_warming(context.application, chat_id)
 
-            relevant_frameworks = select_frameworks_for_session(
+            relevant_frameworks = await select_frameworks_for_session(
                 session_profiles.get(chat_id, ""),
                 user_text,
                 conversations[chat_id],
