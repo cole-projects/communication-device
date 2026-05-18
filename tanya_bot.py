@@ -320,9 +320,10 @@ async def blooio_send_message(phone: str, text: str) -> None:
 
 
 def verify_blooio_signature(raw_body: bytes, signature_header: str) -> bool:
-    """Verify HMAC-SHA256 from X-Blooio-Signature header. Returns True if valid or if no secret configured."""
+    """Verify HMAC-SHA256 from X-Blooio-Signature header. Rejects if no secret is configured."""
     if not BLOOIO_WEBHOOK_SECRET:
-        return True
+        logger.warning("BLOOIO_WEBHOOK_SECRET not set — rejecting unsigned webhook request")
+        return False
     try:
         parts = dict(p.split("=", 1) for p in signature_header.split(","))
         ts = parts.get("t", "")
@@ -1110,6 +1111,18 @@ def load_session_outline() -> str:
     return content
 
 
+def _safe_vault_path(base: Path, *parts: str) -> Path | None:
+    """Resolve a path inside the vault and return it only if it stays within the vault root."""
+    try:
+        resolved = (base / Path(*parts)).resolve()
+        if resolved.is_relative_to(base.resolve()):
+            return resolved
+    except Exception:
+        pass
+    logger.warning("Path traversal attempt blocked: %s under %s", parts, base)
+    return None
+
+
 def load_client_profile(phone_hash: str) -> str:
     """Load client profile by phone hash."""
     profile_path = Path(VAULT_PATH) / "02-Client-Sessions" / "Client Profiles" / f"{phone_hash}.md"
@@ -1268,7 +1281,9 @@ async def load_archive_context(matched_rows: list[dict]) -> str:
         file_path = row["file_path"]
         if not file_path.endswith(".md"):
             file_path += ".md"
-        full_path = Path(VAULT_PATH) / file_path
+        full_path = _safe_vault_path(Path(VAULT_PATH), file_path)
+        if not full_path:
+            continue
         content = await asyncio.to_thread(load_file, full_path)
         if content:
             sections.append(
@@ -1605,7 +1620,9 @@ def load_frameworks(framework_files: list[str]) -> str:
     vault = Path(VAULT_PATH)
     sections = []
     for name in framework_files:
-        fp = vault / "01-Frameworks" / name
+        fp = _safe_vault_path(vault, "01-Frameworks", name)
+        if not fp:
+            continue
         content = load_file(str(fp))
         if content:
             label = name.replace(".md", "").replace("/", " — ")
@@ -3297,8 +3314,10 @@ async def health() -> Response:
 
 
 @_fastapi_app.get("/admin/usage-csv")
-async def admin_usage_csv(key: str = "") -> Response:
-    if not ADMIN_KEY or key != ADMIN_KEY:
+async def admin_usage_csv(request: Request) -> Response:
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if not ADMIN_KEY or token != ADMIN_KEY:
         return Response(status_code=401)
     if not USAGE_CSV_PATH.exists():
         return Response(content="no data yet", status_code=404)
@@ -3325,7 +3344,7 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
     phone = payload.get("sender") or payload.get("from", "")
     text = payload.get("text", "")
     is_group = payload.get("is_group", False)
-    logger.info("Webhook payload: phone=%s text_len=%s is_group=%s keys=%s", phone, len(text) if text else 0, is_group, list(payload.keys()))
+    logger.info("Webhook payload: phone_key=%s text_len=%s is_group=%s keys=%s", _phone_key(phone) if phone else "", len(text) if text else 0, is_group, list(payload.keys()))
     if phone and text and not is_group:
         asyncio.ensure_future(handle_inbound_message(phone, text))
     return Response(status_code=200)
