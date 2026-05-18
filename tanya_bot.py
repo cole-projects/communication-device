@@ -261,8 +261,37 @@ def is_admin_phone(phone: str) -> bool:
     return phone in {p.strip() for p in ADMIN_PHONE_NUMBERS.split(",") if p.strip()}
 
 
+async def blooio_typing_on(phone: str) -> None:
+    """Show typing indicator to client."""
+    chat_id_encoded = quote(phone, safe="")
+    url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/typing"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            await http.post(
+                url,
+                headers={"Authorization": f"Bearer {BLOOIO_API_KEY}"},
+            )
+    except Exception as e:
+        logger.debug("Typing on error: %s", e)
+
+
+async def blooio_typing_off(phone: str) -> None:
+    """Stop typing indicator."""
+    chat_id_encoded = quote(phone, safe="")
+    url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/typing"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            await http.delete(
+                url,
+                headers={"Authorization": f"Bearer {BLOOIO_API_KEY}"},
+            )
+    except Exception as e:
+        logger.debug("Typing off error: %s", e)
+
+
 async def blooio_send_message(phone: str, text: str) -> None:
     """Send a text message via Blooio API v2."""
+    await blooio_typing_off(phone)
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
     try:
@@ -2621,6 +2650,7 @@ async def open_coaching_session_after_mini(phone: str, client_name: str) -> None
 
 async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> None:
     """Process one coaching turn. Called by the debounce timer with potentially combined user text."""
+    await blooio_typing_on(phone)
     ph = phone_to_hash(phone)
 
     # Monthly cap (paid users only; free trial has its own 25-message hard stop)
@@ -3137,6 +3167,7 @@ async def _startup() -> None:
         check_monthly_cap=lambda p: (
             get_monthly_message_count(p) >= MONTHLY_MESSAGE_CAP + get_extra_messages(p)
         ),
+        typing_on=blooio_typing_on,
     )
     await tanya_followup.start_scheduler()
     asyncio.ensure_future(_blooio_failure_poll_loop())

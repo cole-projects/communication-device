@@ -55,6 +55,7 @@ _claude: AsyncAnthropic | None = None
 _claude_model: str = ""
 _claude_haiku_model: str = ""
 _send_message: Callable[[str, str], Awaitable[None]] | None = None
+_typing_on_cb: Callable[[str], Awaitable[None]] | None = None
 _merge_focus_cb: Callable[[str, str], Awaitable[None]] | None = None
 _open_session_cb: Callable[..., Awaitable[None]] | None = None
 _check_monthly_cap_cb: Callable[[str], bool] | None = None  # phone -> True if capped
@@ -74,9 +75,10 @@ def configure(
     merge_focus_for_next_session: Callable[[str, str], Awaitable[None]],
     open_coaching_session: Callable[..., Awaitable[None]],
     check_monthly_cap: Callable[[str], bool] | None = None,
+    typing_on: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     global _claude, _claude_model, _claude_haiku_model, _send_message
-    global _merge_focus_cb, _open_session_cb, _check_monthly_cap_cb
+    global _merge_focus_cb, _open_session_cb, _check_monthly_cap_cb, _typing_on_cb
     _claude = claude
     _claude_model = claude_model
     _claude_haiku_model = claude_haiku_model
@@ -84,6 +86,7 @@ def configure(
     _merge_focus_cb = merge_focus_for_next_session
     _open_session_cb = open_coaching_session
     _check_monthly_cap_cb = check_monthly_cap
+    _typing_on_cb = typing_on
 
 
 def init_scheduler(jobstore_sqlite_path: Path) -> None:
@@ -314,6 +317,8 @@ async def handle_mini_session_turn(phone: str, user_text: str) -> None:
     if not ctxm or not _claude or not _send_message:
         return
 
+    if _typing_on_cb:
+        await _typing_on_cb(phone)
     ctxm.history.append({"role": "user", "content": user_text})
 
     if ctxm.state == MiniState.LISTENING:
