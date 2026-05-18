@@ -143,6 +143,8 @@ REFERRAL_NUDGE_MARKER = "<<<REFERRAL_NUDGE>>>"
 
 # Debounce window: rapid messages arriving within this window are merged into one Claude call.
 DEBOUNCE_SECONDS = 5.0
+# Typing bubble appears this many seconds after a message arrives, before debounce fires.
+TYPING_BUBBLE_DELAY_SEC = 3.0
 
 # Subscription cancellation flow.
 CANCEL_TRIGGERS: frozenset[str] = frozenset({
@@ -906,6 +908,7 @@ _cached_static_prompts: dict[str, str] = {}
 _pending_messages: dict[str, list[str]] = {}  # debounce buffer
 _pending_phones: dict[str, str] = {}          # phone -> phone (replaces _pending_updates)
 _debounce_tasks: dict[str, asyncio.Task] = {}
+_typing_tasks: dict[str, asyncio.Task] = {}   # 3-second typing bubble timer
 awaiting_delete_confirmation: dict[str, bool] = {}
 awaiting_topup_confirmation: dict[str, bool] = {}
 new_client_voice_followup_snippet: dict[str, str] = {}  # kept for opener context; TTS not sent over iMessage
@@ -2418,6 +2421,7 @@ async def delete_client_data(phone: str) -> None:
         _pending_messages,
         _pending_phones,
         _debounce_tasks,
+        _typing_tasks,
         new_client_voice_followup_snippet,
     ):
         state_dict.pop(phone, None)
@@ -2581,6 +2585,7 @@ def cancel_cache_warming(phone: str) -> None:
 
 async def perform_session_close(phone: str, user_text: str) -> bool:
     """End active session if one exists; log close to transcript + history, then send confirmation."""
+    await blooio_typing_on(phone)
     lock = await _get_chat_message_lock(phone)
     async with lock:
         if phone not in session_files:
@@ -3009,6 +3014,19 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
     existing = _debounce_tasks.pop(phone, None)
     if existing and not existing.done():
         existing.cancel()
+
+    existing_typing = _typing_tasks.pop(phone, None)
+    if existing_typing and not existing_typing.done():
+        existing_typing.cancel()
+
+    async def _show_typing_soon() -> None:
+        try:
+            await asyncio.sleep(TYPING_BUBBLE_DELAY_SEC)
+            await blooio_typing_on(phone)
+        except asyncio.CancelledError:
+            pass
+
+    _typing_tasks[phone] = asyncio.ensure_future(_show_typing_soon())
 
     async def _fire() -> None:
         try:
