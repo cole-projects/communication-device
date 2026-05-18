@@ -209,7 +209,7 @@ TOPUP_CREDITED_MESSAGE = (
 # Per-session message cap — prevents marathon sessions from eating the monthly budget.
 # 60 is roughly 3x a typical coaching session; hard to reach naturally.
 SESSION_MESSAGE_CAP = 60
-SESSION_CAP_WARNING_AT = 50
+SESSION_CAP_WARNING_AT = 57  # 3 messages remain — spec: warn client when nearing cap
 SESSION_CAP_WARNING_MESSAGE = (
     "We've been going deep today. Just so you know, we have a little room left in this session."
 )
@@ -3164,7 +3164,7 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
     phone = payload.get("sender") or payload.get("from", "")
     text = payload.get("text", "")
     is_group = payload.get("is_group", False)
-    logger.info("Webhook payload: phone=%s text=%s is_group=%s keys=%s", phone, text[:50] if text else "", is_group, list(payload.keys()))
+    logger.info("Webhook payload: phone=%s text_len=%s is_group=%s keys=%s", phone, len(text) if text else 0, is_group, list(payload.keys()))
     if phone and text and not is_group:
         asyncio.ensure_future(handle_inbound_message(phone, text))
     return Response(status_code=200)
