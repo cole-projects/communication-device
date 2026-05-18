@@ -30,6 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 VAULT_PATH = os.getenv(
