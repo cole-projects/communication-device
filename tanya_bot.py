@@ -3093,12 +3093,18 @@ async def _lifespan(app: FastAPI):
 _fastapi_app = FastAPI(lifespan=_lifespan)
 
 
+@_fastapi_app.get("/health")
+async def health() -> Response:
+    return Response(content="ok", status_code=200)
+
+
 @_fastapi_app.post("/webhook")
 async def blooio_webhook_endpoint(request: Request) -> Response:
     raw_body = await request.body()
+    logger.info("Blooio webhook received: %d bytes", len(raw_body))
     sig = request.headers.get("X-Blooio-Signature", "")
     if BLOOIO_WEBHOOK_SECRET and not verify_blooio_signature(raw_body, sig):
-        logger.warning("Blooio webhook signature verification failed")
+        logger.warning("Blooio webhook signature verification failed (sig=%s)", sig[:40] if sig else "none")
         return Response(status_code=401)
     try:
         payload = json.loads(raw_body)
