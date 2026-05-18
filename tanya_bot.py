@@ -474,6 +474,8 @@ def _write_path_utf8(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 _BOT_DIR = Path(__file__).resolve().parent
+AUDIO_DIR = _BOT_DIR / "audio"
+AUDIO_DIR.mkdir(exist_ok=True)
 COACHING_BLEND_CONFIG_PATH = _BOT_DIR / "logs" / "coaching_blend.json"
 PID_FILE_PATH = _BOT_DIR / "logs" / "tanya_bot.pid"
 USAGE_CSV_PATH = _BOT_DIR / "logs" / "tanya_usage.csv"
@@ -1104,6 +1106,38 @@ async def synthesize_voice(text: str) -> bytes | None:
     except Exception as e:
         logger.error("ElevenLabs request failed: %s", e)
     return None
+
+
+async def synthesize_and_host_voice(text: str) -> str | None:
+    """Synthesize text via ElevenLabs, save MP3 to AUDIO_DIR, return public URL."""
+    import uuid as _uuid
+    audio_bytes = await synthesize_voice(text)
+    if not audio_bytes:
+        return None
+    filename = f"{_uuid.uuid4().hex}.mp3"
+    audio_path = AUDIO_DIR / filename
+    audio_path.write_bytes(audio_bytes)
+    return f"{TANYA_PUBLIC_URL}/audio/{filename}"
+
+
+async def blooio_send_audio(phone: str, audio_url: str) -> None:
+    """Send a hosted MP3 as an iMessage audio attachment via Blooio."""
+    chat_id_encoded = quote(phone, safe="")
+    url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            resp = await http.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {BLOOIO_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"attachments": [{"url": audio_url, "type": "audio/mpeg"}]},
+            )
+            if resp.status_code not in (200, 202):
+                logger.warning("Blooio audio send failed %d: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.error("Blooio audio send error: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -2939,11 +2973,22 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
             if remaining_open > 0:
                 await asyncio.sleep(remaining_open)
 
-            await blooio_send_message(phone, opener_script)
-            logger.info("Returning client opener sent as text for %s", user_name)
+            audio_url = await synthesize_and_host_voice(opener_script)
+            if audio_url:
+                await blooio_send_audio(phone, audio_url)
+                logger.info("Returning client opener sent as voice for %s", user_name)
+            else:
+                await blooio_send_message(phone, opener_script)
+                logger.info("Returning client opener sent as text (ElevenLabs unavailable) for %s", user_name)
 
             pending_first_message_opener.pop(phone, None)
             await asyncio.to_thread(append_tanya_message, session_files[phone], opener_script)
+            conversations[phone].append({"role": "assistant", "content": opener_script})
+            if len(conversations[phone]) > MAX_HISTORY * 2:
+                conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
+            if in_ft:
+                free_trial_user_msg_count[phone] = n_ft
+            return
 
         message_received_at = asyncio.get_event_loop().time()
 
@@ -3357,6 +3402,18 @@ _fastapi_app = FastAPI(lifespan=_lifespan)
 @_fastapi_app.get("/health")
 async def health() -> Response:
     return Response(content="ok", status_code=200)
+
+
+@_fastapi_app.get("/audio/{filename}")
+async def serve_audio(filename: str) -> Response:
+    if "/" in filename or ".." in filename or not filename.endswith(".mp3"):
+        return Response(status_code=404)
+    audio_path = AUDIO_DIR / filename
+    if not audio_path.exists():
+        return Response(status_code=404)
+    content = audio_path.read_bytes()
+    audio_path.unlink(missing_ok=True)
+    return Response(content=content, media_type="audio/mpeg")
 
 
 @_fastapi_app.get("/tanya.vcf")
