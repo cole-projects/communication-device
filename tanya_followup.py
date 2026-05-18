@@ -63,7 +63,6 @@ _check_monthly_cap_cb: Callable[[str], bool] | None = None  # phone -> True if c
 _scheduler: AsyncIOScheduler | None = None
 _mini: dict[str, MiniSessionCtx] = {}
 _post_fu1: dict[str, dict] = {}  # phone -> {session_path, fu1_text, correlation}
-_guard = asyncio.Lock()
 
 
 def configure(
@@ -258,8 +257,8 @@ def on_user_message_cancel_followup(phone: str) -> bool:
             try:
                 _scheduler.remove_job(job.id)
                 logger.info("Cancelled %s (client sent a message)", job.id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Could not remove job %s: %s", job.id, e)
     return had
 
 

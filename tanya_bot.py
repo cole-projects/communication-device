@@ -3343,6 +3343,9 @@ async def handle_stripe_webhook(request: Request) -> Response:
                 phone = (customer.get("metadata") or {}).get("phone", "")
             except Exception as e:
                 logger.error("Could not resolve phone for subscription.deleted: %s", e)
+        if not phone:
+            logger.warning("subscription.deleted ignored — could not resolve phone from metadata or customer")
+            return Response(status_code=200)
         if phone:
             try:
                 revoke_tanyatalk_access(phone)
@@ -3381,8 +3384,9 @@ async def handle_stripe_webhook(request: Request) -> Response:
                 )
             except Exception as e:
                 logger.error("Payment failed notification error: %s", e)
+                # Intentionally return 200 — notification failure is non-critical; don't trigger Stripe retry storms.
 
-    return Response(status_code=200)
+    return Response(status_code=200)  # invoice.payment_failed also exits here — 200 is intentional (see above)
 
 
 # ---------------------------------------------------------------------------
