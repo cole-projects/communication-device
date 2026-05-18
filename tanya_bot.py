@@ -902,6 +902,17 @@ def grant_tanyatalk_access(phone: str) -> None:
     paid_tanyatalk_access[phone] = True
 
 
+def revoke_tanyatalk_access(phone: str) -> None:
+    ph = phone_to_hash(phone)
+    with _PAID_ACCESS_LOCK:
+        ids = _load_paid_access()
+        ids.discard(ph)
+        PAID_ACCESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PAID_ACCESS_PATH.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
+    paid_tanyatalk_access.pop(phone, None)
+    logger.info("Access revoked for phone_key=%s", ph[:12])
+
+
 def load_paid_access_into_memory() -> None:
     # At startup we load hashes from disk but can't reverse to phones —
     # access is re-granted when Stripe webhook fires with the phone.
@@ -3213,6 +3224,55 @@ async def handle_stripe_webhook(request: Request) -> Response:
                     await blooio_send_message(phone, TOPUP_CREDITED_MESSAGE)
             except Exception as e:
                 logger.error("Stripe webhook processing failed: %s", e)
+
+    elif event["type"] == "customer.subscription.deleted":
+        # Subscription cancelled or payment failed too many times — revoke access
+        sub_obj = event["data"]["object"]
+        metadata = sub_obj.get("metadata") or {}
+        phone = metadata.get("phone", "")
+        if not phone:
+            # Try to find phone via customer metadata
+            try:
+                stripe_lib.api_key = STRIPE_SECRET_KEY
+                customer = await asyncio.to_thread(
+                    stripe_lib.Customer.retrieve, sub_obj.get("customer", "")
+                )
+                phone = (customer.get("metadata") or {}).get("phone", "")
+            except Exception:
+                pass
+        if phone:
+            try:
+                revoke_tanyatalk_access(phone)
+                tanya_followup.cancel_all_followup_jobs_for_chat(phone)
+                await blooio_send_message(
+                    phone,
+                    "Your subscription has ended. Your session history is saved and I'll be here if you decide to come back.",
+                )
+            except Exception as e:
+                logger.error("Subscription deletion handling failed: %s", e)
+
+    elif event["type"] == "invoice.payment_failed":
+        invoice_obj = event["data"]["object"]
+        metadata = invoice_obj.get("metadata") or {}
+        phone = metadata.get("phone", "")
+        if not phone:
+            try:
+                stripe_lib.api_key = STRIPE_SECRET_KEY
+                customer = await asyncio.to_thread(
+                    stripe_lib.Customer.retrieve, invoice_obj.get("customer", "")
+                )
+                phone = (customer.get("metadata") or {}).get("phone", "")
+            except Exception:
+                pass
+        if phone:
+            try:
+                await blooio_send_message(
+                    phone,
+                    "Hey, just a heads up — your payment didn't go through this month. "
+                    "Update your card through your billing portal to keep your access.",
+                )
+            except Exception as e:
+                logger.error("Payment failed notification error: %s", e)
 
     return Response(status_code=200)
 
