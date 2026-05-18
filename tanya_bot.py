@@ -3161,6 +3161,7 @@ async def create_subscription_checkout_url(phone: str) -> str:
         stripe_lib.checkout.Session.create,
         line_items=[{"price": STRIPE_SUBSCRIPTION_PRICE_ID, "quantity": 1}],
         mode="subscription",
+        allow_promotion_codes=True,
         metadata={"phone": phone, "product_type": "subscription"},
         success_url="https://stripe.com",
         cancel_url="https://stripe.com",
