@@ -2753,6 +2753,8 @@ def cancel_cache_warming(phone: str) -> None:
 
 async def perform_session_close(phone: str, user_text: str) -> bool:
     """End active session if one exists; log close to transcript + history, then send confirmation."""
+    # Same rhythm as debounced coaching: typing indicator after TYPING_BUBBLE_DELAY_SEC, not immediate.
+    await asyncio.sleep(TYPING_BUBBLE_DELAY_SEC)
     await blooio_typing_on(phone)
     lock = await _get_chat_message_lock(phone)
     async with lock:
@@ -3200,6 +3202,15 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
 
     # Session end: whole message matches SESSION_END_NORMALIZED; not model-decided.
     if is_session_end_message(user_text):
+        # Cancel debounced coaching / pending typing so "end session" wins; then use same 3s-then-typing as other messages.
+        existing = _debounce_tasks.pop(phone, None)
+        if existing and not existing.done():
+            existing.cancel()
+        existing_typing = _typing_tasks.pop(phone, None)
+        if existing_typing and not existing_typing.done():
+            existing_typing.cancel()
+        _pending_messages.pop(phone, None)
+        _pending_phones.pop(phone, None)
         await perform_session_close(phone, user_text)
         return
 
