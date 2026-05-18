@@ -2168,7 +2168,11 @@ def in_first_free_trial_session(phone: str) -> bool:
 
 
 def has_tanyatalk_access(phone: str) -> bool:
-    return paid_tanyatalk_access.get(phone, False) or mesh_tanyatalk_included.get(phone, False)
+    return (
+        paid_tanyatalk_access.get(phone, False)
+        or mesh_tanyatalk_included.get(phone, False)
+        or phone in _POST_TRIAL_BYPASS_PHONES
+    )
 
 
 def should_block_unpaid_after_free_trial(phone: str) -> bool:
