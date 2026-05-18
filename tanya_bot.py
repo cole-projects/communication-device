@@ -3110,9 +3110,10 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
         payload = json.loads(raw_body)
     except Exception:
         return Response(status_code=400)
-    phone = payload.get("sender", "")
+    phone = payload.get("sender") or payload.get("from", "")
     text = payload.get("text", "")
     is_group = payload.get("is_group", False)
+    logger.info("Webhook payload: phone=%s text=%s is_group=%s keys=%s", phone, text[:50] if text else "", is_group, list(payload.keys()))
     if phone and text and not is_group:
         asyncio.ensure_future(handle_inbound_message(phone, text))
     return Response(status_code=200)
