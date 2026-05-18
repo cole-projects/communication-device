@@ -2,6 +2,8 @@ import os
 import io
 import re
 import csv
+import hmac
+import hashlib
 import asyncio
 import logging
 import datetime
@@ -11,18 +13,10 @@ import threading
 import subprocess
 from datetime import timezone
 from pathlib import Path
+from urllib.parse import quote
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.error import NetworkError, TimedOut
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
-from telegram.request import HTTPXRequest
+from fastapi import FastAPI, Request, Response
+import uvicorn
 import anthropic
 import httpx
 
@@ -36,7 +30,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 VAULT_PATH = os.getenv(
     "VAULT_PATH",
@@ -44,8 +37,6 @@ VAULT_PATH = os.getenv(
 )
 GITHUB_PAT = os.getenv("GITHUB_PAT", "").strip()
 GITHUB_VAULT_REPO = os.getenv("GITHUB_VAULT_REPO", "https://github.com/cole-projects/tanya-brain.git")
-ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
-ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_HAIKU_MODEL = os.getenv("CLAUDE_HAIKU_MODEL", "claude-haiku-4-5-20251001")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
@@ -59,13 +50,18 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_TOPUP_PRICE_ID = os.getenv("STRIPE_TOPUP_PRICE_ID", "").strip()
 STRIPE_SUBSCRIPTION_PRICE_ID = os.getenv("STRIPE_SUBSCRIPTION_PRICE_ID", "").strip()
-TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip()
+# Blooio iMessage API
+BLOOIO_API_KEY = os.getenv("BLOOIO_API_KEY", "").strip()
+BLOOIO_WEBHOOK_SECRET = os.getenv("BLOOIO_WEBHOOK_SECRET", "").strip()
+BLOOIO_PHONE_NUMBER = os.getenv("BLOOIO_PHONE_NUMBER", "+13177282783").strip()
+ADMIN_PHONE_NUMBERS = os.getenv("ADMIN_PHONE_NUMBERS", "").strip()
+BLOOIO_BASE_URL = "https://backend.blooio.com/v2/api"
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
-_POST_TRIAL_BYPASS_CHAT_IDS = frozenset(
-    int(x.strip())
-    for x in os.getenv("POST_TRIAL_ALLOW_CHAT_IDS", "").split(",")
-    if x.strip().isdigit()
+_POST_TRIAL_BYPASS_PHONES: frozenset[str] = frozenset(
+    x.strip()
+    for x in os.getenv("POST_TRIAL_ALLOW_PHONES", "").split(",")
+    if x.strip()
 )
 
 # Optional: log approximate USD per API call (coaching messages). Set to 0/false to show tokens only.
@@ -122,14 +118,11 @@ OPENER_INTRO = (
 # Brief pause between separate new-client opener bubbles (after typing delay).
 NEW_CLIENT_OPENER_BEAT_SEC = 1.0
 
-
-def free_trial_close_text() -> str:
-    """Copy when the first-session free trial ends (25 messages, idle timeout, or explicit end). Uses STRIPE_PAYMENT_LINK from env when set."""
-    return (
-        "Unfortunately, this is where our time wraps up. That was a great session. "
-        "If you want to keep going, it's $20 a month for 250 messages. "
-        "Would you like me to send you the link?"
-    )
+FREE_TRIAL_CLOSE_TEXT = (
+    "Unfortunately, this is where our time wraps up. That was a great session. "
+    "If you want to keep going, it's $20 a month for 250 messages. "
+    "Reply yes and I'll send you the link."
+)
 
 FREE_TRIAL_STRIPE_DECLINED = (
     "That's completely okay. Whenever you feel ready, I'll be right here. "
@@ -238,23 +231,169 @@ ARCHIVE_STOP_WORDS = {
     "who", "s", "re", "ve",
 }
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN not set")
 if not ANTHROPIC_API_KEY:
     raise RuntimeError("ANTHROPIC_API_KEY not set")
+if not BLOOIO_API_KEY:
+    raise RuntimeError("BLOOIO_API_KEY not set")
 
 claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-# Serialize message-driven work per chat so concurrent users do not block each other.
+# ---------------------------------------------------------------------------
+# Blooio transport helpers
+# ---------------------------------------------------------------------------
+
+def phone_to_hash(phone: str) -> str:
+    """SHA-256 of normalized E.164 phone. Used for ALL file paths and log identifiers."""
+    normalized = re.sub(r"\s+", "", phone)
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def _phone_key(phone: str) -> str:
+    """16-char SHA-256 prefix — safe short identifier for logs (mirrors tanya_followup)."""
+    return phone_to_hash(phone)[:16]
+
+
+def is_admin_phone(phone: str) -> bool:
+    if not ADMIN_PHONE_NUMBERS:
+        return False
+    return phone in {p.strip() for p in ADMIN_PHONE_NUMBERS.split(",") if p.strip()}
+
+
+async def blooio_send_message(phone: str, text: str) -> None:
+    """Send a text message via Blooio API v2."""
+    chat_id_encoded = quote(phone, safe="")
+    url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            resp = await http.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {BLOOIO_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"text": text},
+            )
+            if resp.status_code not in (200, 202):
+                logger.error("Blooio send failed %d: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.error("Blooio send error: %s", e)
+
+
+def verify_blooio_signature(raw_body: bytes, signature_header: str) -> bool:
+    """Verify HMAC-SHA256 from X-Blooio-Signature header. Returns True if valid or if no secret configured."""
+    if not BLOOIO_WEBHOOK_SECRET:
+        return True
+    try:
+        parts = dict(p.split("=", 1) for p in signature_header.split(","))
+        ts = parts.get("t", "")
+        v1 = parts.get("v1", "")
+        signed = f"{ts}.{raw_body.decode('utf-8', errors='replace')}"
+        expected = hmac.new(
+            BLOOIO_WEBHOOK_SECRET.encode(),
+            signed.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, v1)
+    except Exception:
+        return False
+
+
+async def get_stripe_customer_name(phone: str) -> str:
+    """Look up Stripe customer by phone number; return display name or 'Client'."""
+    if not STRIPE_SECRET_KEY:
+        return "Client"
+    try:
+        import stripe as stripe_lib
+        stripe_lib.api_key = STRIPE_SECRET_KEY
+        customers = await asyncio.to_thread(
+            stripe_lib.Customer.search,
+            query=f'phone:"{phone}"',
+            limit=1,
+        )
+        if customers.data:
+            name = (customers.data[0].get("name") or "").strip()
+            if not name:
+                name = (customers.data[0].get("email") or "").strip()
+            return name or "Client"
+    except Exception as e:
+        logger.warning("Stripe name lookup failed: %s", e)
+    return "Client"
+
+
+# ---------------------------------------------------------------------------
+# Failure-polling: catch messages missed during restarts/deploys
+# ---------------------------------------------------------------------------
+
+_last_failure_poll_at: float = 0.0
+_processed_message_ids: set[str] = set()
+_MAX_SEEN_IDS = 500
+
+
+async def _blooio_failure_poll_loop() -> None:
+    """Poll Blooio webhook logs every 30s for failed deliveries and replay them."""
+    global _last_failure_poll_at
+    await asyncio.sleep(10)  # brief startup delay
+    while True:
+        await asyncio.sleep(30)
+        try:
+            since_ts = int(_last_failure_poll_at * 1000) if _last_failure_poll_at else 0
+            async with httpx.AsyncClient(timeout=15.0) as http:
+                resp = await http.get(
+                    f"{BLOOIO_BASE_URL}/webhook-logs",
+                    headers={"Authorization": f"Bearer {BLOOIO_API_KEY}"},
+                    params={"status": "failed", "limit": 100, "since": since_ts},
+                )
+            if resp.status_code == 404:
+                # Endpoint not available on this plan — poll silently
+                pass
+            elif resp.status_code == 200:
+                data = resp.json()
+                entries = data if isinstance(data, list) else data.get("data", [])
+                _last_failure_poll_at = datetime.datetime.now(timezone.utc).timestamp()
+                for entry in entries:
+                    payload = entry.get("payload") or entry.get("body") or {}
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except Exception:
+                            continue
+                    event = entry.get("event") or payload.get("event") or ""
+                    if event != "message.received":
+                        continue
+                    msg_id = payload.get("message_id", "")
+                    if not msg_id or msg_id in _processed_message_ids:
+                        continue
+                    sender = payload.get("sender", "")
+                    text = payload.get("text", "")
+                    if sender and text:
+                        logger.info("Replaying missed webhook message_id=%s", msg_id)
+                        await handle_inbound_message(sender, text)
+                        _processed_message_ids.add(msg_id)
+                        if len(_processed_message_ids) > _MAX_SEEN_IDS:
+                            # Keep only the most recent half
+                            ids_list = list(_processed_message_ids)
+                            _processed_message_ids.clear()
+                            _processed_message_ids.update(ids_list[-(_MAX_SEEN_IDS // 2):])
+            else:
+                logger.warning("Blooio failure poll returned %d", resp.status_code)
+        except Exception as e:
+            logger.warning("Blooio failure poll error: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Per-phone message serialization
+# ---------------------------------------------------------------------------
+
+# Serialize message-driven work per phone so concurrent users do not block each other.
 _chat_locks_guard = asyncio.Lock()
-_chat_message_locks: dict[int, asyncio.Lock] = {}
+_chat_message_locks: dict[str, asyncio.Lock] = {}
 
 
-async def _get_chat_message_lock(chat_id: int) -> asyncio.Lock:
+async def _get_chat_message_lock(phone: str) -> asyncio.Lock:
     async with _chat_locks_guard:
-        if chat_id not in _chat_message_locks:
-            _chat_message_locks[chat_id] = asyncio.Lock()
-        return _chat_message_locks[chat_id]
+        if phone not in _chat_message_locks:
+            _chat_message_locks[phone] = asyncio.Lock()
+        return _chat_message_locks[phone]
 
 
 def _write_path_utf8(path: Path, text: str) -> None:
@@ -366,7 +505,7 @@ FREE_TRIAL_COMPLETED_PATH = _BOT_DIR / "logs" / "free_trial_completed.json"
 USAGE_CSV_FIELDNAMES = [
     "log_id",
     "timestamp",
-    "chat_id",
+    "phone_hash",
     "user",
     "model",
     "input_tokens",
@@ -375,11 +514,11 @@ USAGE_CSV_FIELDNAMES = [
     "cache_creation_input_tokens",
     "approx_usd",
 ]
-last_coaching_usage: dict[int, dict] = {}
+last_coaching_usage: dict[str, dict] = {}
 
 
 def acquire_single_instance_lock() -> None:
-    """Exclusive PID file (O_CREAT|O_EXCL) so a second bot process fails fast instead of Telegram 409."""
+    """Exclusive PID file so a second process fails fast."""
     PID_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(2):
         try:
@@ -538,13 +677,13 @@ def init_usage_csv_file() -> None:
             logger.info("Usage CSV initialized at %s", USAGE_CSV_PATH)
 
 
-def record_coaching_usage(chat_id: int, username: str, response) -> None:
-    """Log + remember + append CSV for one Tanya reply.
-    Haiku calls logged at Sonnet rates — approx_usd will overestimate for non-coaching calls."""
+def record_coaching_usage(phone: str, username: str, response) -> None:
+    """Log + remember + append CSV for one Tanya reply."""
     info = extract_usage_from_response(response)
     if not info:
         return
-    tag = f"coaching chat={chat_id} user={username}"
+    ph = phone_to_hash(phone)
+    tag = f"coaching phone_hash={ph[:12]} user={username}"
     log_claude_usage(tag, info)
     try:
         with _USAGE_CSV_LOCK:
@@ -555,7 +694,7 @@ def record_coaching_usage(chat_id: int, username: str, response) -> None:
             row = {
                 "log_id": log_id,
                 "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-                "chat_id": chat_id,
+                "phone_hash": ph,
                 "user": username,
                 "model": CLAUDE_MODEL,
                 **info,
@@ -571,7 +710,7 @@ def record_coaching_usage(chat_id: int, username: str, response) -> None:
                 if new_file:
                     w.writeheader()
                 w.writerow(row)
-        last_coaching_usage[chat_id] = row
+        last_coaching_usage[phone] = row
     except Exception as e:
         logger.error("Could not write %s: %s", USAGE_CSV_PATH, e)
 
@@ -589,17 +728,19 @@ def _load_monthly_usage_unlocked() -> dict:
         return {}
 
 
-def get_monthly_message_count(chat_id: int) -> int:
+def get_monthly_message_count(phone: str) -> int:
+    ph = phone_to_hash(phone)
     with _MONTHLY_USAGE_LOCK:
-        return _load_monthly_usage_unlocked().get(str(chat_id), {}).get(_monthly_key(), 0)
+        return _load_monthly_usage_unlocked().get(ph, {}).get(_monthly_key(), 0)
 
 
-def increment_monthly_message_count(chat_id: int) -> int:
-    """Increment this month's count for chat_id and return the new total."""
+def increment_monthly_message_count(phone: str) -> int:
+    """Increment this month's count and return the new total."""
+    ph = phone_to_hash(phone)
     key = _monthly_key()
     with _MONTHLY_USAGE_LOCK:
         data = _load_monthly_usage_unlocked()
-        user_data = data.setdefault(str(chat_id), {})
+        user_data = data.setdefault(ph, {})
         count = user_data.get(key, 0) + 1
         user_data[key] = count
         MONTHLY_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -607,12 +748,13 @@ def increment_monthly_message_count(chat_id: int) -> int:
     return count
 
 
-def credit_monthly_messages(chat_id: int, amount: int) -> int:
+def credit_monthly_messages(phone: str, amount: int) -> int:
     """Decrease this month's count by amount to reflect a top-up purchase. Returns new count."""
+    ph = phone_to_hash(phone)
     key = _monthly_key()
     with _MONTHLY_USAGE_LOCK:
         data = _load_monthly_usage_unlocked()
-        user_data = data.setdefault(str(chat_id), {})
+        user_data = data.setdefault(ph, {})
         count = max(0, user_data.get(key, 0) - amount)
         user_data[key] = count
         MONTHLY_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -629,27 +771,30 @@ def _load_extra_messages_unlocked() -> dict:
         return {}
 
 
-def get_extra_messages(chat_id: int) -> int:
+def get_extra_messages(phone: str) -> int:
+    ph = phone_to_hash(phone)
     with _EXTRA_MESSAGES_LOCK:
-        return _load_extra_messages_unlocked().get(str(chat_id), 0)
+        return _load_extra_messages_unlocked().get(ph, 0)
 
 
-def add_extra_messages(chat_id: int, amount: int) -> int:
+def add_extra_messages(phone: str, amount: int) -> int:
+    ph = phone_to_hash(phone)
     with _EXTRA_MESSAGES_LOCK:
         data = _load_extra_messages_unlocked()
-        total = data.get(str(chat_id), 0) + amount
-        data[str(chat_id)] = total
+        total = data.get(ph, 0) + amount
+        data[ph] = total
         EXTRA_MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
         EXTRA_MESSAGES_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return total
 
 
-def consume_extra_message(chat_id: int) -> None:
+def consume_extra_message(phone: str) -> None:
+    ph = phone_to_hash(phone)
     with _EXTRA_MESSAGES_LOCK:
         data = _load_extra_messages_unlocked()
-        current = data.get(str(chat_id), 0)
+        current = data.get(ph, 0)
         if current > 0:
-            data[str(chat_id)] = current - 1
+            data[ph] = current - 1
             EXTRA_MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
             EXTRA_MESSAGES_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -657,7 +802,7 @@ def consume_extra_message(chat_id: int) -> None:
 _PAID_ACCESS_LOCK = threading.Lock()
 
 
-def _load_paid_access() -> set[int]:
+def _load_paid_access() -> set[str]:
     if not PAID_ACCESS_PATH.exists():
         return set()
     try:
@@ -666,21 +811,23 @@ def _load_paid_access() -> set[int]:
         return set()
 
 
-def grant_tanyatalk_access(chat_id: int) -> None:
+def grant_tanyatalk_access(phone: str) -> None:
+    ph = phone_to_hash(phone)
     with _PAID_ACCESS_LOCK:
         ids = _load_paid_access()
-        ids.add(chat_id)
+        ids.add(ph)
         PAID_ACCESS_PATH.parent.mkdir(parents=True, exist_ok=True)
         PAID_ACCESS_PATH.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
-    paid_tanyatalk_access[chat_id] = True
+    paid_tanyatalk_access[phone] = True
 
 
 def load_paid_access_into_memory() -> None:
-    for chat_id in _load_paid_access():
-        paid_tanyatalk_access[chat_id] = True
+    # At startup we load hashes from disk but can't reverse to phones —
+    # access is re-granted when Stripe webhook fires with the phone.
+    pass
 
 
-def _load_free_trial_completed_ids() -> set[int]:
+def _load_free_trial_completed_ids() -> set[str]:
     if not FREE_TRIAL_COMPLETED_PATH.exists():
         return set()
     try:
@@ -689,47 +836,48 @@ def _load_free_trial_completed_ids() -> set[int]:
         return set()
 
 
-def mark_free_trial_completed(chat_id: int) -> None:
-    mark_free_trial_completed(chat_id)
+def mark_free_trial_completed(phone: str) -> None:
+    ph = phone_to_hash(phone)
+    free_trial_completed[phone] = True
     with _FREE_TRIAL_LOCK:
         ids = _load_free_trial_completed_ids()
-        ids.add(chat_id)
+        ids.add(ph)
         FREE_TRIAL_COMPLETED_PATH.parent.mkdir(parents=True, exist_ok=True)
         FREE_TRIAL_COMPLETED_PATH.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
 
 
 def load_free_trial_completed_into_memory() -> None:
-    for chat_id in _load_free_trial_completed_ids():
-        mark_free_trial_completed(chat_id)
+    # Hashes on disk can't be reversed to phones — mark_free_trial_completed
+    # is called at message time when we have the live phone.
+    pass
 
 
-conversations: dict[int, list[dict]] = {}
-voice_enabled: dict[int, bool] = {}
-client_names: dict[int, str] = {}
-last_activity: dict[int, datetime.datetime] = {}
-timeout_tasks: dict[int, asyncio.Task] = {}
-session_files: dict[int, Path] = {}     # active session file path per chat
-session_numbers: dict[int, int] = {}   # current session number per chat
-session_outlines: dict[int, str] = {}  # coaching outline loaded once per session
-session_profiles: dict[int, str] = {}  # client profile loaded once per session
-voice_note_redirects: dict[int, int] = {}  # count of voice note redirects this session
-free_trial_user_msg_count: dict[int, int] = {}  # completed user coaching turns in current session 1
-free_trial_90_warned: dict[int, bool] = {}
-free_trial_completed: dict[int, bool] = {}  # survives end_session; do not pop
-awaiting_stripe_confirmation: dict[int, bool] = {}
-pending_first_message_opener: dict[int, bool] = {}
-paid_tanyatalk_access: dict[int, bool] = {}  # True when Stripe subscription active (webhook)
-mesh_tanyatalk_included: dict[int, bool] = {}  # True when client is in MESH with TanyaTalk included
-referral_nudge_used_this_session: dict[int, bool] = {}  # at most one optional referral line per session
-cache_warm_tasks: dict[int, asyncio.Task] = {}
-_cached_static_prompts: dict[int, str] = {}  # static prompt per chat for warming pings
-_pending_messages: dict[int, list[str]] = {}  # debounce buffer: messages waiting to be combined
-_pending_updates: dict[int, object] = {}       # latest Telegram Update per chat (for replying)
-_debounce_tasks: dict[int, asyncio.Task] = {}  # active debounce timer per chat
-awaiting_delete_confirmation: dict[int, bool] = {}  # True when client has triggered delete flow
-awaiting_topup_confirmation: dict[int, bool] = {}  # True when client hit cap and we asked if they want the top-up link
-# Set when new client hears the short opener line as voice; consumed on first coaching turn for model context.
-new_client_voice_followup_snippet: dict[int, str] = {}
+conversations: dict[str, list[dict]] = {}
+voice_enabled: dict[str, bool] = {}
+client_names: dict[str, str] = {}       # phone -> display name (from Stripe)
+last_activity: dict[str, datetime.datetime] = {}
+timeout_tasks: dict[str, asyncio.Task] = {}
+session_files: dict[str, Path] = {}     # phone -> active session file path
+session_numbers: dict[str, int] = {}   # phone -> current session number
+session_outlines: dict[str, str] = {}  # phone -> coaching outline (loaded once per session)
+session_profiles: dict[str, str] = {}  # phone -> client profile (loaded once per session)
+voice_note_redirects: dict[str, int] = {}  # not used over iMessage; kept for schema compat
+free_trial_user_msg_count: dict[str, int] = {}
+free_trial_90_warned: dict[str, bool] = {}
+free_trial_completed: dict[str, bool] = {}  # survives end_session; do not pop
+awaiting_stripe_confirmation: dict[str, bool] = {}
+pending_first_message_opener: dict[str, bool] = {}
+paid_tanyatalk_access: dict[str, bool] = {}  # True when Stripe subscription active
+mesh_tanyatalk_included: dict[str, bool] = {}  # True when client is in MESH with TanyaTalk included
+referral_nudge_used_this_session: dict[str, bool] = {}
+cache_warm_tasks: dict[str, asyncio.Task] = {}
+_cached_static_prompts: dict[str, str] = {}
+_pending_messages: dict[str, list[str]] = {}  # debounce buffer
+_pending_phones: dict[str, str] = {}          # phone -> phone (replaces _pending_updates)
+_debounce_tasks: dict[str, asyncio.Task] = {}
+awaiting_delete_confirmation: dict[str, bool] = {}
+awaiting_topup_confirmation: dict[str, bool] = {}
+new_client_voice_followup_snippet: dict[str, str] = {}  # kept for opener context; TTS not sent over iMessage
 
 MAX_HISTORY = 40
 
@@ -749,7 +897,7 @@ SESSION_END_NORMALIZED = frozenset(
 
 
 def sanitize_name_for_path(name: str) -> str:
-    """Remove path-traversal characters from a Telegram first_name before using it in file paths."""
+    """Remove path-traversal characters from a client name before using it in file paths."""
     cleaned = re.sub(r'[/\\\x00]', '', name)    # strip directory separators and null bytes
     cleaned = re.sub(r'\.{2,}', '.', cleaned)   # collapse .. to prevent traversal
     cleaned = cleaned.strip('. ')               # remove leading/trailing dots and spaces
@@ -806,7 +954,7 @@ async def synthesize_voice(text: str) -> bytes | None:
                         "stability": 0.71,
                         "similarity_boost": 0.85,
                         "style": 0.64,
-                        "use_speaker_boost": True,
+                        "use_speaker_boost": False,
                         "speed": 0.95,
                     },
                 },
@@ -857,17 +1005,17 @@ def load_session_outline() -> str:
     return content
 
 
-def load_client_profile(client_name: str) -> str:
-    """Load client profile if it exists."""
-    profile_path = Path(VAULT_PATH) / "02-Client-Sessions" / "Client Profiles" / f"{client_name}.md"
+def load_client_profile(phone_hash: str) -> str:
+    """Load client profile by phone hash."""
+    profile_path = Path(VAULT_PATH) / "02-Client-Sessions" / "Client Profiles" / f"{phone_hash}.md"
     content = load_file(profile_path)
     if content:
-        logger.info("Loaded profile for: %s", client_name)
+        logger.info("Loaded profile for hash: %s", phone_hash[:12])
     return content
 
 
-def profile_path_for(client_name: str) -> Path:
-    return Path(VAULT_PATH) / "02-Client-Sessions" / "Client Profiles" / f"{client_name}.md"
+def profile_path_for(phone_hash: str) -> Path:
+    return Path(VAULT_PATH) / "02-Client-Sessions" / "Client Profiles" / f"{phone_hash}.md"
 
 
 def strip_archived_section(profile_text: str) -> str:
@@ -1039,9 +1187,9 @@ def profile_indicates_prior_session(content: str) -> bool:
     return False
 
 
-def is_returning_client(client_name: str) -> bool:
+def is_returning_client(phone_hash: str) -> bool:
     """True only if a real profile exists with evidence of a prior session."""
-    path = profile_path_for(client_name)
+    path = profile_path_for(phone_hash)
     if not path.exists():
         return False
     return profile_indicates_prior_session(load_file(path))
@@ -1397,7 +1545,7 @@ def build_static_prompt(
 
     return f"""You are Tanya, a professional life coach and founder of MESH Coaching (Mental, Emotional, and Spiritual Health).
 
-You are speaking with a client through Telegram. Respond exactly as Tanya would: warm, direct, grounded, empowering.
+You are speaking with a client through iMessage. Respond exactly as Tanya would: warm, direct, grounded, empowering.
 
 ## Character Rules (non-negotiable)
 
@@ -1412,7 +1560,7 @@ You are speaking with a client through Telegram. Respond exactly as Tanya would:
 
 ---
 
-**Saving and closing (important):** The Telegram bot saves and closes a session only when the client sends a recognized close phrase (for example **end session** and a few short variants) or the command **/endsession**, or after about 30 minutes with no messages. If they sound finished, in a hurry, or like they are leaving but have not actually closed yet, acknowledge that in one short phrase and tell them they can send **end session** or **/endsession** when they are ready to save and close. Do not tell them the session is already saved until they have done one of those. You cannot trigger a save from your side.
+**Saving and closing (important):** A session saves and closes only when the client sends a recognized close phrase (for example **end session** and a few short variants), or after about 30 minutes with no messages. If they sound finished, in a hurry, or like they are leaving but have not actually closed yet, acknowledge that in one short phrase and tell them they can send **end session** when they are ready to save and close. Do not tell them the session is already saved until they have done that. You cannot trigger a save from your side.
 
 ---
 
@@ -1496,27 +1644,24 @@ Reflective phrases like "that's real," "that lands," or "that's deep" are powerf
 # Session file management — create on start, append in real time
 # ---------------------------------------------------------------------------
 
-def get_next_session_number(client_name: str) -> int:
+def get_next_session_number(phone_hash: str) -> int:
     """Count existing Session N.md files and return the next number."""
-    session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / client_name
+    session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
     if not session_dir.exists():
         return 1
     existing = [f for f in session_dir.iterdir() if f.name.startswith("Session ") and f.suffix == ".md"]
     return len(existing) + 1
 
 
-def start_session_file(client_name: str, session_num: int) -> Path:
+def start_session_file(phone_hash: str, client_name: str, session_num: int) -> Path:
     """Create the session file with header and backlinks. Return the path."""
     today = datetime.date.today().isoformat()
-    session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / client_name
+    session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
     session_dir.mkdir(parents=True, exist_ok=True)
-
-    # Do not create Client Profiles/[Name].md here. A blank file made every new
-    # client look "returning." Profiles are created/updated at session end only.
 
     session_file = session_dir / f"Session {session_num}.md"
     header = (
-        f"**Client:** [[02-Client-Sessions/Client Profiles/{client_name}|{client_name}]] · "
+        f"**Client:** [[02-Client-Sessions/Client Profiles/{phone_hash}|{client_name}]] · "
         f"[[02-Client-Sessions|Client Sessions]]\n\n"
         f"# Session {session_num} — {client_name}\n\n"
         f"*Date: {today}*\n\n---\n\n"
@@ -1609,11 +1754,12 @@ Use concise phrases. No em dashes. No space before commas."""
     logger.info("Follow-Up Extraction written to %s", session_path)
 
 
-async def merge_focus_for_next_session_profile(client_name: str, problem_one_liner: str) -> None:
+async def merge_focus_for_next_session_profile(phone: str, problem_one_liner: str) -> None:
     """Append a focus line to ## Focus for Next Session in the vault profile (mini-session)."""
-    path = profile_path_for(client_name)
+    ph = phone_to_hash(phone)
+    path = profile_path_for(ph)
     if not path.exists():
-        logger.warning("merge_focus: no profile for %s", client_name)
+        logger.warning("merge_focus: no profile for phone_hash=%s", ph[:12])
         return
     existing = await asyncio.to_thread(load_file, path)
     needle = "## Focus for Next Session"
@@ -1632,15 +1778,15 @@ async def merge_focus_for_next_session_profile(client_name: str, problem_one_lin
     logger.info("Focus for Next Session updated for %s", client_name)
 
 
-async def update_client_profile(client_name: str, session_num: int, history: list):
+async def update_client_profile(phone_hash: str, client_name: str, session_num: int, history: list):
     """Ask Claude to update (or create) the client profile based on the completed session."""
     if not history:
         return
 
-    existing_profile = await asyncio.to_thread(load_client_profile, client_name)
+    existing_profile = await asyncio.to_thread(load_client_profile, phone_hash)
     template = await asyncio.to_thread(load_file, template_path())
     today = datetime.date.today().isoformat()
-    session_link = f"[[02-Client-Sessions/{client_name}/Session {session_num}|Session {session_num}]]"
+    session_link = f"[[02-Client-Sessions/{phone_hash}/Session {session_num}|Session {session_num}]]"
 
     transcript_lines = []
     for msg in history:
@@ -1715,13 +1861,13 @@ Return ONLY the completed profile markdown — nothing else."""
         )
         updated_profile = response.content[0].text.strip()
         updated_profile = cap_profile_sessions(updated_profile)
-        await asyncio.to_thread(_write_path_utf8, profile_path_for(client_name), updated_profile)
-        logger.info("Profile updated for: %s (session %d)", client_name, session_num)
+        await asyncio.to_thread(_write_path_utf8, profile_path_for(phone_hash), updated_profile)
+        logger.info("Profile updated for hash %s (session %d)", phone_hash[:12], session_num)
     except Exception as e:
-        logger.error("Profile update failed for %s: %s", client_name, e)
+        logger.error("Profile update failed for hash %s: %s", phone_hash[:12], e)
 
 
-async def update_vault_index_files(client_name: str, session_num: int, today: str, profile: str, transcript: str):
+async def update_vault_index_files(phone_hash: str, client_name: str, session_num: int, today: str, profile: str, transcript: str):
     """Use Claude to update Client Hub and 02-Client-Sessions.md to stay in sync."""
     hub_path = Path(VAULT_PATH) / "02-Client-Sessions" / "Client Hub.md"
     index_path = Path(VAULT_PATH) / "02-Client-Sessions.md"
@@ -1755,8 +1901,8 @@ Here is the current Client Hub:
 {hub_content}
 
 Update it as follows:
-- In "Clients With Profiles": if {client_name} is not already listed, add them with a one-line summary in this exact format: `- [[02-Client-Sessions/Client Profiles/{client_name}|{client_name}]] — [Primary wound] / [Secondary wound] · [Stage] · [One-line key focus]`. Use the existing entries as the format reference.
-- In "All Clients — Session History" table: if {client_name} is already listed, increment their session count by 1 and update their profile link to `[[02-Client-Sessions/Client Profiles/{client_name}|Profile]]` if not already there — never remove their existing row. If they are not listed, add them alphabetically with session count 1 and profile link.
+- In "Clients With Profiles": if {client_name} is not already listed, add them with a one-line summary in this exact format: `- [[02-Client-Sessions/Client Profiles/{phone_hash}|{client_name}]] — [Primary wound] / [Secondary wound] · [Stage] · [One-line key focus]`. Use the existing entries as the format reference.
+- In "All Clients — Session History" table: if {client_name} is already listed, increment their session count by 1 and update their profile link to `[[02-Client-Sessions/Client Profiles/{phone_hash}|Profile]]` if not already there — never remove their existing row. If they are not listed, add them alphabetically with session count 1 and profile link.
 - Update the `*Last updated:*` date at the bottom to {today}.
 - Do not change anything else.
 
@@ -1771,11 +1917,11 @@ Here is the current 02-Client-Sessions.md:
 {index_content}
 
 Update it as follows:
-- In the profiles line at the top (starting with `> Clients with a profile`): if {client_name} is not already listed, add `[[02-Client-Sessions/Client Profiles/{client_name}|{client_name}]]` alphabetically in the list.
-- In the Clients section: if {client_name} already has a section, append a new session line `- [[02-Client-Sessions/{client_name}/Session {session_num}|Session {session_num} — {today_display}]]` under their existing session links — never remove or replace previous session links. Update the primary themes line only if new themes emerged. If {client_name} does not have a section yet, add one alphabetically in this format:
+- In the profiles line at the top (starting with `> Clients with a profile`): if {client_name} is not already listed, add `[[02-Client-Sessions/Client Profiles/{phone_hash}|{client_name}]]` alphabetically in the list.
+- In the Clients section: if {client_name} already has a section, append a new session line `- [[02-Client-Sessions/{phone_hash}/Session {session_num}|Session {session_num} — {today_display}]]` under their existing session links — never remove or replace previous session links. Update the primary themes line only if new themes emerged. If {client_name} does not have a section yet, add one alphabetically in this format:
 ```
 ### {client_name}
-- [[02-Client-Sessions/{client_name}/Session {session_num}|Session {session_num} — {today_display}]]
+- [[02-Client-Sessions/{phone_hash}/Session {session_num}|Session {session_num} — {today_display}]]
 *Primary themes: [2-3 key themes from the session]*
 ```
 - Update the `*Last updated:*` line at the bottom — increment the transcript count by 1.
@@ -1844,7 +1990,7 @@ This is a returning client only. Never imply a first meeting. Return only the gr
 
 async def generate_new_client_opener_bridge(first_message: str) -> str:
     """Short lead-in before OPENER_INTRO for every new client — same two-message flow for all first lines."""
-    system = """You are Tanya, a life coach, on Telegram. A brand-new client just sent their first message (below).
+    system = """You are Tanya, a life coach. A brand-new client just sent their first message via iMessage (below).
 
 Write a SHORT opening (1–2 sentences max) they will see immediately BEFORE her fixed welcome text. That welcome always starts with "Hi, I'm Tanya" and then covers privacy, terms, and how she works — you must NOT quote or repeat any of that welcome.
 
@@ -1875,9 +2021,9 @@ Rules:
 
 async def generate_new_client_opener_followup_line(first_message: str) -> str:
     """Third outbound line for new clients: invite coaching without faux-intimacy."""
-    system = """Tanya already sent her short personalized opener and her fixed welcome/terms in text. You write ONLY her single next Telegram line.
+    system = """Tanya already sent her short personalized opener and her fixed welcome/terms in text. You write ONLY her single next iMessage line.
 
-This line will be sent as a **short voice note** (ElevenLabs), so write for the ear: natural spoken English, no bullet lists, no markdown, no parentheses with stage directions.
+Write for the ear: natural spoken English, no bullet lists, no markdown, no parentheses with stage directions.
 
 This is someone's first-ever exchange with her. Avoid generic acquaintance-check-ins ('how have you been', 'how are you doing', 'these days', 'what's new with you')—they signal a shallow relationship she does not have yet.
 
@@ -1914,35 +2060,20 @@ async def prepare_new_client_opener_parts(user_text: str) -> tuple[str, str]:
 
 
 async def deliver_new_client_opener_messages(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
+    phone: str,
     user_name: str,
     bridge: str,
     followup: str,
 ) -> str:
-    """Outbound flow: (1) text — bridge + OPENER_INTRO; (2) short line as voice when TTS is available."""
+    """Outbound flow: (1) bridge + OPENER_INTRO; (2) short coaching invite line — all text over iMessage."""
     main_combined = f"{bridge}\n\n{OPENER_INTRO}"
-
-    await safe_send_chat_action(context.bot, chat_id, "typing")
-    await update.message.reply_text(main_combined)
-    logger.info("New client opener: main block sent as text for %s", user_name)
+    await blooio_send_message(phone, main_combined)
+    logger.info("New client opener: main block sent for %s", user_name)
 
     await asyncio.sleep(NEW_CLIENT_OPENER_BEAT_SEC)
 
-    await safe_send_chat_action(context.bot, chat_id, "record_voice")
-    audio_follow = await synthesize_voice(followup)
-    if audio_follow:
-        await context.bot.send_voice(
-            chat_id=chat_id,
-            voice=io.BytesIO(audio_follow),
-            filename="tanya.mp3",
-        )
-        new_client_voice_followup_snippet[chat_id] = followup
-        logger.info("New client opener: follow-up voice sent for %s", user_name)
-    else:
-        await update.message.reply_text(followup)
-        logger.info("New client opener: follow-up text sent for %s (no TTS)", user_name)
+    await blooio_send_message(phone, followup)
+    logger.info("New client opener: follow-up line sent for %s", user_name)
 
     return f"{main_combined}\n\n{followup}"
 
@@ -1958,10 +2089,10 @@ def _parse_stripe_confirmation_label(raw: str) -> str:
 
 
 async def classify_stripe_confirmation_intent(
-    chat_id: int, username: str, user_text: str,
+    phone: str, username: str, user_text: str,
 ) -> str:
     """Use Haiku to classify reply after trial Stripe prompt: affirmative | negative | unclear."""
-    system = """You classify the client's latest message in Telegram.
+    system = """You classify the client's latest message in iMessage.
 
 Context: They finished the free trial. Tanya offered TanyaTalk for a monthly fee and offered to send a secure Stripe payment link when they are ready. This message is their reply.
 
@@ -1979,11 +2110,11 @@ Reply with exactly one word on the first line: affirmative OR negative OR unclea
             system=system,
             messages=[{"role": "user", "content": user_text}],
         )
-        await asyncio.to_thread(record_coaching_usage, chat_id, username, response)
+        await asyncio.to_thread(record_coaching_usage, phone, username, response)
         label = _parse_stripe_confirmation_label(response.content[0].text)
         logger.info(
-            "Stripe confirmation intent chat=%s label=%s",
-            chat_id,
+            "Stripe confirmation intent phone_key=%s label=%s",
+            _phone_key(phone),
             label,
         )
         return label
@@ -1996,25 +2127,25 @@ SESSION_CLOSE_CONFIRMATION = "I've saved our session. When you're here, I'm here
 LINK_RESPONSE = "I can't open links, but I'm here with you. What's on your mind?"
 
 
-def in_first_free_trial_session(chat_id: int) -> bool:
+def in_first_free_trial_session(phone: str) -> bool:
     return (
-        session_numbers.get(chat_id) == 1
-        and not free_trial_completed.get(chat_id, False)
+        session_numbers.get(phone) == 1
+        and not free_trial_completed.get(phone, False)
     )
 
 
-def has_tanyatalk_access(chat_id: int) -> bool:
-    return paid_tanyatalk_access.get(chat_id, False) or mesh_tanyatalk_included.get(chat_id, False)
+def has_tanyatalk_access(phone: str) -> bool:
+    return paid_tanyatalk_access.get(phone, False) or mesh_tanyatalk_included.get(phone, False)
 
 
-def should_block_unpaid_after_free_trial(chat_id: int) -> bool:
+def should_block_unpaid_after_free_trial(phone: str) -> bool:
     if not BLOCK_AFTER_FREE_TRIAL:
         return False
-    if chat_id in _POST_TRIAL_BYPASS_CHAT_IDS:
+    if phone in _POST_TRIAL_BYPASS_PHONES:
         return False
-    if not free_trial_completed.get(chat_id):
+    if not free_trial_completed.get(phone):
         return False
-    if has_tanyatalk_access(chat_id):
+    if has_tanyatalk_access(phone):
         return False
     return True
 
@@ -2059,12 +2190,12 @@ def referral_record_nudge(client_name: str, session_num: int) -> None:
         _referral_state_save_unlocked(s)
 
 
-def referral_nudge_prompt_allowed(chat_id: int, client_name: str) -> bool:
+def referral_nudge_prompt_allowed(phone: str, client_name: str) -> bool:
     """True when session spacing allows offering the optional referral line (context still model-gated)."""
-    sess = session_numbers.get(chat_id, 0)
+    sess = session_numbers.get(phone, 0)
     if sess < REFERRAL_NUDGE_FIRST_ELIGIBLE_SESSION:
         return False
-    if referral_nudge_used_this_session.get(chat_id):
+    if referral_nudge_used_this_session.get(phone):
         return False
     last = referral_get_last_nudge_session(client_name)
     if last is None:
@@ -2099,63 +2230,63 @@ def strip_referral_nudge_marker(text: str) -> tuple[str, bool]:
     return text, False
 
 
-def cancel_session_timeout(chat_id: int) -> None:
-    if chat_id in timeout_tasks and not timeout_tasks[chat_id].done():
-        timeout_tasks[chat_id].cancel()
+def cancel_session_timeout(phone: str) -> None:
+    if phone in timeout_tasks and not timeout_tasks[phone].done():
+        timeout_tasks[phone].cancel()
 
 
-async def end_session(chat_id: int):
+async def end_session(phone: str):
     """Transcript already written in real time — update profile + vault indexes, then clear state."""
-    client_name = client_names.get(chat_id, "Client")
-    history = conversations.get(chat_id, [])
-    session_num = session_numbers.get(chat_id, 1)
-    session_path = session_files.get(chat_id)
+    ph = phone_to_hash(phone)
+    client_name = client_names.get(phone, "Client")
+    history = conversations.get(phone, [])
+    session_num = session_numbers.get(phone, 1)
+    session_path = session_files.get(phone)
 
     if history:
-        logger.info("Ending session for %s session %d (%d messages)", client_name, session_num, len(history))
+        logger.info("Ending session for hash %s session %d (%d messages)", ph[:12], session_num, len(history))
         today = datetime.date.today().isoformat()
 
-        # Transcript already written — just update profile and indexes
-        await update_client_profile(client_name, session_num, history)
+        await update_client_profile(ph, client_name, session_num, history)
 
-        profile = await asyncio.to_thread(load_file, profile_path_for(client_name))
+        profile = await asyncio.to_thread(load_file, profile_path_for(ph))
         transcript_lines = []
         for msg in history:
             role = "Tanya" if msg["role"] == "assistant" else client_name
             transcript_lines.append(f"{role}: {msg['content']}")
         transcript = "\n".join(transcript_lines)
 
-        if session_path and len(history) >= MIN_EXCHANGES_FOR_FOLLOWUP and has_tanyatalk_access(chat_id):
+        if session_path and len(history) >= MIN_EXCHANGES_FOR_FOLLOWUP and has_tanyatalk_access(phone):
             ended_at = datetime.datetime.now(timezone.utc)
             await append_follow_up_extraction(
                 session_path, client_name, session_num, history, ended_at
             )
             tanya_followup.schedule_follow_up_1(
-                chat_id, client_name, session_path, session_num, ended_at
+                phone, client_name, session_path, session_num, ended_at
             )
         elif session_path:
             logger.info(
-                "Skipping follow-up for %s session %d (%d messages < %d threshold)",
-                client_name, session_num, len(history), MIN_EXCHANGES_FOR_FOLLOWUP,
+                "Skipping follow-up for hash %s session %d (%d messages < %d threshold)",
+                ph[:12], session_num, len(history), MIN_EXCHANGES_FOR_FOLLOWUP,
             )
 
-        await update_vault_index_files(client_name, session_num, today, profile, transcript)
+        await update_vault_index_files(ph, client_name, session_num, today, profile, transcript)
         asyncio.create_task(push_vault_changes(client_name, session_num))
 
-    cancel_cache_warming(chat_id)
-    _cached_static_prompts.pop(chat_id, None)
-    referral_nudge_used_this_session.pop(chat_id, None)
-    conversations.pop(chat_id, None)
-    session_files.pop(chat_id, None)
-    session_numbers.pop(chat_id, None)
-    session_outlines.pop(chat_id, None)
-    session_profiles.pop(chat_id, None)
-    voice_note_redirects.pop(chat_id, None)
-    pending_first_message_opener.pop(chat_id, None)
-    free_trial_user_msg_count.pop(chat_id, None)
-    free_trial_90_warned.pop(chat_id, None)
-    last_activity.pop(chat_id, None)
-    new_client_voice_followup_snippet.pop(chat_id, None)
+    cancel_cache_warming(phone)
+    _cached_static_prompts.pop(phone, None)
+    referral_nudge_used_this_session.pop(phone, None)
+    conversations.pop(phone, None)
+    session_files.pop(phone, None)
+    session_numbers.pop(phone, None)
+    session_outlines.pop(phone, None)
+    session_profiles.pop(phone, None)
+    voice_note_redirects.pop(phone, None)
+    pending_first_message_opener.pop(phone, None)
+    free_trial_user_msg_count.pop(phone, None)
+    free_trial_90_warned.pop(phone, None)
+    last_activity.pop(phone, None)
+    new_client_voice_followup_snippet.pop(phone, None)
 
 
 async def ai_detects_cancel_intent(text: str) -> bool:
@@ -2191,57 +2322,55 @@ async def ai_detects_delete_intent(text: str) -> bool:
         return False
 
 
-async def delete_client_data(chat_id: int) -> None:
+async def delete_client_data(phone: str) -> None:
     """Anonymize all data for a client who requested deletion.
 
     The session folder is renamed to an unguessable UUID-based name so the bot
     can never find it again (treating the user as new on return), while the raw
     files remain on disk for any audit/legal need. All other state tied to
-    chat_id is also cleared.
+    phone is also cleared.
     """
     import uuid
 
-    client_name = client_names.get(chat_id, "")
+    ph = phone_to_hash(phone)
 
     # End any live session cleanly first (writes transcript, clears state).
-    if chat_id in conversations:
-        await end_session(chat_id)
+    if phone in conversations:
+        await end_session(phone)
 
     # Rename session folder and profile file to unguessable names so the bot
     # can never find them again (treats the user as brand-new on return).
     # Anonymized items are moved into a _Deleted/ subfolder to keep the vault tidy.
-    if client_name:
-        sessions_deleted_bin = Path(VAULT_PATH) / "02-Client-Sessions" / "_Deleted"
-        profiles_deleted_bin = Path(VAULT_PATH) / "02-Client-Sessions" / "Client Profiles" / "_Deleted"
+    sessions_deleted_bin = Path(VAULT_PATH) / "02-Client-Sessions" / "_Deleted"
+    profiles_deleted_bin = Path(VAULT_PATH) / "02-Client-Sessions" / "Client Profiles" / "_Deleted"
 
-        client_dir = Path(VAULT_PATH) / "02-Client-Sessions" / client_name
-        if client_dir.exists():
-            deleted_name = f"_deleted_{uuid.uuid4().hex}"
-            await asyncio.to_thread(sessions_deleted_bin.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(client_dir.rename, sessions_deleted_bin / deleted_name)
-            logger.info("Anonymized session folder for chat_id=%d → _Deleted/%s", chat_id, deleted_name)
+    client_dir = Path(VAULT_PATH) / "02-Client-Sessions" / ph
+    if client_dir.exists():
+        deleted_name = f"_deleted_{uuid.uuid4().hex}"
+        await asyncio.to_thread(sessions_deleted_bin.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(client_dir.rename, sessions_deleted_bin / deleted_name)
+        logger.info("Anonymized session folder for phone_key=%s → _Deleted/%s", ph[:12], deleted_name)
 
-        profile_file = profile_path_for(client_name)
-        if profile_file.exists():
-            deleted_profile_name = f"_deleted_{uuid.uuid4().hex}.md"
-            await asyncio.to_thread(profiles_deleted_bin.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(profile_file.rename, profiles_deleted_bin / deleted_profile_name)
-            logger.info("Anonymized profile file for chat_id=%d → _Deleted/%s", chat_id, deleted_profile_name)
+    profile_file = profile_path_for(ph)
+    if profile_file.exists():
+        deleted_profile_name = f"_deleted_{uuid.uuid4().hex}.md"
+        await asyncio.to_thread(profiles_deleted_bin.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(profile_file.rename, profiles_deleted_bin / deleted_profile_name)
+        logger.info("Anonymized profile file for phone_key=%s → _Deleted/%s", ph[:12], deleted_profile_name)
 
     # Remove monthly usage entry so the user starts completely fresh on return.
     def _scrub_monthly_usage():
         with _MONTHLY_USAGE_LOCK:
             usage = _load_monthly_usage_unlocked()
-            key = str(chat_id)
-            if key in usage:
-                del usage[key]
+            if ph in usage:
+                del usage[ph]
                 MONTHLY_USAGE_PATH.write_text(json.dumps(usage, indent=2))
 
     await asyncio.to_thread(_scrub_monthly_usage)
 
     # Cancel any pending follow-up jobs for this client.
     try:
-        tanya_followup.cancel_all_followup_jobs_for_chat(chat_id)
+        tanya_followup.cancel_all_followup_jobs_for_chat(phone)
     except Exception:
         pass
 
@@ -2257,33 +2386,13 @@ async def delete_client_data(chat_id: int) -> None:
         cache_warm_tasks,
         _cached_static_prompts,
         _pending_messages,
-        _pending_updates,
+        _pending_phones,
         _debounce_tasks,
         new_client_voice_followup_snippet,
     ):
-        state_dict.pop(chat_id, None)
+        state_dict.pop(phone, None)
 
-    logger.info("Deletion complete for chat_id=%d", chat_id)
-
-
-# ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
-
-def is_allowed(update: Update) -> bool:
-    if not ALLOWED_USERS:
-        return True
-    allowed = {u.strip().lower() for u in ALLOWED_USERS.split(",") if u.strip()}
-    username = (update.effective_user.username or "").lower()
-    user_id = str(update.effective_user.id)
-    return username in allowed or user_id in allowed
-
-
-def is_admin(update: Update) -> bool:
-    if not ADMIN_USER_IDS.strip():
-        return False
-    allowed = {x.strip() for x in ADMIN_USER_IDS.split(",") if x.strip()}
-    return str(update.effective_user.id) in allowed
+    logger.info("Deletion complete for phone_key=%s", ph[:12])
 
 
 def load_coach_teaching_ratio() -> tuple[int, int]:
@@ -2355,52 +2464,49 @@ def becoming_you_phase_for_prompt(profile_md: str) -> str | None:
 # Timeout task
 # ---------------------------------------------------------------------------
 
-async def session_timeout_task(chat_id: int, bot):
+async def session_timeout_task(phone: str) -> None:
     """Wait SESSION_TIMEOUT_MINUTES then end session if no activity."""
     await asyncio.sleep(SESSION_TIMEOUT_MINUTES * 60)
-    lock = await _get_chat_message_lock(chat_id)
+    lock = await _get_chat_message_lock(phone)
     ended = False
     is_ft = False
     async with lock:
-        if chat_id in conversations and conversations[chat_id]:
-            logger.info("Session timeout for chat_id %d", chat_id)
-            is_ft = in_first_free_trial_session(chat_id)
+        if phone in conversations and conversations[phone]:
+            logger.info("Session timeout for phone_key=%s", _phone_key(phone))
+            is_ft = in_first_free_trial_session(phone)
             if is_ft:
-                mark_free_trial_completed(chat_id)
-                awaiting_stripe_confirmation[chat_id] = True
-            await end_session(chat_id)
+                mark_free_trial_completed(phone)
+                awaiting_stripe_confirmation[phone] = True
+            await end_session(phone)
             ended = True
     if ended:
-        close_text = free_trial_close_text() if is_ft else SESSION_CLOSE_CONFIRMATION
+        close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=close_text,
-            )
+            await blooio_send_message(phone, close_text)
         except Exception:
             pass
 
 
-def reset_timeout(chat_id: int, bot):
+def reset_timeout(phone: str) -> None:
     """Cancel any existing timeout and start a fresh one."""
-    if chat_id in timeout_tasks and not timeout_tasks[chat_id].done():
-        timeout_tasks[chat_id].cancel()
-    timeout_tasks[chat_id] = asyncio.create_task(session_timeout_task(chat_id, bot))
+    if phone in timeout_tasks and not timeout_tasks[phone].done():
+        timeout_tasks[phone].cancel()
+    timeout_tasks[phone] = asyncio.create_task(session_timeout_task(phone))
 
 
 # ---------------------------------------------------------------------------
 # Cache warming — keeps Anthropic prompt cache alive between messages
 # ---------------------------------------------------------------------------
 
-async def _cache_warm_loop(chat_id: int):
+async def _cache_warm_loop(phone: str) -> None:
     """Send a minimal API call every CACHE_WARM_INTERVAL_SEC to keep the prompt cache alive."""
     while True:
         await asyncio.sleep(CACHE_WARM_INTERVAL_SEC)
-        static_prompt = _cached_static_prompts.get(chat_id)
-        if not static_prompt or chat_id not in session_files:
+        static_prompt = _cached_static_prompts.get(phone)
+        if not static_prompt or phone not in session_files:
             logger.info(
-                "Cache warm loop exiting chat_id=%d reason=no_prompt_or_session",
-                chat_id,
+                "Cache warm loop exiting phone_key=%s reason=no_prompt_or_session",
+                _phone_key(phone),
             )
             break
         try:
@@ -2417,23 +2523,23 @@ async def _cache_warm_loop(chat_id: int):
             cr = getattr(_u, "cache_read_input_tokens", 0) if _u else 0
             cc = getattr(_u, "cache_creation_input_tokens", 0) if _u else 0
             logger.info(
-                "Cache warm ping chat_id=%d cache_read=%s cache_creation=%s",
-                chat_id,
+                "Cache warm ping phone_key=%s cache_read=%s cache_creation=%s",
+                _phone_key(phone),
                 cr,
                 cc,
             )
         except Exception as e:
-            logger.warning("Cache warm ping failed for chat_id %d: %s", chat_id, e)
+            logger.warning("Cache warm ping failed for phone_key=%s: %s", _phone_key(phone), e)
 
 
-def start_cache_warming(application: Application, chat_id: int):
+def start_cache_warming(phone: str) -> None:
     """Start or restart the cache warming loop for a session."""
-    cancel_cache_warming(chat_id)
-    cache_warm_tasks[chat_id] = application.create_task(_cache_warm_loop(chat_id))
+    cancel_cache_warming(phone)
+    cache_warm_tasks[phone] = asyncio.ensure_future(_cache_warm_loop(phone))
 
 
-def cancel_cache_warming(chat_id: int):
-    task = cache_warm_tasks.pop(chat_id, None)
+def cancel_cache_warming(phone: str) -> None:
+    task = cache_warm_tasks.pop(phone, None)
     if task and not task.done():
         task.cancel()
 
@@ -2443,678 +2549,433 @@ def cancel_cache_warming(chat_id: int):
 # ---------------------------------------------------------------------------
 
 
-async def safe_send_chat_action(bot, chat_id: int, action: str) -> None:
-    """Typing / record_voice hints are non-critical; flaky networks must not abort the turn."""
-    try:
-        await bot.send_chat_action(chat_id=chat_id, action=action)
-    except (TimedOut, NetworkError) as e:
-        logger.warning("send_chat_action(%s) skipped: %s", action, e)
-
-
-async def _keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
-    """Refreshes the Telegram typing indicator every 4 s until stop_event is set."""
-    while not stop_event.is_set():
-        await safe_send_chat_action(bot, chat_id, "typing")
-        try:
-            await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=4.0)
-        except asyncio.TimeoutError:
-            pass
-
-
-async def perform_session_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def perform_session_close(phone: str, user_text: str) -> bool:
     """End active session if one exists; log close to transcript + history, then send confirmation."""
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-    lock = await _get_chat_message_lock(chat_id)
+    lock = await _get_chat_message_lock(phone)
     async with lock:
-        if chat_id not in session_files:
-            await msg.reply_text(
-                "There isn't an active session to close. Send Tanya a message whenever you want to start."
+        if phone not in session_files:
+            await blooio_send_message(
+                phone,
+                "There isn't an active session to close. Send Tanya a message whenever you want to start.",
             )
             return False
 
-        is_ft = in_first_free_trial_session(chat_id)
-        close_text = free_trial_close_text() if is_ft else SESSION_CLOSE_CONFIRMATION
+        is_ft = in_first_free_trial_session(phone)
+        close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
 
-        client_name = client_names.get(chat_id, update.effective_user.first_name or "Client")
-        client_names[chat_id] = client_name
-        user_close = (msg.text or "").strip() or "/endsession"
+        client_name = client_names.get(phone, "Client")
+        user_close = user_text.strip() or "end session"
 
-        session_path = session_files[chat_id]
+        session_path = session_files[phone]
         await asyncio.to_thread(
             append_exchange, session_path, client_name, user_close, close_text
         )
 
-        if chat_id not in conversations:
-            conversations[chat_id] = []
-        conversations[chat_id].append({"role": "user", "content": user_close})
-        conversations[chat_id].append({"role": "assistant", "content": close_text})
-        if len(conversations[chat_id]) > MAX_HISTORY * 2:
-            conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2) :]
+        if phone not in conversations:
+            conversations[phone] = []
+        conversations[phone].append({"role": "user", "content": user_close})
+        conversations[phone].append({"role": "assistant", "content": close_text})
+        if len(conversations[phone]) > MAX_HISTORY * 2:
+            conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
 
         if is_ft:
-            mark_free_trial_completed(chat_id)
-            awaiting_stripe_confirmation[chat_id] = True
+            mark_free_trial_completed(phone)
+            awaiting_stripe_confirmation[phone] = True
 
-        cancel_session_timeout(chat_id)
-        await end_session(chat_id)
-    await msg.reply_text(close_text)
+        cancel_session_timeout(phone)
+        await end_session(phone)
+    await blooio_send_message(phone, close_text)
     return True
 
 
-async def send_with_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(text)
-    if voice_enabled.get(chat_id, True) and ELEVENLABS_API_KEY:
-        await safe_send_chat_action(context.bot, chat_id, "record_voice")
-        audio_bytes = await synthesize_voice(text)
-        if audio_bytes:
-            await context.bot.send_voice(
-                chat_id=chat_id,
-                voice=io.BytesIO(audio_bytes),
-                filename="tanya.mp3",
-            )
-
-
-
-async def begin_session_with_opening(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    client_name: str,
-) -> None:
-    """Create session on disk + outline + profile cache + timeout; opener is sent from handle_message."""
-    chat_id = update.effective_chat.id
-    tanya_followup.cancel_all_followup_jobs_for_chat(chat_id)
-    voice_enabled[chat_id] = False
-    voice_note_redirects[chat_id] = 0
-    referral_nudge_used_this_session.pop(chat_id, None)
+async def begin_session_with_opening(phone: str, client_name: str, phone_hash: str) -> None:
+    """Create session on disk + outline + profile cache + timeout; opener is sent from handle_inbound_message."""
+    tanya_followup.cancel_all_followup_jobs_for_chat(phone)
+    voice_note_redirects[phone] = 0
+    referral_nudge_used_this_session.pop(phone, None)
 
     logger.info("Session opening setup: client=%s", client_name)
 
-    sess_num = await asyncio.to_thread(get_next_session_number, client_name)
-    session_numbers[chat_id] = sess_num
-    session_files[chat_id] = await asyncio.to_thread(start_session_file, client_name, sess_num)
-    session_outlines[chat_id] = await asyncio.to_thread(load_session_outline)
-    session_profiles[chat_id] = await asyncio.to_thread(load_client_profile, client_name)
+    sess_num = await asyncio.to_thread(get_next_session_number, phone_hash)
+    session_numbers[phone] = sess_num
+    session_files[phone] = await asyncio.to_thread(start_session_file, phone_hash, client_name, sess_num)
+    session_outlines[phone] = await asyncio.to_thread(load_session_outline)
+    session_profiles[phone] = await asyncio.to_thread(load_client_profile, phone_hash)
 
-    pending_first_message_opener[chat_id] = True
-    reset_timeout(chat_id, context.bot)
+    pending_first_message_opener[phone] = True
+    reset_timeout(phone)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        await update.message.reply_text("This bot is private.")
-        return
-    chat_id = update.effective_chat.id
-    client_name = sanitize_name_for_path(update.effective_user.first_name or "Client")
-    lock = await _get_chat_message_lock(chat_id)
+async def open_coaching_session_after_mini(phone: str, client_name: str) -> None:
+    """Start a full session after mini-session chooses SESSION_NOW (under per-phone lock)."""
+    ph = phone_to_hash(phone)
+    lock = await _get_chat_message_lock(phone)
     async with lock:
-        if should_block_unpaid_after_free_trial(chat_id):
-            await update.message.reply_text(POST_FREE_TRIAL_BLOCK_MESSAGE)
-            return
-        conversations[chat_id] = []
-        client_names[chat_id] = client_name
-        last_activity[chat_id] = datetime.datetime.now()
-
-        await begin_session_with_opening(update, context, client_name)  # greeting only; no user line yet
+        conversations[phone] = []
+        client_names[phone] = sanitize_name_for_path(client_name)
+        last_activity[phone] = datetime.datetime.now()
+        await begin_session_with_opening(phone, client_names[phone], ph)
 
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-    chat_id = update.effective_chat.id
-    client_name = client_names.get(chat_id, update.effective_user.first_name or "Client")
-    lock = await _get_chat_message_lock(chat_id)
-    async with lock:
-        # Do not let clients wipe trial completion to farm another 25 messages (admins may reset for QA).
-        if (
-            not is_admin(update)
-            and free_trial_completed.get(chat_id)
-            and not has_tanyatalk_access(chat_id)
-        ):
-            await update.message.reply_text(POST_TRIAL_RESET_DENIED_MESSAGE)
-            return
-
-        if conversations.get(chat_id):
-            cancel_session_timeout(chat_id)
-            await end_session(chat_id)
-        conversations[chat_id] = []
-        last_activity[chat_id] = datetime.datetime.now()
-        if is_admin(update):
-            free_trial_completed.pop(chat_id, None)
-
-        await begin_session_with_opening(update, context, client_name)  # greeting only; no user line yet
-
-
-async def show_last_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show approximate USD and tokens for the last Tanya reply in this chat."""
-    if not is_allowed(update):
-        return
-    chat_id = update.effective_chat.id
-    u = last_coaching_usage.get(chat_id)
-    if not u:
-        await update.message.reply_text(
-            "No usage recorded yet. Send Tanya a normal message first, then try /cost again."
-        )
-        return
-    await update.message.reply_text(
-        "Last coaching reply (one API call: your message + Tanya's full answer):\n\n"
-        f"Approx USD: ${u['approx_usd']:.4f}\n"
-        f"(Uses default prices unless you set ANTHROPIC_PRICE_* in .env — check anthropic.com/pricing.)\n\n"
-        f"Tokens — input: {u['input_tokens']}, output: {u['output_tokens']}, "
-        f"cache read: {u['cache_read_input_tokens']}, cache write: {u['cache_creation_input_tokens']}\n\n"
-        f"Running total file: logs/{USAGE_CSV_PATH.name} (inside Communication Device — open in Excel or Numbers)."
-    )
-
-
-async def toggle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-    chat_id = update.effective_chat.id
-    current = voice_enabled.get(chat_id, True)
-    voice_enabled[chat_id] = not current
-    state = "on" if not current else "off"
-    await update.message.reply_text(f"Voice notes turned {state}.")
-
-
-async def cmd_endsession(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Same as sending an accepted end-session phrase; avoids natural-language ambiguity."""
-    if not is_allowed(update):
-        await update.effective_message.reply_text("This bot is private.")
-        return
-    await perform_session_close(update, context)
-
-
-async def open_coaching_session_after_mini(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, client_name: str
-) -> None:
-    """Start a full session after mini-session chooses SESSION_NOW (under per-chat lock)."""
-    chat_id = update.effective_chat.id
-    lock = await _get_chat_message_lock(chat_id)
-    async with lock:
-        conversations[chat_id] = []
-        client_names[chat_id] = sanitize_name_for_path(client_name)
-        last_activity[chat_id] = datetime.datetime.now()
-        await begin_session_with_opening(update, context, client_names[chat_id])
-
-
-async def handle_set_ratio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: set ratio 70/30 (coaching/teaching, must sum to 100)."""
-    if not is_admin(update):
-        await update.message.reply_text("Not authorized to change blend ratio.")
-        return
-    m = re.match(r"(?i)^set\s+ratio\s+(\d+)\s*/\s*(\d+)\s*$", (update.message.text or "").strip())
-    if not m:
-        await update.message.reply_text("Usage: set ratio 70/30  (coaching first, then teaching; must sum to 100)")
-        return
-    c, t = int(m.group(1)), int(m.group(2))
-    if c + t != 100:
-        await update.message.reply_text("The two numbers must add up to 100.")
-        return
-    save_coach_teaching_ratio(c, t)
-    await update.message.reply_text(f"Saved blend: {c}% coaching / {t}% teaching. Applies to messages from here on.")
-
-
-VOICE_REDIRECT_FIRST = (
-    "I'd love to hear your voice, but right now I connect best through text. "
-    "Would you mind typing that out for me?"
-)
-VOICE_REDIRECT_REPEAT = (
-    "I really do want to hear what you're sharing. "
-    "Text helps me be fully present with you. Take your time."
-)
-UNSUPPORTED_MESSAGE_REPLY = (
-    "I can't open that here, but I'm with you. What's on your mind?"
-)
-
-
-async def handle_voice_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-    chat_id = update.effective_chat.id
-    if should_block_unpaid_after_free_trial(chat_id):
-        await update.message.reply_text(POST_FREE_TRIAL_BLOCK_MESSAGE)
-        return
-    has_session = chat_id in session_files
-    count = voice_note_redirects.get(chat_id, 0)
-    voice_note_redirects[chat_id] = count + 1
-    if count == 0:
-        msg = VOICE_REDIRECT_FIRST
-        if not has_session:
-            msg += " Once you do, we'll get started."
-        await update.message.reply_text(msg)
-    else:
-        await update.message.reply_text(VOICE_REDIRECT_REPEAT)
-
-
-async def _fire_coaching_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_name: str, user_text: str
-) -> None:
+async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> None:
     """Process one coaching turn. Called by the debounce timer with potentially combined user text."""
+    ph = phone_to_hash(phone)
+
     # Monthly cap (paid users only; free trial has its own 25-message hard stop)
-    if has_tanyatalk_access(chat_id) and chat_id not in _POST_TRIAL_BYPASS_CHAT_IDS:
-        count = get_monthly_message_count(chat_id)
-        extra = get_extra_messages(chat_id)
+    if has_tanyatalk_access(phone) and phone not in _POST_TRIAL_BYPASS_PHONES:
+        count = get_monthly_message_count(phone)
+        extra = get_extra_messages(phone)
         effective_cap = MONTHLY_MESSAGE_CAP + extra
         if count >= effective_cap:
             if count == effective_cap:
-                increment_monthly_message_count(chat_id)
-                awaiting_topup_confirmation[chat_id] = True
-                await update.message.reply_text(MONTHLY_CAP_BLOCK_MESSAGE)
+                increment_monthly_message_count(phone)
+                awaiting_topup_confirmation[phone] = True
+                await blooio_send_message(phone, MONTHLY_CAP_BLOCK_MESSAGE)
             return
-        new_count = increment_monthly_message_count(chat_id)
+        new_count = increment_monthly_message_count(phone)
         if new_count > MONTHLY_MESSAGE_CAP:
-            consume_extra_message(chat_id)
+            consume_extra_message(phone)
         if new_count == MONTHLY_CAP_WARNING_AT:
-            await update.message.reply_text(MONTHLY_CAP_WARNING_MESSAGE)
+            await blooio_send_message(phone, MONTHLY_CAP_WARNING_MESSAGE)
 
-    lock = await _get_chat_message_lock(chat_id)
+    lock = await _get_chat_message_lock(phone)
     async with lock:
-        if should_block_unpaid_after_free_trial(chat_id):
-            await update.message.reply_text(POST_FREE_TRIAL_BLOCK_MESSAGE)
+        if should_block_unpaid_after_free_trial(phone):
+            await blooio_send_message(phone, POST_FREE_TRIAL_BLOCK_MESSAGE)
             return
 
         session_turn_anchor_time = asyncio.get_event_loop().time()
-        await safe_send_chat_action(context.bot, chat_id, "typing")
 
-        voice_opener_script = ""
-        stop_typing = asyncio.Event()
-        typing_task = asyncio.ensure_future(
-            _keep_typing(context.bot, chat_id, stop_typing)
+        if phone not in session_files:
+            conversations[phone] = []
+            await begin_session_with_opening(phone, user_name, ph)
+        elif phone not in conversations:
+            conversations[phone] = []
+
+        conversations[phone].append({"role": "user", "content": user_text})
+
+        if len(conversations[phone]) > MAX_HISTORY * 2:
+            conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
+
+        reset_timeout(phone)
+
+        # Per-session message cap
+        session_user_msgs = sum(1 for m in conversations[phone] if m["role"] == "user")
+        if session_user_msgs >= SESSION_MESSAGE_CAP:
+            await asyncio.to_thread(
+                append_exchange, session_files[phone], user_name, user_text, SESSION_CAP_BLOCK_MESSAGE
+            )
+            await blooio_send_message(phone, SESSION_CAP_BLOCK_MESSAGE)
+            cancel_session_timeout(phone)
+            await end_session(phone)
+            return
+        if session_user_msgs == SESSION_CAP_WARNING_AT:
+            await blooio_send_message(phone, SESSION_CAP_WARNING_MESSAGE)
+
+        prev_ft = free_trial_user_msg_count.get(phone, 0)
+        n_ft = prev_ft + 1
+        in_ft = in_first_free_trial_session(phone)
+
+        if in_ft and n_ft == FREE_TRIAL_90_PCT_USER_MESSAGE and not free_trial_90_warned.get(phone):
+            free_trial_90_warned[phone] = True
+            await blooio_send_message(phone, FREE_TRIAL_90_WARNING)
+
+        archive_context = ""
+        if any(sig in user_text.lower() for sig in ARCHIVE_REFERENCE_SIGNALS):
+            client_name_for_archive = client_names.get(phone)
+            if client_name_for_archive and phone in session_files:
+                full_profile = await asyncio.to_thread(
+                    load_file, profile_path_for(ph)
+                )
+                if full_profile:
+                    archived_rows = parse_archived_sessions(full_profile)
+                    if archived_rows:
+                        matched = find_matching_archived_sessions(user_text, archived_rows)
+                        if matched:
+                            archive_context = await load_archive_context(matched)
+                            logger.info(
+                                "Archive retrieval: %d match(es) for %s",
+                                len(matched), client_name_for_archive,
+                            )
+
+        if archive_context:
+            conversations[phone][-1] = {
+                "role": "user",
+                "content": f"{archive_context}\n\n---\n\nClient message: {user_text}",
+            }
+
+        if in_ft and n_ft == FREE_TRIAL_USER_MESSAGE_CAP:
+            conversations[phone].append({"role": "assistant", "content": FREE_TRIAL_CLOSE_TEXT})
+            if len(conversations[phone]) > MAX_HISTORY * 2:
+                conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
+            await asyncio.to_thread(
+                append_exchange,
+                session_files[phone],
+                user_name,
+                user_text,
+                FREE_TRIAL_CLOSE_TEXT,
+            )
+            await blooio_send_message(phone, FREE_TRIAL_CLOSE_TEXT)
+            mark_free_trial_completed(phone)
+            free_trial_user_msg_count[phone] = FREE_TRIAL_USER_MESSAGE_CAP
+            awaiting_stripe_confirmation[phone] = True
+            cancel_session_timeout(phone)
+            await end_session(phone)
+            return
+
+        if pending_first_message_opener.get(phone):
+            is_ret = await asyncio.to_thread(is_returning_client, ph)
+            _profile_path = profile_path_for(ph)
+            if _profile_path.exists() and not is_ret:
+                logger.warning(
+                    "Profile file exists but client not classified returning; vault markers may need review (phone_key=%s)",
+                    ph[:12],
+                )
+
+            if not is_ret:
+                bridge, followup = await prepare_new_client_opener_parts(user_text)
+                elapsed_since_anchor = asyncio.get_event_loop().time() - session_turn_anchor_time
+                remaining_open = RESPONSE_DELAY_SECONDS - elapsed_since_anchor
+                if remaining_open > 0:
+                    await asyncio.sleep(remaining_open)
+                opener_script = await deliver_new_client_opener_messages(phone, user_name, bridge, followup)
+                pending_first_message_opener.pop(phone, None)
+                conversations[phone].append({"role": "assistant", "content": opener_script})
+                if len(conversations[phone]) > MAX_HISTORY * 2:
+                    conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
+                await asyncio.to_thread(
+                    append_exchange,
+                    session_files[phone],
+                    user_name,
+                    user_text,
+                    opener_script,
+                )
+                if in_ft:
+                    free_trial_user_msg_count[phone] = n_ft
+                return
+
+            opener_script = await generate_returning_greeting(
+                user_name,
+                session_profiles.get(phone, ""),
+            )
+            logger.info("Returning client greeting prepared for: %s", user_name)
+
+            elapsed_open = asyncio.get_event_loop().time() - session_turn_anchor_time
+            remaining_open = RESPONSE_DELAY_SECONDS - elapsed_open
+            if remaining_open > 0:
+                await asyncio.sleep(remaining_open)
+
+            await blooio_send_message(phone, opener_script)
+            logger.info("Returning client opener sent as text for %s", user_name)
+
+            pending_first_message_opener.pop(phone, None)
+            await asyncio.to_thread(append_tanya_message, session_files[phone], opener_script)
+
+        message_received_at = asyncio.get_event_loop().time()
+
+        client_profile = session_profiles.get(phone, "")
+        phase_line = becoming_you_phase_for_prompt(client_profile)
+        static_prompt = build_static_prompt(
+            client_profile, session_outlines.get(phone, ""), phase_line
+        )
+        _cached_static_prompts[phone] = static_prompt
+        start_cache_warming(phone)
+
+        relevant_frameworks = await select_frameworks_for_session(
+            session_profiles.get(phone, ""),
+            user_text,
+            conversations[phone],
+        )
+        framework_context = (
+            await asyncio.to_thread(load_frameworks, relevant_frameworks)
+            if relevant_frameworks
+            else ""
+        )
+
+        system_blocks: list[dict] = [
+            {"type": "text", "text": static_prompt, "cache_control": {"type": "ephemeral"}},
+        ]
+        if framework_context:
+            system_blocks.append(
+                {"type": "text", "text": f"\n\n---\n\n## Relevant Frameworks\n\n{framework_context}"}
+            )
+
+        profile_client = client_names.get(phone, user_name)
+        if referral_nudge_prompt_allowed(phone, profile_client):
+            system_blocks.append({"type": "text", "text": referral_nudge_system_instruction()})
+
+        logger.info(
+            "Message from %s | Session %d | Profile: %s | Frameworks: %s | Static: %d chars",
+            user_name,
+            session_numbers.get(phone, 0),
+            "loaded" if client_profile else "none",
+            relevant_frameworks or "none",
+            len(static_prompt),
         )
 
         try:
-            if chat_id not in session_files:
-                conversations[chat_id] = []
-                await begin_session_with_opening(update, context, user_name)
-            elif chat_id not in conversations:
-                conversations[chat_id] = []
-
-            conversations[chat_id].append({"role": "user", "content": user_text})
-
-            if len(conversations[chat_id]) > MAX_HISTORY * 2:
-                conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2):]
-
-            reset_timeout(chat_id, context.bot)
-
-            # Per-session message cap
-            session_user_msgs = sum(1 for m in conversations[chat_id] if m["role"] == "user")
-            if session_user_msgs >= SESSION_MESSAGE_CAP:
-                await asyncio.to_thread(
-                    append_exchange, session_files[chat_id], user_name, user_text, SESSION_CAP_BLOCK_MESSAGE
-                )
-                await update.message.reply_text(SESSION_CAP_BLOCK_MESSAGE)
-                cancel_session_timeout(chat_id)
-                await end_session(chat_id)
-                return
-            if session_user_msgs == SESSION_CAP_WARNING_AT:
-                await update.message.reply_text(SESSION_CAP_WARNING_MESSAGE)
-
-            prev_ft = free_trial_user_msg_count.get(chat_id, 0)
-            n_ft = prev_ft + 1
-            in_ft = in_first_free_trial_session(chat_id)
-
-            if in_ft and n_ft == FREE_TRIAL_90_PCT_USER_MESSAGE and not free_trial_90_warned.get(chat_id):
-                free_trial_90_warned[chat_id] = True
-                await update.message.reply_text(FREE_TRIAL_90_WARNING)
-
-            archive_context = ""
-            if any(sig in user_text.lower() for sig in ARCHIVE_REFERENCE_SIGNALS):
-                client_name_for_archive = client_names.get(chat_id)
-                if client_name_for_archive and chat_id in session_files:
-                    full_profile = await asyncio.to_thread(
-                        load_file, profile_path_for(client_name_for_archive)
-                    )
-                    if full_profile:
-                        archived_rows = parse_archived_sessions(full_profile)
-                        if archived_rows:
-                            matched = find_matching_archived_sessions(user_text, archived_rows)
-                            if matched:
-                                archive_context = await load_archive_context(matched)
-                                logger.info(
-                                    "Archive retrieval: %d match(es) for %s",
-                                    len(matched), client_name_for_archive,
-                                )
-
-            if archive_context:
-                conversations[chat_id][-1] = {
-                    "role": "user",
-                    "content": f"{archive_context}\n\n---\n\nClient message: {user_text}",
-                }
-
-            if in_ft and n_ft == FREE_TRIAL_USER_MESSAGE_CAP:
-                trial_close = free_trial_close_text()
-                conversations[chat_id].append({"role": "assistant", "content": trial_close})
-                if len(conversations[chat_id]) > MAX_HISTORY * 2:
-                    conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2):]
-                await asyncio.to_thread(
-                    append_exchange,
-                    session_files[chat_id],
-                    user_name,
-                    user_text,
-                    trial_close,
-                )
-                await update.message.reply_text(trial_close)
-                mark_free_trial_completed(chat_id)
-                free_trial_user_msg_count[chat_id] = FREE_TRIAL_USER_MESSAGE_CAP
-                awaiting_stripe_confirmation[chat_id] = True
-                cancel_session_timeout(chat_id)
-                await end_session(chat_id)
-                return
-
-            if pending_first_message_opener.get(chat_id):
-                is_ret = await asyncio.to_thread(is_returning_client, user_name)
-                _profile_path = profile_path_for(user_name)
-                if _profile_path.exists() and not is_ret:
-                    logger.warning(
-                        "Profile file exists but client not classified returning; vault markers may need review (%s)",
-                        user_name,
-                    )
-
-                if not is_ret:
-                    bridge, followup = await prepare_new_client_opener_parts(user_text)
-                    elapsed_since_anchor = (
-                        asyncio.get_event_loop().time() - session_turn_anchor_time
-                    )
-                    remaining_open = RESPONSE_DELAY_SECONDS - elapsed_since_anchor
-                    if remaining_open > 0:
-                        await asyncio.sleep(remaining_open)
-                    opener_script = await deliver_new_client_opener_messages(
-                        update, context, chat_id, user_name, bridge, followup
-                    )
-                    pending_first_message_opener.pop(chat_id, None)
-                    conversations[chat_id].append({"role": "assistant", "content": opener_script})
-                    if len(conversations[chat_id]) > MAX_HISTORY * 2:
-                        conversations[chat_id] = conversations[chat_id][-(MAX_HISTORY * 2):]
-                    await asyncio.to_thread(
-                        append_exchange,
-                        session_files[chat_id],
-                        user_name,
-                        user_text,
-                        opener_script,
-                    )
-                    if in_ft:
-                        free_trial_user_msg_count[chat_id] = n_ft
-                    return
-
-                opener_script = await generate_returning_greeting(
-                    user_name,
-                    session_profiles.get(chat_id, ""),
-                )
-                logger.info("Returning client greeting prepared for: %s", user_name)
-
-                elapsed_open = asyncio.get_event_loop().time() - session_turn_anchor_time
-                remaining_open = RESPONSE_DELAY_SECONDS - elapsed_open
-                if remaining_open > 0:
-                    await asyncio.sleep(remaining_open)
-
-                audio_bytes = await synthesize_voice(opener_script)
-                if audio_bytes:
-                    await context.bot.send_voice(
-                        chat_id=chat_id,
-                        voice=io.BytesIO(audio_bytes),
-                        filename="tanya.mp3",
-                    )
-                    logger.info("Returning client opener: voice note sent for %s", user_name)
-                else:
-                    await update.message.reply_text(opener_script)
-                    logger.info(
-                        "Returning client opener: ElevenLabs failed, sent as text for %s",
-                        user_name,
-                    )
-
-                pending_first_message_opener.pop(chat_id, None)
-                await asyncio.to_thread(append_tanya_message, session_files[chat_id], opener_script)
-                voice_opener_script = opener_script
-
-            message_received_at = asyncio.get_event_loop().time()
-
-            client_profile = session_profiles.get(chat_id, "")
-            phase_line = becoming_you_phase_for_prompt(client_profile)
-            static_prompt = build_static_prompt(
-                client_profile, session_outlines.get(chat_id, ""), phase_line
+            response = await claude.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1024,
+                system=system_blocks,
+                messages=conversations[phone][-20:],
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
             )
-            _cached_static_prompts[chat_id] = static_prompt
-            start_cache_warming(context.application, chat_id)
-
-            relevant_frameworks = await select_frameworks_for_session(
-                session_profiles.get(chat_id, ""),
-                user_text,
-                conversations[chat_id],
-            )
-            framework_context = (
-                await asyncio.to_thread(load_frameworks, relevant_frameworks)
-                if relevant_frameworks
-                else ""
-            )
-
-            system_blocks: list[dict] = [
-                {"type": "text", "text": static_prompt, "cache_control": {"type": "ephemeral"}},
-            ]
-            if framework_context:
-                system_blocks.append(
-                    {"type": "text", "text": f"\n\n---\n\n## Relevant Frameworks\n\n{framework_context}"}
+            raw_reply = response.content[0].text
+            reply, referral_marked = strip_referral_nudge_marker(raw_reply)
+            reply = reply.replace("—", ",").replace("–", ",").replace(" - ", ", ")
+            await asyncio.to_thread(record_coaching_usage, phone, user_name, response)
+            if referral_marked:
+                referral_nudge_used_this_session[phone] = True
+                referral_record_nudge(profile_client, session_numbers.get(phone, 0))
+                logger.info(
+                    "Referral nudge recorded for %s session %d",
+                    profile_client,
+                    session_numbers.get(phone, 0),
                 )
+        except Exception as e:
+            logger.error("Anthropic API error: %s", e)
+            reply = "I'm having a little trouble right now. Give me a moment and try again."
 
-            voice_snippet = new_client_voice_followup_snippet.pop(chat_id, None)
-            if voice_snippet:
-                system_blocks.append(
-                    {
-                        "type": "text",
-                        "text": (
-                            "\n\n---\n\n## This turn only\n\n"
-                            "Your opening had two Telegram parts: first a longer text message (welcome and terms), "
-                            "then a short voice note where you gave this coaching invite line:\n\n"
-                            f"{voice_snippet}\n\n"
-                            "Do not repeat that voice line verbatim or re-open with a fresh greeting. "
-                            "Respond in text to what they just said. Follow your normal coaching rules."
-                        ),
-                    }
-                )
+        conversations[phone].append({"role": "assistant", "content": reply})
 
-            if voice_opener_script:
-                system_blocks.append(
-                    {
-                        "type": "text",
-                        "text": (
-                            "\n\n---\n\n## This turn only\n\n"
-                            "You already opened this session with a voice-only greeting the client heard in Telegram. "
-                            "Do not repeat that opening verbatim or re-greet from scratch. "
-                            "Your opening (for continuity) was:\n\n"
-                            f"{voice_opener_script}\n\n"
-                            "Respond in text to what they just said. Follow your normal coaching rules."
-                        ),
-                    }
-                )
+        await asyncio.to_thread(
+            append_exchange, session_files[phone], user_name, user_text, reply
+        )
 
-            profile_client = client_names.get(chat_id, user_name)
-            if referral_nudge_prompt_allowed(chat_id, profile_client):
-                system_blocks.append({"type": "text", "text": referral_nudge_system_instruction()})
+        elapsed = asyncio.get_event_loop().time() - message_received_at
+        remaining = RESPONSE_DELAY_SECONDS - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
-            logger.info(
-                "Message from %s | Session %d | Profile: %s | Frameworks: %s | Static: %d chars",
-                user_name,
-                session_numbers.get(chat_id, 0),
-                "loaded" if client_profile else "none",
-                relevant_frameworks or "none",
-                len(static_prompt),
-            )
+        await blooio_send_message(phone, reply)
 
-            try:
-                response = await claude.messages.create(
-                    model=CLAUDE_MODEL,
-                    max_tokens=1024,
-                    system=system_blocks,
-                    messages=conversations[chat_id][-20:],
-                    extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-                )
-                raw_reply = response.content[0].text
-                reply, referral_marked = strip_referral_nudge_marker(raw_reply)
-                reply = reply.replace("—", ",").replace("–", ",").replace(" - ", ", ")
-                await asyncio.to_thread(record_coaching_usage, chat_id, user_name, response)
-                if referral_marked:
-                    referral_nudge_used_this_session[chat_id] = True
-                    referral_record_nudge(profile_client, session_numbers.get(chat_id, 0))
-                    logger.info(
-                        "Referral nudge recorded for %s session %d",
-                        profile_client,
-                        session_numbers.get(chat_id, 0),
-                    )
-            except Exception as e:
-                logger.error("Anthropic API error: %s", e)
-                reply = "I'm having a little trouble right now. Give me a moment and try again."
-
-            conversations[chat_id].append({"role": "assistant", "content": reply})
-
-            await asyncio.to_thread(
-                append_exchange, session_files[chat_id], user_name, user_text, reply
-            )
-
-            elapsed = asyncio.get_event_loop().time() - message_received_at
-            remaining = RESPONSE_DELAY_SECONDS - elapsed
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-
-            await send_with_voice(update, context, reply)
-
-            if in_ft:
-                free_trial_user_msg_count[chat_id] = n_ft
-        finally:
-            stop_typing.set()
-            try:
-                await typing_task
-            except Exception:
-                pass
+        if in_ft:
+            free_trial_user_msg_count[phone] = n_ft
 
 
-async def handle_unsupported_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-    chat_id = update.effective_chat.id
-    if should_block_unpaid_after_free_trial(chat_id):
-        await update.message.reply_text(POST_FREE_TRIAL_BLOCK_MESSAGE)
-        return
-    await update.message.reply_text(UNSUPPORTED_MESSAGE_REPLY)
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        return
-
-    chat_id = update.effective_chat.id
-    user_text = update.message.text
+async def handle_inbound_message(phone: str, user_text: str) -> None:
+    """Route one inbound iMessage from phone through the full Tanya logic."""
     if re.search(r'https?://\S+|www\.\S+', user_text, re.IGNORECASE):
-        await update.message.reply_text(LINK_RESPONSE)
-        return
-    user_name = sanitize_name_for_path(update.effective_user.first_name or "Client")
-    client_names[chat_id] = user_name
-    last_activity[chat_id] = datetime.datetime.now()
-
-    if tanya_followup.on_user_message_cancel_fu2(chat_id):
-        tanya_followup.enter_mini_session_after_fu1(chat_id, None)
-    if tanya_followup.in_mini_session(chat_id):
-        lock = await _get_chat_message_lock(chat_id)
-        async with lock:
-            await tanya_followup.handle_mini_session_turn(update, context, user_text)
+        await blooio_send_message(phone, LINK_RESPONSE)
         return
 
-    if awaiting_stripe_confirmation.get(chat_id):
-        lock = await _get_chat_message_lock(chat_id)
+    # Resolve client name from Stripe (cached after first lookup)
+    if phone not in client_names:
+        resolved = await get_stripe_customer_name(phone)
+        client_names[phone] = resolved
+    user_name = client_names[phone]
+    last_activity[phone] = datetime.datetime.now()
+
+    # Cancel any pending follow-up jobs; enter mini-session if in post-FU window
+    in_post_fu = tanya_followup.on_user_message_cancel_followup(phone)
+    if in_post_fu:
+        tanya_followup.enter_mini_session_after_fu1(phone, None)
+    if tanya_followup.in_mini_session(phone):
+        lock = await _get_chat_message_lock(phone)
         async with lock:
-            intent = await classify_stripe_confirmation_intent(chat_id, user_name, user_text)
+            await tanya_followup.handle_mini_session_turn(phone, user_text)
+        return
+
+    if awaiting_stripe_confirmation.get(phone):
+        lock = await _get_chat_message_lock(phone)
+        async with lock:
+            intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
             if intent == "affirmative":
-                awaiting_stripe_confirmation.pop(chat_id, None)
+                awaiting_stripe_confirmation.pop(phone, None)
                 if STRIPE_SECRET_KEY and STRIPE_SUBSCRIPTION_PRICE_ID:
                     try:
-                        checkout_url = await create_subscription_checkout_url(chat_id)
-                        await update.message.reply_text(
-                            f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}"
+                        checkout_url = await create_subscription_checkout_url(phone)
+                        await blooio_send_message(
+                            phone,
+                            f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}",
                         )
                     except Exception as e:
                         logger.error("Failed to create subscription checkout URL: %s", e)
                         if STRIPE_PAYMENT_LINK:
-                            await update.message.reply_text(
-                                f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}"
+                            await blooio_send_message(
+                                phone,
+                                f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}",
                             )
                 elif STRIPE_PAYMENT_LINK:
-                    await update.message.reply_text(
-                        f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}"
+                    await blooio_send_message(
+                        phone,
+                        f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}",
                     )
             elif intent == "negative":
-                awaiting_stripe_confirmation.pop(chat_id, None)
-                await update.message.reply_text(FREE_TRIAL_STRIPE_DECLINED)
+                awaiting_stripe_confirmation.pop(phone, None)
+                await blooio_send_message(phone, FREE_TRIAL_STRIPE_DECLINED)
             else:
-                await update.message.reply_text(STRIPE_CONFIRMATION_UNCLEAR_REPLY)
+                await blooio_send_message(phone, STRIPE_CONFIRMATION_UNCLEAR_REPLY)
         return
 
-
     # Delete confirmation: client already triggered the delete flow, waiting on yes/no.
-    if awaiting_delete_confirmation.get(chat_id):
+    if awaiting_delete_confirmation.get(phone):
         normalized_del = user_text.strip().lower().rstrip("!.? ")
         if normalized_del in ("yes, delete everything", "yes delete everything",
                               "yes, delete", "yes delete", "yes"):
-            awaiting_delete_confirmation.pop(chat_id, None)
-            await delete_client_data(chat_id)
-            await update.message.reply_text(DELETE_CONFIRMED_MESSAGE)
+            awaiting_delete_confirmation.pop(phone, None)
+            await delete_client_data(phone)
+            await blooio_send_message(phone, DELETE_CONFIRMED_MESSAGE)
             if STRIPE_PORTAL_LINK:
-                await update.message.reply_text(
+                await blooio_send_message(
+                    phone,
                     "One more thing. Your data is gone but your billing is still active. "
                     "Use the link below to cancel so you are not charged again.\n\n"
-                    f"{STRIPE_PORTAL_LINK}"
+                    f"{STRIPE_PORTAL_LINK}",
                 )
         else:
-            awaiting_delete_confirmation.pop(chat_id, None)
-            await update.message.reply_text(DELETE_CANCELLED_MESSAGE)
+            awaiting_delete_confirmation.pop(phone, None)
+            await blooio_send_message(phone, DELETE_CANCELLED_MESSAGE)
         return
 
     # Top-up confirmation: client hit monthly cap and we asked if they want the link.
-    if awaiting_topup_confirmation.get(chat_id):
+    if awaiting_topup_confirmation.get(phone):
         normalized = user_text.strip().lower().rstrip("!.? ")
         is_yes = any(word in normalized for word in ("yes", "yeah", "yep", "sure", "send", "ok", "okay"))
         is_no = any(word in normalized for word in ("no", "nope", "not", "wait", "later", "next month"))
         if is_yes:
-            awaiting_topup_confirmation.pop(chat_id, None)
+            awaiting_topup_confirmation.pop(phone, None)
             try:
-                checkout_url = await create_topup_checkout_url(chat_id)
-                await update.message.reply_text(
-                    f"Here you go. Each $5 adds 60 messages and you can add as many as you'd like.\n\n{checkout_url}"
+                checkout_url = await create_topup_checkout_url(phone)
+                await blooio_send_message(
+                    phone,
+                    f"Here you go. Each $5 adds 60 messages and you can add as many as you'd like.\n\n{checkout_url}",
                 )
             except Exception as e:
                 logger.error("Failed to create top-up checkout URL: %s", e)
                 if STRIPE_TOPUP_LINK:
-                    await update.message.reply_text(f"Here you go.\n\n{STRIPE_TOPUP_LINK}")
+                    await blooio_send_message(phone, f"Here you go.\n\n{STRIPE_TOPUP_LINK}")
         elif is_no:
-            awaiting_topup_confirmation.pop(chat_id, None)
-            await update.message.reply_text(TOPUP_LINK_DECLINED)
+            awaiting_topup_confirmation.pop(phone, None)
+            await blooio_send_message(phone, TOPUP_LINK_DECLINED)
         else:
-            await update.message.reply_text(TOPUP_UNCLEAR_REPLY)
+            await blooio_send_message(phone, TOPUP_UNCLEAR_REPLY)
         return
 
     # Cancel subscription trigger: phrase match first, then AI fallback.
     user_text_lower = user_text.strip().lower()
     if any(trigger in user_text_lower for trigger in CANCEL_TRIGGERS) or await ai_detects_cancel_intent(user_text):
         msg = CANCEL_MESSAGE_WITH_LINK.format(portal_link=STRIPE_PORTAL_LINK)
-        await update.message.reply_text(msg)
+        await blooio_send_message(phone, msg)
         return
 
     # Delete trigger: phrase match first (free), then AI fallback to catch natural phrasing.
     if any(trigger in user_text_lower for trigger in DELETE_TRIGGERS) or await ai_detects_delete_intent(user_text):
-        awaiting_delete_confirmation[chat_id] = True
-        await update.message.reply_text(DELETE_CONFIRMATION_PROMPT)
+        awaiting_delete_confirmation[phone] = True
+        await blooio_send_message(phone, DELETE_CONFIRMATION_PROMPT)
         return
 
     # Session end: whole message matches SESSION_END_NORMALIZED; not model-decided.
     if is_session_end_message(user_text):
-        await perform_session_close(update, context)
+        await perform_session_close(phone, user_text)
         return
 
     # Debounce: buffer this message and wait for more before firing to Claude.
-    # If another message arrives within DEBOUNCE_SECONDS, the timer resets and both
-    # messages are combined into a single Claude call.
-    _pending_messages.setdefault(chat_id, []).append(user_text)
-    _pending_updates[chat_id] = update
+    _pending_messages.setdefault(phone, []).append(user_text)
+    _pending_phones[phone] = phone
 
-    existing = _debounce_tasks.pop(chat_id, None)
+    existing = _debounce_tasks.pop(phone, None)
     if existing and not existing.done():
         existing.cancel()
 
@@ -3123,24 +2984,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(DEBOUNCE_SECONDS)
         except asyncio.CancelledError:
             return
-        _debounce_tasks.pop(chat_id, None)
-        msgs = _pending_messages.pop(chat_id, [])
-        upd = _pending_updates.pop(chat_id, update)
+        _debounce_tasks.pop(phone, None)
+        msgs = _pending_messages.pop(phone, [])
+        _pending_phones.pop(phone, None)
         if msgs:
             combined = "\n\n".join(msgs)
-            await _fire_coaching_message(upd, context, chat_id, user_name, combined)
+            await _fire_coaching_message(phone, user_name, combined)
 
-    _debounce_tasks[chat_id] = asyncio.ensure_future(_fire())
+    _debounce_tasks[phone] = asyncio.ensure_future(_fire())
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-async def create_topup_checkout_url(chat_id: int) -> str:
+async def create_topup_checkout_url(phone: str) -> str:
     import stripe as stripe_lib
     stripe_lib.api_key = STRIPE_SECRET_KEY
-    return_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}" if TELEGRAM_BOT_USERNAME else "https://telegram.org"
     session = await asyncio.to_thread(
         stripe_lib.checkout.Session.create,
         line_items=[{
@@ -3149,60 +3009,53 @@ async def create_topup_checkout_url(chat_id: int) -> str:
             "adjustable_quantity": {"enabled": True, "minimum": 1, "maximum": 99},
         }],
         mode="payment",
-        metadata={"chat_id": str(chat_id)},
-        success_url=return_url,
-        cancel_url=return_url,
+        metadata={"phone": phone},
+        success_url="https://stripe.com",
+        cancel_url="https://stripe.com",
     )
     return session.url
 
 
-async def create_subscription_checkout_url(chat_id: int) -> str:
+async def create_subscription_checkout_url(phone: str) -> str:
     import stripe as stripe_lib
     stripe_lib.api_key = STRIPE_SECRET_KEY
-    return_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}" if TELEGRAM_BOT_USERNAME else "https://telegram.org"
     session = await asyncio.to_thread(
         stripe_lib.checkout.Session.create,
         line_items=[{"price": STRIPE_SUBSCRIPTION_PRICE_ID, "quantity": 1}],
         mode="subscription",
-        metadata={"chat_id": str(chat_id), "product_type": "subscription"},
-        success_url=return_url,
-        cancel_url=return_url,
+        metadata={"phone": phone, "product_type": "subscription"},
+        success_url="https://stripe.com",
+        cancel_url="https://stripe.com",
     )
     return session.url
 
 
-async def handle_stripe_webhook(request):
-    from aiohttp import web
+async def handle_stripe_webhook(request: Request) -> Response:
     import stripe as stripe_lib
-    payload = await request.read()
+    payload = await request.body()
     sig_header = request.headers.get("Stripe-Signature", "")
     try:
         event = stripe_lib.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
         logger.warning("Stripe webhook verification failed: %s", e)
-        return web.Response(status=400)
+        return Response(status_code=400)
 
     if event["type"] == "checkout.session.completed":
         session_obj = event["data"]["object"]
         metadata = session_obj.get("metadata") or {}
-        chat_id_str = metadata.get("chat_id", "")
+        phone = metadata.get("phone", "")
         product_type = metadata.get("product_type", "topup")
-        if chat_id_str:
+        if phone:
             try:
-                chat_id = int(chat_id_str)
                 if product_type == "subscription":
-                    grant_tanyatalk_access(chat_id)
-                    logger.info("Subscription granted for chat_id=%d", chat_id)
-                    if _telegram_bot:
-                        await _telegram_bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                "You're in. Your subscription is active and your 250 messages are ready. "
-                                "Come back whenever you are and we will pick up right where we left off."
-                            ),
-                        )
+                    grant_tanyatalk_access(phone)
+                    logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
+                    await blooio_send_message(
+                        phone,
+                        "You're in. Your subscription is active and your 250 messages are ready. "
+                        "Come back whenever you are and we will pick up right where we left off.",
+                    )
                 else:
-                    import stripe as stripe_lib
                     stripe_lib.api_key = STRIPE_SECRET_KEY
                     session_expanded = await asyncio.to_thread(
                         stripe_lib.checkout.Session.retrieve,
@@ -3210,104 +3063,81 @@ async def handle_stripe_webhook(request):
                         expand=["line_items"],
                     )
                     qty = session_expanded.line_items.data[0].quantity if session_expanded.line_items.data else 1
-                    total_extra = add_extra_messages(chat_id, qty * 60)
-                    logger.info("Top-up: added %d bonus messages to chat_id=%d (total bonus now %d)", qty * 60, chat_id, total_extra)
-                    if _telegram_bot:
-                        await _telegram_bot.send_message(chat_id=chat_id, text=TOPUP_CREDITED_MESSAGE)
-            except (ValueError, TypeError) as e:
+                    total_extra = add_extra_messages(phone, qty * 60)
+                    logger.info(
+                        "Top-up: added %d bonus messages to phone_key=%s (total bonus now %d)",
+                        qty * 60,
+                        _phone_key(phone),
+                        total_extra,
+                    )
+                    await blooio_send_message(phone, TOPUP_CREDITED_MESSAGE)
+            except Exception as e:
                 logger.error("Stripe webhook processing failed: %s", e)
 
-    return web.Response(status=200)
+    return Response(status_code=200)
 
 
-_webhook_runner = None
-_telegram_bot = None
+# ---------------------------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------------------------
+
+_fastapi_app = FastAPI()
 
 
-async def start_stripe_webhook_server() -> None:
-    global _webhook_runner
-    from aiohttp import web
-    app = web.Application()
-    app.router.add_post("/stripe/webhook", handle_stripe_webhook)
-    _webhook_runner = web.AppRunner(app)
-    await _webhook_runner.setup()
-    port = int(os.getenv("PORT", "8080"))
-    site = web.TCPSite(_webhook_runner, "0.0.0.0", port)
-    await site.start()
-    logger.info("Stripe webhook server listening on port %d", port)
-
-
-async def stop_stripe_webhook_server() -> None:
-    global _webhook_runner
-    if _webhook_runner:
-        await _webhook_runner.cleanup()
-        _webhook_runner = None
-
-
-def main():
+@_fastapi_app.post("/webhook")
+async def blooio_webhook_endpoint(request: Request) -> Response:
+    raw_body = await request.body()
+    sig = request.headers.get("X-Blooio-Signature", "")
+    if BLOOIO_WEBHOOK_SECRET and not verify_blooio_signature(raw_body, sig):
+        logger.warning("Blooio webhook signature verification failed")
+        return Response(status_code=401)
     try:
-        acquire_single_instance_lock()
-        load_paid_access_into_memory()
-        load_free_trial_completed_into_memory()
-        init_usage_csv_file()
-        telegram_http = HTTPXRequest(
-            connect_timeout=20.0,
-            read_timeout=30.0,
-            write_timeout=30.0,
-            pool_timeout=5.0,
-        )
-        async def post_init(app: Application) -> None:
-            global _telegram_bot
-            _telegram_bot = app.bot
-            tanya_followup.init_scheduler(_BOT_DIR / "logs" / "apscheduler.sqlite")
+        payload = json.loads(raw_body)
+    except Exception:
+        return Response(status_code=400)
+    phone = payload.get("sender", "")
+    text = payload.get("text", "")
+    is_group = payload.get("is_group", False)
+    if phone and text and not is_group:
+        asyncio.ensure_future(handle_inbound_message(phone, text))
+    return Response(status_code=200)
 
-            async def send_msg(cid: int, txt: str) -> None:
-                await app.bot.send_message(chat_id=cid, text=txt)
 
-            tanya_followup.configure(
-                claude=claude,
-                claude_model=CLAUDE_MODEL,
-                claude_haiku_model=CLAUDE_HAIKU_MODEL,
-                send_message=send_msg,
-                merge_focus_for_next_session=merge_focus_for_next_session_profile,
-                open_coaching_session=open_coaching_session_after_mini,
-            )
-            await tanya_followup.start_scheduler()
-            if STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET:
-                await start_stripe_webhook_server()
+@_fastapi_app.post("/stripe/webhook")
+async def stripe_webhook_endpoint(request: Request) -> Response:
+    return await handle_stripe_webhook(request)
 
-        async def post_shutdown(app: Application) -> None:
-            await tanya_followup.shutdown_scheduler()
-            await stop_stripe_webhook_server()
 
-        app = (
-            ApplicationBuilder()
-            .token(TELEGRAM_TOKEN)
-            .request(telegram_http)
-            .post_init(post_init)
-            .post_shutdown(post_shutdown)
-            .build()
-        )
+@_fastapi_app.on_event("startup")
+async def _startup() -> None:
+    init_usage_csv_file()
+    tanya_followup.init_scheduler(_BOT_DIR / "logs" / "apscheduler.sqlite")
+    tanya_followup.configure(
+        claude=claude,
+        claude_model=CLAUDE_MODEL,
+        claude_haiku_model=CLAUDE_HAIKU_MODEL,
+        send_message=blooio_send_message,
+        merge_focus_for_next_session=merge_focus_for_next_session_profile,
+        open_coaching_session=open_coaching_session_after_mini,
+        check_monthly_cap=lambda p: (
+            get_monthly_message_count(p) >= MONTHLY_MESSAGE_CAP + get_extra_messages(p)
+        ),
+    )
+    await tanya_followup.start_scheduler()
+    asyncio.ensure_future(_blooio_failure_poll_loop())
+    logger.info("Tanya Talk iMessage server started")
 
-        app.add_handler(
-            MessageHandler(
-                filters.TEXT & filters.Regex(r"(?i)^set\s+ratio\s+\d+\s*/\s*\d+\s*$"),
-                handle_set_ratio,
-            )
-        )
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("reset", reset))
-        app.add_handler(CommandHandler("endsession", cmd_endsession))
-        app.add_handler(CommandHandler("end_session", cmd_endsession))
-        app.add_handler(CommandHandler("voice", toggle_voice))
-        app.add_handler(CommandHandler("cost", show_last_cost))
-        app.add_handler(CommandHandler("usage", show_last_cost))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_note))
-        app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND & ~filters.VOICE & ~filters.AUDIO, handle_unsupported_message))
 
-        logger.info("Tanya bot is running — listening for messages...")
-        app.run_polling()
+@_fastapi_app.on_event("shutdown")
+async def _shutdown() -> None:
+    await tanya_followup.shutdown_scheduler()
+
+
+def main() -> None:
+    acquire_single_instance_lock()
+    try:
+        port = int(os.getenv("PORT", "8080"))
+        uvicorn.run(_fastapi_app, host="0.0.0.0", port=port, log_level="info")
     finally:
         release_single_instance_lock()
 

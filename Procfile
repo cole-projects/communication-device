@@ -1,1 +1,1 @@
-worker: python tanya_bot.py
+web: python tanya_bot.py
