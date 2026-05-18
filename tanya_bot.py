@@ -59,6 +59,7 @@ BLOOIO_PHONE_NUMBER = os.getenv("BLOOIO_PHONE_NUMBER", "+13177282783").strip()
 ADMIN_PHONE_NUMBERS = os.getenv("ADMIN_PHONE_NUMBERS", "").strip()
 ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
 BLOOIO_BASE_URL = "https://backend.blooio.com/v2/api"
+TANYA_PUBLIC_URL = os.getenv("TANYA_PUBLIC_URL", "https://worker-production-32fb.up.railway.app").rstrip("/")
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
 _POST_TRIAL_BYPASS_PHONES: frozenset[str] = frozenset(
@@ -104,6 +105,17 @@ POST_TRIAL_RESET_DENIED_MESSAGE = (
     "That cannot start another free session. Your trial is complete. "
     "Subscribe through TanyaTalk when you are ready, and we continue from there."
 )
+
+TANYA_VCARD = "\r\n".join([
+    "BEGIN:VCARD",
+    "VERSION:3.0",
+    "FN:Tanya",
+    "N:;Tanya;;;",
+    f"TEL;TYPE=CELL:{BLOOIO_PHONE_NUMBER}",
+    "NOTE:The conversation that changes your day.",
+    "END:VCARD",
+    "",
+])
 
 OPENER_INTRO = (
     "Hi, I'm Tanya. I've spent years helping people work through what's on their mind, "
@@ -317,6 +329,27 @@ async def blooio_send_message(phone: str, text: str) -> None:
                 logger.error("Blooio send failed %d: %s", resp.status_code, resp.text[:200])
     except Exception as e:
         logger.error("Blooio send error: %s", e)
+
+
+async def blooio_send_vcard(phone: str) -> None:
+    """Send TanyaTalk contact card on first interaction so clients can save the number."""
+    chat_id_encoded = quote(phone, safe="")
+    url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
+    vcf_url = f"{TANYA_PUBLIC_URL}/tanya.vcf"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            resp = await http.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {BLOOIO_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"attachments": [{"url": vcf_url}]},
+            )
+            if resp.status_code not in (200, 202):
+                logger.warning("Blooio vCard send failed %d: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.error("Blooio vCard send error: %s", e)
 
 
 def verify_blooio_signature(raw_body: bytes, signature_header: str) -> bool:
@@ -2873,6 +2906,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 )
 
             if not is_ret:
+                asyncio.ensure_future(blooio_send_vcard(phone))
                 bridge, followup = await prepare_new_client_opener_parts(user_text)
                 elapsed_since_anchor = asyncio.get_event_loop().time() - session_turn_anchor_time
                 remaining_open = RESPONSE_DELAY_SECONDS - elapsed_since_anchor
@@ -3215,14 +3249,18 @@ async def handle_stripe_webhook(request: Request) -> Response:
         if phone:
             try:
                 if product_type == "subscription":
+                    # Access control first — if this fails, return 500 so Stripe retries
                     grant_tanyatalk_access(phone)
                     record_subscription_start(phone)
                     logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
-                    await blooio_send_message(
-                        phone,
-                        "You're in. Your subscription is active and your 250 messages are ready. "
-                        "Come back whenever you are and we will pick up right where we left off.",
-                    )
+                    try:
+                        await blooio_send_message(
+                            phone,
+                            "You're in. Your subscription is active and your 250 messages are ready. "
+                            "Come back whenever you are and we will pick up right where we left off.",
+                        )
+                    except Exception as e:
+                        logger.error("Subscription welcome message failed (access already granted): %s", e)
                 else:
                     stripe_lib.api_key = STRIPE_SECRET_KEY
                     session_expanded = await asyncio.to_thread(
@@ -3231,6 +3269,7 @@ async def handle_stripe_webhook(request: Request) -> Response:
                         expand=["line_items"],
                     )
                     qty = session_expanded.line_items.data[0].quantity if session_expanded.line_items.data else 1
+                    # Credits first — if this fails, return 500 so Stripe retries
                     total_extra = add_extra_messages(phone, qty * 60)
                     logger.info(
                         "Top-up: added %d bonus messages to phone_key=%s (total bonus now %d)",
@@ -3238,35 +3277,42 @@ async def handle_stripe_webhook(request: Request) -> Response:
                         _phone_key(phone),
                         total_extra,
                     )
-                    await blooio_send_message(phone, TOPUP_CREDITED_MESSAGE)
+                    try:
+                        await blooio_send_message(phone, TOPUP_CREDITED_MESSAGE)
+                    except Exception as e:
+                        logger.error("Top-up confirmation message failed (credits already added): %s", e)
             except Exception as e:
-                logger.error("Stripe webhook processing failed: %s", e)
+                logger.error("Stripe checkout.session.completed processing failed: %s", e)
+                return Response(status_code=500)
 
     elif event["type"] == "customer.subscription.deleted":
-        # Subscription cancelled or payment failed too many times — revoke access
         sub_obj = event["data"]["object"]
         metadata = sub_obj.get("metadata") or {}
         phone = metadata.get("phone", "")
         if not phone:
-            # Try to find phone via customer metadata
             try:
                 stripe_lib.api_key = STRIPE_SECRET_KEY
                 customer = await asyncio.to_thread(
                     stripe_lib.Customer.retrieve, sub_obj.get("customer", "")
                 )
                 phone = (customer.get("metadata") or {}).get("phone", "")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Could not resolve phone for subscription.deleted: %s", e)
         if phone:
             try:
                 revoke_tanyatalk_access(phone)
                 tanya_followup.cancel_all_followup_jobs_for_chat(phone)
+                logger.info("Access revoked for phone_key=%s via subscription.deleted", _phone_key(phone))
+            except Exception as e:
+                logger.error("Access revocation failed: %s", e)
+                return Response(status_code=500)
+            try:
                 await blooio_send_message(
                     phone,
                     "Your subscription has ended. Your session history is saved and I'll be here if you decide to come back.",
                 )
             except Exception as e:
-                logger.error("Subscription deletion handling failed: %s", e)
+                logger.error("Subscription ended message failed (access already revoked): %s", e)
 
     elif event["type"] == "invoice.payment_failed":
         invoice_obj = event["data"]["object"]
@@ -3279,8 +3325,8 @@ async def handle_stripe_webhook(request: Request) -> Response:
                     stripe_lib.Customer.retrieve, invoice_obj.get("customer", "")
                 )
                 phone = (customer.get("metadata") or {}).get("phone", "")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Could not resolve phone for invoice.payment_failed: %s", e)
         if phone:
             try:
                 await blooio_send_message(
@@ -3313,6 +3359,15 @@ async def health() -> Response:
     return Response(content="ok", status_code=200)
 
 
+@_fastapi_app.get("/tanya.vcf")
+async def serve_vcard() -> Response:
+    return Response(
+        content=TANYA_VCARD,
+        media_type="text/vcard",
+        headers={"Content-Disposition": 'attachment; filename="Tanya.vcf"'},
+    )
+
+
 @_fastapi_app.get("/admin/usage-csv")
 async def admin_usage_csv(request: Request) -> Response:
     auth = request.headers.get("Authorization", "")
@@ -3334,7 +3389,7 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
     raw_body = await request.body()
     logger.info("Blooio webhook received: %d bytes", len(raw_body))
     sig = request.headers.get("X-Blooio-Signature", "")
-    if BLOOIO_WEBHOOK_SECRET and not verify_blooio_signature(raw_body, sig):
+    if not verify_blooio_signature(raw_body, sig):
         logger.warning("Blooio webhook signature verification failed (sig=%s)", sig[:40] if sig else "none")
         return Response(status_code=401)
     try:
