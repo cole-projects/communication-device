@@ -57,6 +57,7 @@ BLOOIO_API_KEY = os.getenv("BLOOIO_API_KEY", "").strip()
 BLOOIO_WEBHOOK_SECRET = os.getenv("BLOOIO_WEBHOOK_SECRET", "").strip()
 BLOOIO_PHONE_NUMBER = os.getenv("BLOOIO_PHONE_NUMBER", "+13177282783").strip()
 ADMIN_PHONE_NUMBERS = os.getenv("ADMIN_PHONE_NUMBERS", "").strip()
+ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
 BLOOIO_BASE_URL = "https://backend.blooio.com/v2/api"
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
@@ -535,6 +536,7 @@ MONTHLY_USAGE_PATH = _BOT_DIR / "logs" / "monthly_usage.json"
 EXTRA_MESSAGES_PATH = _BOT_DIR / "logs" / "extra_messages.json"
 PAID_ACCESS_PATH = _BOT_DIR / "logs" / "paid_access.json"
 FREE_TRIAL_COMPLETED_PATH = _BOT_DIR / "logs" / "free_trial_completed.json"
+SUBSCRIPTION_START_PATH = _BOT_DIR / "logs" / "subscription_starts.json"
 USAGE_CSV_FIELDNAMES = [
     "log_id",
     "timestamp",
@@ -752,6 +754,46 @@ def _monthly_key() -> str:
     return datetime.date.today().strftime("%Y-%m")
 
 
+_SUB_START_LOCK = threading.Lock()
+
+
+def _load_sub_starts_unlocked() -> dict:
+    if not SUBSCRIPTION_START_PATH.exists():
+        return {}
+    try:
+        return json.loads(SUBSCRIPTION_START_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def record_subscription_start(phone: str) -> None:
+    """Record today as this phone's subscription start date (30-day billing anchor)."""
+    ph = phone_to_hash(phone)
+    with _SUB_START_LOCK:
+        data = _load_sub_starts_unlocked()
+        data[ph] = datetime.date.today().isoformat()
+        SUBSCRIPTION_START_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SUBSCRIPTION_START_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def get_billing_period_key(phone: str) -> str:
+    """Return the ISO start date of this user's current 30-day billing period.
+    Falls back to YYYY-MM calendar key for users with no recorded start date."""
+    ph = phone_to_hash(phone)
+    with _SUB_START_LOCK:
+        data = _load_sub_starts_unlocked()
+    start_str = data.get(ph)
+    if not start_str:
+        return _monthly_key()
+    try:
+        start = datetime.date.fromisoformat(start_str)
+        days_elapsed = (datetime.date.today() - start).days
+        period_start = start + datetime.timedelta(days=30 * (days_elapsed // 30))
+        return period_start.isoformat()
+    except Exception:
+        return _monthly_key()
+
+
 def _load_monthly_usage_unlocked() -> dict:
     if not MONTHLY_USAGE_PATH.exists():
         return {}
@@ -764,13 +806,13 @@ def _load_monthly_usage_unlocked() -> dict:
 def get_monthly_message_count(phone: str) -> int:
     ph = phone_to_hash(phone)
     with _MONTHLY_USAGE_LOCK:
-        return _load_monthly_usage_unlocked().get(ph, {}).get(_monthly_key(), 0)
+        return _load_monthly_usage_unlocked().get(ph, {}).get(get_billing_period_key(phone), 0)
 
 
 def increment_monthly_message_count(phone: str) -> int:
-    """Increment this month's count and return the new total."""
+    """Increment this billing period's count and return the new total."""
     ph = phone_to_hash(phone)
-    key = _monthly_key()
+    key = get_billing_period_key(phone)
     with _MONTHLY_USAGE_LOCK:
         data = _load_monthly_usage_unlocked()
         user_data = data.setdefault(ph, {})
@@ -782,9 +824,9 @@ def increment_monthly_message_count(phone: str) -> int:
 
 
 def credit_monthly_messages(phone: str, amount: int) -> int:
-    """Decrease this month's count by amount to reflect a top-up purchase. Returns new count."""
+    """Decrease this billing period's count by amount to reflect a top-up purchase. Returns new count."""
     ph = phone_to_hash(phone)
-    key = _monthly_key()
+    key = get_billing_period_key(phone)
     with _MONTHLY_USAGE_LOCK:
         data = _load_monthly_usage_unlocked()
         user_data = data.setdefault(ph, {})
@@ -2924,19 +2966,24 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
             if intent == "affirmative":
                 awaiting_stripe_confirmation.pop(phone, None)
                 if STRIPE_SECRET_KEY and STRIPE_SUBSCRIPTION_PRICE_ID:
-                    try:
-                        checkout_url = await create_subscription_checkout_url(phone)
+                    checkout_url = None
+                    for attempt in range(2):
+                        try:
+                            checkout_url = await create_subscription_checkout_url(phone)
+                            break
+                        except Exception as e:
+                            if attempt == 0:
+                                await asyncio.sleep(2)
+                            else:
+                                logger.error("Subscription checkout URL failed after retry: %s", e)
+                    if checkout_url:
                         await blooio_send_message(
                             phone,
                             f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}",
                         )
-                    except Exception as e:
-                        logger.error("Failed to create subscription checkout URL: %s", e)
-                        if STRIPE_PAYMENT_LINK:
-                            await blooio_send_message(
-                                phone,
-                                f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}",
-                            )
+                    else:
+                        awaiting_stripe_confirmation[phone] = True
+                        await blooio_send_message(phone, "Having a small tech hiccup. Text me back in a minute and I'll send you the link.")
                 elif STRIPE_PAYMENT_LINK:
                     await blooio_send_message(
                         phone,
@@ -2976,16 +3023,24 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         is_no = any(word in normalized for word in ("no", "nope", "not", "wait", "later", "next month"))
         if is_yes:
             awaiting_topup_confirmation.pop(phone, None)
-            try:
-                checkout_url = await create_topup_checkout_url(phone)
+            checkout_url = None
+            for attempt in range(2):
+                try:
+                    checkout_url = await create_topup_checkout_url(phone)
+                    break
+                except Exception as e:
+                    if attempt == 0:
+                        await asyncio.sleep(2)
+                    else:
+                        logger.error("Top-up checkout URL failed after retry: %s", e)
+            if checkout_url:
                 await blooio_send_message(
                     phone,
                     f"Here you go. Each $5 adds 60 messages and you can add as many as you'd like.\n\n{checkout_url}",
                 )
-            except Exception as e:
-                logger.error("Failed to create top-up checkout URL: %s", e)
-                if STRIPE_TOPUP_LINK:
-                    await blooio_send_message(phone, f"Here you go.\n\n{STRIPE_TOPUP_LINK}")
+            else:
+                awaiting_topup_confirmation[phone] = True
+                await blooio_send_message(phone, "Having a small tech hiccup. Text me back in a minute and I'll send you the link.")
         elif is_no:
             awaiting_topup_confirmation.pop(phone, None)
             await blooio_send_message(phone, TOPUP_LINK_DECLINED)
@@ -3102,6 +3157,7 @@ async def handle_stripe_webhook(request: Request) -> Response:
             try:
                 if product_type == "subscription":
                     grant_tanyatalk_access(phone)
+                    record_subscription_start(phone)
                     logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
                     await blooio_send_message(
                         phone,
@@ -3147,6 +3203,20 @@ _fastapi_app = FastAPI(lifespan=_lifespan)
 @_fastapi_app.get("/health")
 async def health() -> Response:
     return Response(content="ok", status_code=200)
+
+
+@_fastapi_app.get("/admin/usage-csv")
+async def admin_usage_csv(key: str = "") -> Response:
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        return Response(status_code=401)
+    if not USAGE_CSV_PATH.exists():
+        return Response(content="no data yet", status_code=404)
+    content = await asyncio.to_thread(USAGE_CSV_PATH.read_bytes)
+    return Response(
+        content=content,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=tanya_usage.csv"},
+    )
 
 
 @_fastapi_app.post("/webhook")
