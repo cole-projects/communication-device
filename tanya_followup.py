@@ -215,7 +215,7 @@ Return ONLY the message text, nothing else."""
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
     )
-    return response.content[0].text.strip().replace("—", ",").replace("–", ",")
+    return response.content[0].text.strip().replace(" — ", ", ").replace("—", ",").replace(" – ", ", ").replace("–", ",").replace(" ,", ",")
 
 
 async def followup_job_fire(
@@ -300,7 +300,7 @@ Output ONLY JSON: {{"reply":"<message>"}}"""
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         data = json.loads(raw)
-        reply2 = (data.get("reply") or "").strip().replace("—", ",").replace("–", ",")
+        reply2 = (data.get("reply") or "").strip().replace(" — ", ", ").replace("—", ",").replace(" – ", ", ").replace("–", ",").replace(" ,", ",")
     except Exception as e:
         logger.error("Mini-session prompt error: %s", e)
         reply2 = (
@@ -361,7 +361,7 @@ If they decline or say they're not interested, set choice to "declined" and repl
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         data = json.loads(raw)
-        reply = (data.get("reply") or "").strip().replace("—", ",").replace("–", ",")
+        reply = (data.get("reply") or "").strip().replace(" — ", ", ").replace("—", ",").replace(" – ", ", ").replace("–", ",").replace(" ,", ",")
     except Exception as e:
         logger.error("Mini-session Claude error: %s", e)
         reply = "thanks for texting back. i'm here."

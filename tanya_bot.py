@@ -2859,7 +2859,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
             )
             raw_reply = response.content[0].text
             reply, referral_marked = strip_referral_nudge_marker(raw_reply)
-            reply = reply.replace("—", ",").replace("–", ",").replace(" - ", ", ")
+            reply = reply.replace(" — ", ", ").replace("—", ",").replace(" – ", ", ").replace("–", ",").replace(" - ", ", ").replace(" ,", ",")
             await asyncio.to_thread(record_coaching_usage, phone, user_name, response)
             if referral_marked:
                 referral_nudge_used_this_session[phone] = True
