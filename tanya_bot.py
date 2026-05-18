@@ -66,6 +66,12 @@ _POST_TRIAL_BYPASS_PHONES: frozenset[str] = frozenset(
     for x in os.getenv("POST_TRIAL_ALLOW_PHONES", "").split(",")
     if x.strip()
 )
+# Phones included in a MESH package (TanyaTalk access without a direct Stripe subscription)
+_MESH_PHONES: frozenset[str] = frozenset(
+    x.strip()
+    for x in os.getenv("MESH_PHONES", "").split(",")
+    if x.strip()
+)
 
 # Optional: log approximate USD per API call (coaching messages). Set to 0/false to show tokens only.
 # Prices are per 1M tokens — confirm against https://www.anthropic.com/pricing for your model.
@@ -927,6 +933,18 @@ def load_free_trial_completed_into_memory() -> None:
     pass
 
 
+def _has_completed_free_trial(phone: str) -> bool:
+    """Check in-memory first, fall back to disk to survive server restarts."""
+    if free_trial_completed.get(phone):
+        return True
+    ph = phone_to_hash(phone)
+    with _FREE_TRIAL_LOCK:
+        if ph in _load_free_trial_completed_ids():
+            free_trial_completed[phone] = True
+            return True
+    return False
+
+
 conversations: dict[str, list[dict]] = {}
 voice_enabled: dict[str, bool] = {}
 client_names: dict[str, str] = {}       # phone -> display name (from Stripe)
@@ -1635,7 +1653,7 @@ You are speaking with a client through iMessage. Respond exactly as Tanya would:
 
 ---
 
-**Saving and closing (important):** A session saves and closes only when the client sends a recognized close phrase (for example **end session** and a few short variants), or after about 30 minutes with no messages. If they sound finished, in a hurry, or like they are leaving but have not actually closed yet, acknowledge that in one short phrase and tell them they can send **end session** when they are ready to save and close. Do not tell them the session is already saved until they have done that. You cannot trigger a save from your side.
+**Saving and closing (important):** A session saves and closes only when the client sends a recognized close phrase (for example **end session** and a few short variants), or after about 60 minutes with no messages. If they sound finished, in a hurry, or like they are leaving but have not actually closed yet, acknowledge that in one short phrase and tell them they can send **end session** when they are ready to save and close. Do not tell them the session is already saved until they have done that. You cannot trigger a save from your side.
 
 ---
 
@@ -2205,16 +2223,24 @@ LINK_RESPONSE = "I can't open links, but I'm here with you. What's on your mind?
 def in_first_free_trial_session(phone: str) -> bool:
     return (
         session_numbers.get(phone) == 1
-        and not free_trial_completed.get(phone, False)
+        and not _has_completed_free_trial(phone)
     )
 
 
 def has_tanyatalk_access(phone: str) -> bool:
-    return (
-        paid_tanyatalk_access.get(phone, False)
-        or mesh_tanyatalk_included.get(phone, False)
-        or phone in _POST_TRIAL_BYPASS_PHONES
-    )
+    if paid_tanyatalk_access.get(phone):
+        return True
+    if mesh_tanyatalk_included.get(phone):
+        return True
+    if phone in _POST_TRIAL_BYPASS_PHONES:
+        return True
+    # Disk fallback: re-hydrate after server restart (hashes can't be reversed)
+    ph = phone_to_hash(phone)
+    with _PAID_ACCESS_LOCK:
+        if ph in _load_paid_access():
+            paid_tanyatalk_access[phone] = True
+            return True
+    return False
 
 
 def should_block_unpaid_after_free_trial(phone: str) -> bool:
@@ -2222,7 +2248,7 @@ def should_block_unpaid_after_free_trial(phone: str) -> bool:
         return False
     if phone in _POST_TRIAL_BYPASS_PHONES:
         return False
-    if not free_trial_completed.get(phone):
+    if not _has_completed_free_trial(phone):
         return False
     if has_tanyatalk_access(phone):
         return False
@@ -2335,7 +2361,8 @@ async def end_session(phone: str):
             transcript_lines.append(f"{role}: {msg['content']}")
         transcript = "\n".join(transcript_lines)
 
-        if session_path and len(history) >= MIN_EXCHANGES_FOR_FOLLOWUP and has_tanyatalk_access(phone):
+        user_turns = sum(1 for m in history if m["role"] == "user")
+        if session_path and user_turns >= MIN_EXCHANGES_FOR_FOLLOWUP and has_tanyatalk_access(phone):
             ended_at = datetime.datetime.now(timezone.utc)
             await append_follow_up_extraction(
                 session_path, client_name, session_num, history, ended_at
@@ -2346,7 +2373,7 @@ async def end_session(phone: str):
         elif session_path:
             logger.info(
                 "Skipping follow-up for hash %s session %d (%d messages < %d threshold)",
-                ph[:12], session_num, len(history), MIN_EXCHANGES_FOR_FOLLOWUP,
+                ph[:12], session_num, user_turns, MIN_EXCHANGES_FOR_FOLLOWUP,
             )
 
         await update_vault_index_files(ph, client_name, session_num, today, profile, transcript)
@@ -2693,7 +2720,9 @@ async def open_coaching_session_after_mini(phone: str, client_name: str) -> None
     lock = await _get_chat_message_lock(phone)
     async with lock:
         conversations[phone] = []
-        client_names[phone] = sanitize_name_for_path(client_name)
+        # Use cached name from earlier in the inbound flow; fetch from Stripe only if missing
+        resolved = client_name or client_names.get(phone) or await get_stripe_customer_name(phone)
+        client_names[phone] = sanitize_name_for_path(resolved)
         last_activity[phone] = datetime.datetime.now()
         await begin_session_with_opening(phone, client_names[phone], ph)
 
@@ -2711,6 +2740,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
         if count >= effective_cap:
             if count == effective_cap:
                 increment_monthly_message_count(phone)
+            if not awaiting_topup_confirmation.get(phone):
                 awaiting_topup_confirmation[phone] = True
                 await blooio_send_message(phone, MONTHLY_CAP_BLOCK_MESSAGE)
             return
@@ -3247,6 +3277,8 @@ async def stripe_webhook_endpoint(request: Request) -> Response:
 
 async def _startup() -> None:
     init_usage_csv_file()
+    for _mp in _MESH_PHONES:
+        mesh_tanyatalk_included[_mp] = True
     tanya_followup.init_scheduler(_BOT_DIR / "logs" / "apscheduler.sqlite")
     tanya_followup.configure(
         claude=claude,
