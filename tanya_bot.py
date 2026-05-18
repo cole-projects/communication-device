@@ -3,6 +3,7 @@ import io
 import re
 import csv
 import hmac
+from contextlib import asynccontextmanager
 import hashlib
 import asyncio
 import logging
@@ -3081,7 +3082,14 @@ async def handle_stripe_webhook(request: Request) -> Response:
 # FastAPI application
 # ---------------------------------------------------------------------------
 
-_fastapi_app = FastAPI()
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    await _startup()
+    yield
+    await _shutdown()
+
+
+_fastapi_app = FastAPI(lifespan=_lifespan)
 
 
 @_fastapi_app.post("/webhook")
@@ -3108,7 +3116,6 @@ async def stripe_webhook_endpoint(request: Request) -> Response:
     return await handle_stripe_webhook(request)
 
 
-@_fastapi_app.on_event("startup")
 async def _startup() -> None:
     init_usage_csv_file()
     tanya_followup.init_scheduler(_BOT_DIR / "logs" / "apscheduler.sqlite")
@@ -3128,7 +3135,6 @@ async def _startup() -> None:
     logger.info("Tanya Talk iMessage server started")
 
 
-@_fastapi_app.on_event("shutdown")
 async def _shutdown() -> None:
     await tanya_followup.shutdown_scheduler()
 
