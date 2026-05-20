@@ -193,8 +193,8 @@ DELETE_TRIGGERS: frozenset[str] = frozenset({
 })
 DELETE_CONFIRMATION_PROMPT = (
     "This one I want to get right. Everything we've built together, your sessions, your profile, "
-    "all of it, would be gone for good. If that's what you want, reply 'yes, delete everything' "
-    "and I'll take care of it. If not, just say so and we keep going."
+    "all of it, would be gone for good. If that's what you want, just say yes and I'll take care of it. "
+    "If not, just say so and we keep going."
 )
 DELETE_CONFIRMED_MESSAGE = (
     "Done. It's all gone. Your sessions, your profile, everything. "
@@ -346,7 +346,7 @@ async def blooio_send_vcard(phone: str) -> None:
                     "Authorization": f"Bearer {BLOOIO_API_KEY}",
                     "Content-Type": "application/json",
                 },
-                json={"attachments": [{"url": vcf_url}]},
+                json={"attachments": [{"url": vcf_url, "name": "Tanya.vcf"}]},
             )
             if resp.status_code not in (200, 202):
                 logger.warning("Blooio vCard send failed %d: %s", resp.status_code, resp.text[:200])
@@ -2263,7 +2263,7 @@ If they only said hi/hello or something minimal, give a brief warm line (e.g. gl
 Rules:
 - 1–2 sentences only
 - No em dashes
-- No space before commas
+- Standard punctuation spacing: space after a comma, never before it
 - Do not start with "I"
 - No privacy, terms, legal, or encryption talk
 - Never mention tech, Telegram, bots, AI, microphones, syncing, prototypes, keyboards, figuring out platforms, debugging, beta, or app mechanics
@@ -2295,7 +2295,7 @@ Prefer a grounded coaching invitation instead: what's present to explore, where 
 Rules:
 - One sentence, at most 14 words
 - No em dashes
-- No space before commas
+- Standard punctuation spacing: space after a comma, never before it
 - Do not start with "I"
 - Never mention Telegram, bots, AI, microphones, syncing, prototyping, dashboards, keyboards, figuring out tech, debugging, beta, apps, platforms, or product mechanics.
 - Return only that line, nothing else"""
@@ -2605,6 +2605,30 @@ async def ai_detects_delete_intent(text: str) -> bool:
         return response.content[0].text.strip().lower().startswith("yes")
     except Exception:
         return False
+
+
+async def classify_delete_confirmation_intent(user_text: str) -> str:
+    """Haiku sentiment check for delete confirmation: affirmative | negative | unclear."""
+    system = (
+        "A client was asked to confirm they want all their data permanently deleted. "
+        "Classify their reply.\n\n"
+        "- affirmative: any form of yes, go ahead, do it, sure, ok, yep, confirmed, delete it, etc.\n"
+        "- negative: any form of no, cancel, keep it, never mind, I changed my mind, etc.\n"
+        "- unclear: ambiguous or unrelated\n\n"
+        "Reply with exactly one word: affirmative OR negative OR unclear. Nothing else."
+    )
+    try:
+        response = await claude.messages.create(
+            model=CLAUDE_HAIKU_MODEL,
+            max_tokens=10,
+            system=system,
+            messages=[{"role": "user", "content": user_text}],
+        )
+        word = response.content[0].text.strip().lower().split()[0].rstrip(".,!?")
+        return word if word in ("affirmative", "negative", "unclear") else "unclear"
+    except Exception as e:
+        logger.warning("Delete confirmation classify error: %s", e)
+        return "unclear"
 
 
 async def delete_client_data(phone: str) -> None:
@@ -3253,9 +3277,8 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
 
     # Delete confirmation: client already triggered the delete flow, waiting on yes/no.
     if awaiting_delete_confirmation.get(phone):
-        normalized_del = user_text.strip().lower().rstrip("!.? ")
-        if normalized_del in ("yes, delete everything", "yes delete everything",
-                              "yes, delete", "yes delete", "yes"):
+        intent = await classify_delete_confirmation_intent(user_text)
+        if intent == "affirmative":
             awaiting_delete_confirmation.pop(phone, None)
             await delete_client_data(phone)
             await blooio_send_message(phone, DELETE_CONFIRMED_MESSAGE)
@@ -3266,9 +3289,11 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
                     "Use the link below to cancel so you are not charged again.\n\n"
                     f"{STRIPE_PORTAL_LINK}",
                 )
-        else:
+        elif intent == "negative":
             awaiting_delete_confirmation.pop(phone, None)
             await blooio_send_message(phone, DELETE_CANCELLED_MESSAGE)
+        else:
+            await blooio_send_message(phone, "Just want to make sure — do you want me to delete everything?")
         return
 
     # Top-up confirmation: client hit monthly cap and we asked if they want the link.
