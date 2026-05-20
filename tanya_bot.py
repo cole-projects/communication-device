@@ -86,9 +86,9 @@ SESSION_TIMEOUT_MINUTES = 60
 MIN_EXCHANGES_FOR_FOLLOWUP = 5
 # Human-like pause before sending reply (anchor clock). Override via RESPONSE_DELAY_SECONDS in .env for quick tests (e.g. 3).
 try:
-    RESPONSE_DELAY_SECONDS = float(os.getenv("RESPONSE_DELAY_SECONDS", "10"))
+    RESPONSE_DELAY_SECONDS = float(os.getenv("RESPONSE_DELAY_SECONDS", "0"))
 except ValueError:
-    RESPONSE_DELAY_SECONDS = 10.0
+    RESPONSE_DELAY_SECONDS = 0.0
 
 # First session free trial: cap user turns (each turn = one user message + one Tanya reply).
 FREE_TRIAL_USER_MESSAGE_CAP = 25
@@ -161,7 +161,7 @@ REFERRAL_NUDGE_MIN_SESSIONS_BETWEEN = 4
 REFERRAL_NUDGE_MARKER = "<<<REFERRAL_NUDGE>>>"
 
 # Debounce window: rapid messages arriving within this window are merged into one Claude call.
-DEBOUNCE_SECONDS = 5.0
+DEBOUNCE_SECONDS = 2.0
 # Typing bubble appears this many seconds after a message arrives, before debounce fires.
 TYPING_BUBBLE_DELAY_SEC = 3.0
 # Re-fire typing_on this often while waiting for Claude, so the indicator doesn't expire.
