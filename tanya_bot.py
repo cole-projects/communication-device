@@ -198,6 +198,9 @@ DELETE_CONFIRMATION_PROMPT = (
     "all of it, would be gone for good. If that's what you want, just say yes and I'll take care of it. "
     "If not, just say so and we keep going."
 )
+DELETE_CONFIRMATION_PROMPT_TRIAL = (
+    "Just to confirm. Saying yes will permanently delete our conversation and any session notes tied to you. Want to go ahead?"
+)
 DELETE_CONFIRMED_MESSAGE = (
     "Done. It's all gone. Your sessions, your profile, everything. "
     "If you ever find yourself back here, I'll meet you fresh. Take care of yourself."
@@ -3337,7 +3340,7 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         intent = await classify_delete_confirmation_intent(user_text)
         if intent == "affirmative":
             awaiting_delete_confirmation.pop(phone, None)
-            portal_url = await create_stripe_portal_url(phone) or STRIPE_PORTAL_LINK
+            portal_url = await create_stripe_portal_url(phone)
             await delete_client_data(phone)
             await blooio_send_message(phone, DELETE_CONFIRMED_MESSAGE)
             if portal_url:
@@ -3407,7 +3410,8 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
 
     if delete_intent:
         awaiting_delete_confirmation[phone] = True
-        await blooio_send_message(phone, DELETE_CONFIRMATION_PROMPT)
+        prompt = DELETE_CONFIRMATION_PROMPT if has_tanyatalk_access(phone) else DELETE_CONFIRMATION_PROMPT_TRIAL
+        await blooio_send_message(phone, prompt)
         return
 
     # Session end: whole message matches SESSION_END_NORMALIZED; not model-decided.
