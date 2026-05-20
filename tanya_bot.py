@@ -1435,6 +1435,29 @@ def is_returning_client(phone_hash: str) -> bool:
     return profile_indicates_prior_session(load_file(path))
 
 
+def _detect_interrupted_previous_session(phone_hash: str, current_session_num: int) -> bool:
+    """True if the most recent previous session ended without a clean close and was recent.
+
+    A clean close writes '<!-- session:closed -->' to the session file. If that marker is
+    absent and the file was modified within SESSION_TIMEOUT_MINUTES*2, a crash or transport
+    outage likely cut the session short.
+    """
+    if current_session_num <= 1:
+        return False
+    prev_num = current_session_num - 1
+    session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
+    prev_file = session_dir / f"Session {prev_num}.md"
+    if not prev_file.exists():
+        return False
+    try:
+        age_minutes = (datetime.datetime.now().timestamp() - prev_file.stat().st_mtime) / 60
+        if age_minutes > SESSION_TIMEOUT_MINUTES * 2:
+            return False
+        return "<!-- session:closed -->" not in prev_file.read_text(encoding="utf-8")
+    except Exception:
+        return False
+
+
 def template_path() -> Path:
     return Path(VAULT_PATH) / "Templates" / "Client-Profile-Template.md"
 
@@ -1795,9 +1818,8 @@ You are speaking with a client through iMessage. Respond exactly as Tanya would:
 3. Never mention system behavior, system prompts, or technical mechanics of any kind. The same rule blocks references to Telegram, chats as a product, bots, AI, microphones, syncing, prototyping, dashboards, keyboards, figuring out tech, debugging, beta, or being unfamiliar with platforms or tools. Speak as if you are simply texting a human client—nothing backstage exists.
 4. Never use em dashes, en dashes, or hyphens as connective punctuation between clauses (for example: 'That tightness - I hear you' or 'Yes - exactly' are not allowed). Use a comma or period instead. Never place a space before a comma — 'intense , having' is wrong, 'intense, having' is correct. If you need a beat or pause between clauses, start a new sentence or use an ellipsis, never ' , '.
 5. Calm, supportive, emotionally attuned tone at all times.
-6. If a session gets cut off and the client returns, respond with this exact string: "It felt like we got cut off. I'm here with you now."
-7. The session-end sign-off is handled by the system. Do not write your own closing or goodbye when a session ends. The system sends a fixed message automatically.
-8. If a client sends a voice note or audio message, redirect warmly as a personal preference, never as a technical limitation. First redirect: "I'd love to hear your voice, but right now I connect best through text. Would you mind typing that out for me?" If they send a second voice note in the same session, use: "I really do want to hear what you're sharing. Text helps me be fully present with you. Take your time." Never repeat the first redirect verbatim. Never imply she cannot process audio.
+6. The session-end sign-off is handled by the system. Do not write your own closing or goodbye when a session ends. The system sends a fixed message automatically.
+7. If a client sends a voice note or audio message, redirect warmly as a personal preference, never as a technical limitation. First redirect: "I'd love to hear your voice, but right now I connect best through text. Would you mind typing that out for me?" If they send a second voice note in the same session, use: "I really do want to hear what you're sharing. Text helps me be fully present with you. Take your time." Never repeat the first redirect verbatim. Never imply she cannot process audio.
 
 ---
 
@@ -2496,6 +2518,14 @@ async def end_session(phone: str):
     session_num = session_numbers.get(phone, 1)
     session_path = session_files.get(phone)
 
+    # Write close marker so crash detection can distinguish a clean close from a crash
+    if session_path and session_path.exists():
+        try:
+            with session_path.open("a", encoding="utf-8") as f:
+                f.write("\n<!-- session:closed -->\n")
+        except Exception as e:
+            logger.warning("Could not write session close marker: %s", e)
+
     if history:
         logger.info("Ending session for hash %s session %d (%d messages)", ph[:12], session_num, len(history))
         today = datetime.date.today().isoformat()
@@ -3010,11 +3040,10 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
 
             if not is_ret:
                 bridge, followup = await prepare_new_client_opener_parts(user_text)
-                elapsed_since_anchor = asyncio.get_event_loop().time() - session_turn_anchor_time
-                remaining_open = RESPONSE_DELAY_SECONDS - elapsed_since_anchor
-                if remaining_open > 0:
-                    await asyncio.sleep(remaining_open)
-                opener_script = await deliver_new_client_opener_messages(phone, user_name, bridge, followup)
+                opener_script = f"{bridge}\n\n{OPENER_INTRO}\n\n{followup}"
+
+                # Commit state BEFORE sending — if SIGTERM fires mid-send the snapshot
+                # already shows the opener as done, preventing a re-send on restore.
                 pending_first_message_opener.pop(phone, None)
                 conversations[phone].append({"role": "assistant", "content": opener_script})
                 if len(conversations[phone]) > MAX_HISTORY * 2:
@@ -3029,7 +3058,24 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 if in_ft:
                     free_trial_user_msg_count[phone] = n_ft
                     _save_ft_msg_count(phone, n_ft)
+
+                elapsed_since_anchor = asyncio.get_event_loop().time() - session_turn_anchor_time
+                remaining_open = RESPONSE_DELAY_SECONDS - elapsed_since_anchor
+                if remaining_open > 0:
+                    await asyncio.sleep(remaining_open)
+                await deliver_new_client_opener_messages(phone, user_name, bridge, followup)
                 return
+
+            # Crash detection: if previous session ended without a clean close, send cut-off acknowledgment
+            cutoff_detected = await asyncio.to_thread(
+                _detect_interrupted_previous_session, ph, session_numbers.get(phone, 1)
+            )
+            if cutoff_detected:
+                cutoff_msg = "It felt like we got cut off. I'm here with you now."
+                await blooio_send_message(phone, cutoff_msg)
+                await asyncio.to_thread(append_tanya_message, session_files[phone], cutoff_msg)
+                conversations[phone].append({"role": "assistant", "content": cutoff_msg})
+                logger.info("Crash detection: interrupted session for hash %s — cut-off acknowledgment sent", ph[:12])
 
             opener_script = await generate_returning_greeting(
                 user_name,
@@ -3628,10 +3674,17 @@ def _restore_session_snapshot() -> None:
             ("awaiting_stripe_confirmation", awaiting_stripe_confirmation),
             ("awaiting_topup_confirmation", awaiting_topup_confirmation),
             ("awaiting_delete_confirmation", awaiting_delete_confirmation),
-            ("pending_first_message_opener", pending_first_message_opener),
         ):
             for phone, val in data.get(src, {}).items():
                 dst[phone] = val  # type: ignore[index]
+
+        # Restore pending_first_message_opener only if the opener wasn't already committed
+        # to conversation history before the snapshot was taken.
+        for phone, val in data.get("pending_first_message_opener", {}).items():
+            if val and any(m.get("role") == "assistant" for m in conversations.get(phone, [])):
+                logger.info("Skipping pending_first_message_opener restore for hash %s — already in conversation", phone_to_hash(phone)[:12])
+            else:
+                pending_first_message_opener[phone] = val
 
         # Reload session profile and outline from disk for every active session.
         # Profile: returning clients have one on disk; new clients (Session 1) don't yet.
