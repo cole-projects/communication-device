@@ -3565,6 +3565,8 @@ def _write_session_snapshot() -> None:
             "awaiting_delete_confirmation": awaiting_delete_confirmation,
             "pending_first_message_opener": pending_first_message_opener,
             "free_trial_user_msg_count": free_trial_user_msg_count,
+            "free_trial_90_warned": free_trial_90_warned,
+            "referral_nudge_used_this_session": referral_nudge_used_this_session,
         }
         SESSION_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
         SESSION_SNAPSHOT_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -3615,6 +3617,8 @@ def _restore_session_snapshot() -> None:
             ("session_numbers", session_numbers),
             ("client_names", client_names),
             ("free_trial_user_msg_count", free_trial_user_msg_count),
+            ("free_trial_90_warned", free_trial_90_warned),
+            ("referral_nudge_used_this_session", referral_nudge_used_this_session),
         ):
             for phone, val in data.get(src, {}).items():
                 if phone in active_phones:
@@ -3628,6 +3632,24 @@ def _restore_session_snapshot() -> None:
         ):
             for phone, val in data.get(src, {}).items():
                 dst[phone] = val  # type: ignore[index]
+
+        # Reload session profile and outline from disk for each active session —
+        # fresher than storing them in the snapshot and avoids snapshot bloat.
+        for phone in active_phones:
+            if phone in session_files:
+                ph = phone_to_hash(phone)
+                try:
+                    profile = load_client_profile(ph)
+                    if profile:
+                        session_profiles[phone] = profile
+                except Exception:
+                    pass
+                try:
+                    outline = load_session_outline()
+                    if outline:
+                        session_outlines[phone] = outline
+                except Exception:
+                    pass
 
         SESSION_SNAPSHOT_PATH.unlink()
         logger.info(
