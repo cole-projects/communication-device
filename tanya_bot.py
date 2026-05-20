@@ -39,7 +39,7 @@ VAULT_PATH = os.getenv(
 )
 GITHUB_PAT = os.getenv("GITHUB_PAT", "").strip()
 GITHUB_VAULT_REPO = os.getenv("GITHUB_VAULT_REPO", "https://github.com/cole-projects/tanya-brain.git")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_HAIKU_MODEL = os.getenv("CLAUDE_HAIKU_MODEL", "claude-haiku-4-5-20251001")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "JZWiJzVBxv3K7zOcItDy")
@@ -164,6 +164,8 @@ REFERRAL_NUDGE_MARKER = "<<<REFERRAL_NUDGE>>>"
 DEBOUNCE_SECONDS = 5.0
 # Typing bubble appears this many seconds after a message arrives, before debounce fires.
 TYPING_BUBBLE_DELAY_SEC = 3.0
+# Re-fire typing_on this often while waiting for Claude, so the indicator doesn't expire.
+_TYPING_KEEPALIVE_SEC = 20.0
 
 # Subscription cancellation flow.
 CANCEL_TRIGGERS: frozenset[str] = frozenset({
@@ -609,8 +611,20 @@ def acquire_single_instance_lock() -> None:
             except OSError:
                 pass
             if attempt == 0 and stale.isdigit():
+                stale_pid = int(stale)
+                # In Railway containers the app runs as PID 1. After a crash the lock
+                # file persists on the volume with PID 1, and the new container also
+                # starts as PID 1 — so os.kill(1, 0) succeeds even though it's stale.
+                # If the PID matches our own, the lock is definitely from a prior run.
+                if stale_pid == os.getpid():
+                    try:
+                        PID_FILE_PATH.unlink(missing_ok=True)
+                    except (TypeError, OSError):
+                        if PID_FILE_PATH.exists():
+                            PID_FILE_PATH.unlink()
+                    continue
                 try:
-                    os.kill(int(stale), 0)
+                    os.kill(stale_pid, 0)
                 except ProcessLookupError:
                     try:
                         PID_FILE_PATH.unlink(missing_ok=True)
