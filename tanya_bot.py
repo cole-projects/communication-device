@@ -100,7 +100,8 @@ FREE_TRIAL_90_WARNING = (
     "After a couple more messages from you, I will share how to keep going with TanyaTalk."
 )
 POST_FREE_TRIAL_BLOCK_MESSAGE = (
-    "This chapter with me is complete for now, and I am not opening more coaching here until you are inside TanyaTalk."
+    "You have used up your free session with me. If you want to keep going, it's $21 a month for 250 messages. "
+    "Reply yes and I'll send you the link."
 )
 POST_TRIAL_RESET_DENIED_MESSAGE = (
     "That cannot start another free session. Your trial is complete. "
@@ -2994,7 +2995,36 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
     lock = await _get_chat_message_lock(phone)
     async with lock:
         if should_block_unpaid_after_free_trial(phone):
-            await blooio_send_message(phone, POST_FREE_TRIAL_BLOCK_MESSAGE)
+            if awaiting_stripe_confirmation.get(phone):
+                intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
+                if intent == "affirmative":
+                    awaiting_stripe_confirmation.pop(phone, None)
+                    if STRIPE_SECRET_KEY and STRIPE_SUBSCRIPTION_PRICE_ID:
+                        checkout_url = None
+                        for attempt in range(2):
+                            try:
+                                checkout_url = await create_subscription_checkout_url(phone)
+                                break
+                            except Exception as e:
+                                if attempt == 0:
+                                    await asyncio.sleep(2)
+                                else:
+                                    logger.error("Checkout URL failed after retry: %s", e)
+                        if checkout_url:
+                            await blooio_send_message(phone, f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}")
+                        else:
+                            awaiting_stripe_confirmation[phone] = True
+                            await blooio_send_message(phone, "Having a small tech hiccup. Text me back in a minute and I'll send you the link.")
+                    elif STRIPE_PAYMENT_LINK:
+                        await blooio_send_message(phone, f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}")
+                elif intent == "negative":
+                    awaiting_stripe_confirmation.pop(phone, None)
+                    await blooio_send_message(phone, FREE_TRIAL_STRIPE_DECLINED)
+                else:
+                    await blooio_send_message(phone, STRIPE_CONFIRMATION_UNCLEAR_REPLY)
+            else:
+                awaiting_stripe_confirmation[phone] = True
+                await blooio_send_message(phone, POST_FREE_TRIAL_BLOCK_MESSAGE)
             return
 
         session_turn_anchor_time = asyncio.get_event_loop().time()
