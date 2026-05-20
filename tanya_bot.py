@@ -337,7 +337,7 @@ async def blooio_send_vcard(phone: str) -> None:
     """Send TanyaTalk contact card on first interaction so clients can save the number."""
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
-    vcf_url = f"{TANYA_PUBLIC_URL}/tanya.vcf"
+    vcf_url = "https://www.tanya-talk.com/tanya.vcf"
     try:
         async with httpx.AsyncClient(timeout=30.0) as http:
             resp = await http.post(
