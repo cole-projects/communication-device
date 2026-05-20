@@ -2328,12 +2328,13 @@ async def deliver_new_client_opener_messages(
     bridge: str,
     followup: str,
 ) -> str:
-    """Outbound flow: (1) bridge + OPENER_INTRO; (2) short coaching invite line — all text over iMessage."""
+    """Outbound flow: (1) vCard; (2) bridge + OPENER_INTRO; (3) coaching invite — no delays."""
+    await blooio_send_message(phone, "Save this contact")
+    await blooio_send_vcard(phone)
+
     main_combined = f"{bridge}\n\n{OPENER_INTRO}"
     await blooio_send_message(phone, main_combined)
     logger.info("New client opener: main block sent for %s", user_name)
-
-    await asyncio.sleep(NEW_CLIENT_OPENER_BEAT_SEC)
 
     await blooio_send_message(phone, followup)
     logger.info("New client opener: follow-up line sent for %s", user_name)
