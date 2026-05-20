@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import quote
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import anthropic
 import httpx
@@ -109,8 +110,8 @@ POST_TRIAL_RESET_DENIED_MESSAGE = (
 TANYA_VCARD = "\r\n".join([
     "BEGIN:VCARD",
     "VERSION:3.0",
-    "FN:Tanya",
-    "N:;Tanya;;;",
+    "FN:TanyaTalk",
+    "N:;TanyaTalk;;;",
     f"TEL;TYPE=CELL:{BLOOIO_PHONE_NUMBER}",
     "NOTE:The conversation that changes your day.",
     "END:VCARD",
@@ -372,6 +373,32 @@ def verify_blooio_signature(raw_body: bytes, signature_header: str) -> bool:
         return hmac.compare_digest(expected, v1)
     except Exception:
         return False
+
+
+async def create_stripe_portal_url(phone: str) -> str | None:
+    """Generate a customer-specific Stripe Billing Portal session URL."""
+    if not STRIPE_SECRET_KEY:
+        return None
+    try:
+        import stripe as stripe_lib
+        stripe_lib.api_key = STRIPE_SECRET_KEY
+        customers = await asyncio.to_thread(
+            stripe_lib.Customer.search,
+            query=f'phone:"{phone}"',
+            limit=1,
+        )
+        if not customers.data:
+            return None
+        customer_id = customers.data[0]["id"]
+        session = await asyncio.to_thread(
+            stripe_lib.billing_portal.Session.create,
+            customer=customer_id,
+            return_url="https://www.tanya-talk.com",
+        )
+        return session.url
+    except Exception as e:
+        logger.warning("Stripe portal URL creation failed: %s", e)
+        return None
 
 
 async def get_stripe_customer_name(phone: str) -> str:
@@ -2329,7 +2356,7 @@ async def deliver_new_client_opener_messages(
     followup: str,
 ) -> str:
     """Outbound flow: (1) vCard; (2) bridge + OPENER_INTRO; (3) coaching invite — no delays."""
-    await blooio_send_message(phone, "Save this contact")
+    await blooio_send_message(phone, "Save this contact if you haven't already")
     await blooio_send_vcard(phone)
 
     main_combined = f"{bridge}\n\n{OPENER_INTRO}"
@@ -3280,14 +3307,16 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         intent = await classify_delete_confirmation_intent(user_text)
         if intent == "affirmative":
             awaiting_delete_confirmation.pop(phone, None)
+            portal_url = await create_stripe_portal_url(phone) or STRIPE_PORTAL_LINK
             await delete_client_data(phone)
             await blooio_send_message(phone, DELETE_CONFIRMED_MESSAGE)
-            if STRIPE_PORTAL_LINK:
+            if portal_url:
                 await blooio_send_message(
                     phone,
-                    "One more thing. Your data is gone but your billing is still active. "
-                    "Use the link below to cancel so you are not charged again.\n\n"
-                    f"{STRIPE_PORTAL_LINK}",
+                    "One more thing. Your billing is still active. Use the link below to cancel "
+                    "your subscription. You'll keep access through the end of your current billing "
+                    "period and won't be charged again after that.\n\n"
+                    f"{portal_url}",
                 )
         elif intent == "negative":
             awaiting_delete_confirmation.pop(phone, None)
@@ -3328,15 +3357,25 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
             await blooio_send_message(phone, TOPUP_UNCLEAR_REPLY)
         return
 
-    # Cancel subscription trigger: phrase match first, then AI fallback.
+    # Cancel / delete triggers — phrase match first (free), then parallel AI fallback.
     user_text_lower = user_text.strip().lower()
-    if any(trigger in user_text_lower for trigger in CANCEL_TRIGGERS) or await ai_detects_cancel_intent(user_text):
+    cancel_phrase = any(t in user_text_lower for t in CANCEL_TRIGGERS)
+    delete_phrase = any(t in user_text_lower for t in DELETE_TRIGGERS)
+
+    if not cancel_phrase and not delete_phrase:
+        cancel_intent, delete_intent = await asyncio.gather(
+            ai_detects_cancel_intent(user_text),
+            ai_detects_delete_intent(user_text),
+        )
+    else:
+        cancel_intent, delete_intent = cancel_phrase, delete_phrase
+
+    if cancel_intent:
         msg = CANCEL_MESSAGE_WITH_LINK.format(portal_link=STRIPE_PORTAL_LINK)
         await blooio_send_message(phone, msg)
         return
 
-    # Delete trigger: phrase match first (free), then AI fallback to catch natural phrasing.
-    if any(trigger in user_text_lower for trigger in DELETE_TRIGGERS) or await ai_detects_delete_intent(user_text):
+    if delete_intent:
         awaiting_delete_confirmation[phone] = True
         await blooio_send_message(phone, DELETE_CONFIRMATION_PROMPT)
         return
@@ -3553,11 +3592,49 @@ async def _lifespan(app: FastAPI):
 
 
 _fastapi_app = FastAPI(lifespan=_lifespan)
+_fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://www.tanya-talk.com", "https://tanya-talk.com"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 
 @_fastapi_app.get("/health")
 async def health() -> Response:
     return Response(content="ok", status_code=200)
+
+
+@_fastapi_app.post("/report-error")
+async def report_error(request: Request) -> Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return Response(status_code=400)
+    description = (body.get("description") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    if not description:
+        return Response(status_code=400)
+    from datetime import datetime, timezone
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    phone_line = f"**Phone:** {phone}\n" if phone else ""
+    entry = f"\n## {timestamp}\n{phone_line}**Issue:** {description}\n\n---\n"
+    report_path = Path(VAULT_PATH) / "00-Archive" / "Error Reports.md"
+    try:
+        await asyncio.to_thread(_append_error_report, report_path, entry)
+        logger.info("Error report logged: %s chars", len(description))
+    except Exception as e:
+        logger.warning("Error report write failed: %s", e)
+        return Response(status_code=500)
+    return Response(status_code=200)
+
+
+def _append_error_report(path: Path, entry: str) -> None:
+    if not path.exists():
+        path.write_text("# Error Reports\n" + entry, encoding="utf-8")
+    else:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(entry)
 
 
 @_fastapi_app.get("/audio/{filename}")
