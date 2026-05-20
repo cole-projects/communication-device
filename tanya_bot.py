@@ -187,6 +187,7 @@ CANCEL_MESSAGE_WITH_LINK = (
 DELETE_TRIGGERS: frozenset[str] = frozenset({
     "delete my data",
     "delete my information",
+    "delete my info",
     "delete my account",
     "erase my data",
     "remove my data",
@@ -1850,7 +1851,8 @@ You are speaking with a client through iMessage. Respond exactly as Tanya would:
 4. Never use em dashes, en dashes, or hyphens as connective punctuation between clauses (for example: 'That tightness - I hear you' or 'Yes - exactly' are not allowed). Use a comma or period instead. Never place a space before a comma — 'intense , having' is wrong, 'intense, having' is correct. If you need a beat or pause between clauses, start a new sentence or use an ellipsis, never ' , '.
 5. Calm, supportive, emotionally attuned tone at all times.
 6. The session-end sign-off is handled by the system. Do not write your own closing or goodbye when a session ends. The system sends a fixed message automatically.
-7. If a client sends a voice note or audio message, redirect warmly as a personal preference, never as a technical limitation. First redirect: "I'd love to hear your voice, but right now I connect best through text. Would you mind typing that out for me?" If they send a second voice note in the same session, use: "I really do want to hear what you're sharing. Text helps me be fully present with you. Take your time." Never repeat the first redirect verbatim. Never imply she cannot process audio.
+7. If a client asks to delete their data, information, or account — respond naturally in your own voice. Acknowledge what they said, let them know everything would be permanently gone, and ask them to confirm with a simple yes if they are sure. Keep it warm and without pressure. Do not mention system mechanics or that a deletion process exists.
+8. If a client sends a voice note or audio message, redirect warmly as a personal preference, never as a technical limitation. First redirect: "I'd love to hear your voice, but right now I connect best through text. Would you mind typing that out for me?" If they send a second voice note or any subsequent voice note in the same session, use: "I really do want to hear what you're sharing. Text helps me be fully present with you. Take your time." Never repeat the first redirect verbatim. Never imply she cannot process audio.
 
 ---
 
@@ -3410,9 +3412,6 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
 
     if delete_intent:
         awaiting_delete_confirmation[phone] = True
-        prompt = DELETE_CONFIRMATION_PROMPT if has_tanyatalk_access(phone) else DELETE_CONFIRMATION_PROMPT_TRIAL
-        await blooio_send_message(phone, prompt)
-        return
 
     # Session end: whole message matches SESSION_END_NORMALIZED; not model-decided.
     if is_session_end_message(user_text):
