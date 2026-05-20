@@ -3633,8 +3633,13 @@ def _restore_session_snapshot() -> None:
             for phone, val in data.get(src, {}).items():
                 dst[phone] = val  # type: ignore[index]
 
-        # Reload session profile and outline from disk for each active session —
-        # fresher than storing them in the snapshot and avoids snapshot bloat.
+        # Reload session profile and outline from disk for every active session.
+        # Profile: returning clients have one on disk; new clients (Session 1) don't yet.
+        # Outline: always reloaded — same file for every client, always fresh from disk.
+        profiles_loaded = 0
+        profiles_skipped = 0
+        outlines_loaded = 0
+        outline_cache: str | None = None  # load once, reuse for all sessions
         for phone in active_phones:
             if phone in session_files:
                 ph = phone_to_hash(phone)
@@ -3642,14 +3647,23 @@ def _restore_session_snapshot() -> None:
                     profile = load_client_profile(ph)
                     if profile:
                         session_profiles[phone] = profile
+                        profiles_loaded += 1
+                    else:
+                        profiles_skipped += 1  # new client, no profile yet
                 except Exception:
-                    pass
+                    profiles_skipped += 1
                 try:
-                    outline = load_session_outline()
-                    if outline:
-                        session_outlines[phone] = outline
+                    if outline_cache is None:
+                        outline_cache = load_session_outline()
+                    if outline_cache:
+                        session_outlines[phone] = outline_cache
+                        outlines_loaded += 1
                 except Exception:
                     pass
+        logger.info(
+            "Snapshot restore: profiles reloaded=%d (skipped=%d new clients), outlines reloaded=%d",
+            profiles_loaded, profiles_skipped, outlines_loaded,
+        )
 
         SESSION_SNAPSHOT_PATH.unlink()
         logger.info(
