@@ -141,7 +141,7 @@ NEW_CLIENT_OPENER_BEAT_SEC = 1.0
 
 FREE_TRIAL_CLOSE_TEXT = (
     "Unfortunately, this is where our time wraps up. That was a great session. "
-    "If you want to keep going, it's $20 a month for 250 messages. "
+    "If you want to keep going, it's $21 a month for 250 messages. "
     "Reply yes and I'll send you the link."
 )
 
@@ -488,6 +488,7 @@ _REFERRAL_STATE_LOCK = threading.Lock()
 _MONTHLY_USAGE_LOCK = threading.Lock()
 _EXTRA_MESSAGES_LOCK = threading.Lock()
 _FREE_TRIAL_LOCK = threading.Lock()
+_FT_COUNT_LOCK = threading.Lock()
 _VAULT_GIT_LOCK = threading.Lock()
 
 
@@ -578,6 +579,7 @@ MONTHLY_USAGE_PATH = _BOT_DIR / "logs" / "monthly_usage.json"
 EXTRA_MESSAGES_PATH = _BOT_DIR / "logs" / "extra_messages.json"
 PAID_ACCESS_PATH = _BOT_DIR / "logs" / "paid_access.json"
 FREE_TRIAL_COMPLETED_PATH = _BOT_DIR / "logs" / "free_trial_completed.json"
+FREE_TRIAL_MSG_COUNT_PATH = _BOT_DIR / "logs" / "free_trial_msg_counts.json"
 SUBSCRIPTION_START_PATH = _BOT_DIR / "logs" / "subscription_starts.json"
 USAGE_CSV_FIELDNAMES = [
     "log_id",
@@ -953,6 +955,42 @@ def load_paid_access_into_memory() -> None:
     # At startup we load hashes from disk but can't reverse to phones —
     # access is re-granted when Stripe webhook fires with the phone.
     pass
+
+
+FREE_TRIAL_MIN_MSGS_FOR_CLOSE = 5
+
+
+def _load_ft_msg_counts() -> dict[str, int]:
+    if not FREE_TRIAL_MSG_COUNT_PATH.exists():
+        return {}
+    try:
+        return json.loads(FREE_TRIAL_MSG_COUNT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_ft_msg_count(phone: str, count: int) -> None:
+    ph = phone_to_hash(phone)
+    with _FT_COUNT_LOCK:
+        data = _load_ft_msg_counts()
+        data[ph] = count
+        FREE_TRIAL_MSG_COUNT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        FREE_TRIAL_MSG_COUNT_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _get_ft_msg_count_from_disk(phone: str) -> int:
+    ph = phone_to_hash(phone)
+    with _FT_COUNT_LOCK:
+        return _load_ft_msg_counts().get(ph, 0)
+
+
+def _delete_ft_msg_count(phone: str) -> None:
+    ph = phone_to_hash(phone)
+    with _FT_COUNT_LOCK:
+        data = _load_ft_msg_counts()
+        data.pop(ph, None)
+        FREE_TRIAL_MSG_COUNT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        FREE_TRIAL_MSG_COUNT_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def _load_free_trial_completed_ids() -> set[str]:
@@ -2674,10 +2712,18 @@ async def session_timeout_task(phone: str) -> None:
     is_ft = False
     async with lock:
         if phone in conversations and conversations[phone]:
-            logger.info("Session timeout for phone_key=%s", _phone_key(phone))
             is_ft = in_first_free_trial_session(phone)
+            ft_count = free_trial_user_msg_count.get(phone, 0)
+            if is_ft and ft_count < FREE_TRIAL_MIN_MSGS_FOR_CLOSE:
+                logger.info(
+                    "Free trial timeout suppressed for phone_key=%s — only %d user turn(s), need %d",
+                    _phone_key(phone), ft_count, FREE_TRIAL_MIN_MSGS_FOR_CLOSE,
+                )
+                return
+            logger.info("Session timeout for phone_key=%s", _phone_key(phone))
             if is_ft:
                 mark_free_trial_completed(phone)
+                _delete_ft_msg_count(phone)
                 awaiting_stripe_confirmation[phone] = True
             await end_session(phone)
             ended = True
@@ -2785,6 +2831,7 @@ async def perform_session_close(phone: str, user_text: str) -> bool:
 
         if is_ft:
             mark_free_trial_completed(phone)
+            _delete_ft_msg_count(phone)
             awaiting_stripe_confirmation[phone] = True
 
         cancel_session_timeout(phone)
@@ -2881,9 +2928,13 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
         if session_user_msgs == SESSION_CAP_WARNING_AT:
             await blooio_send_message(phone, SESSION_CAP_WARNING_MESSAGE)
 
+        in_ft = in_first_free_trial_session(phone)
+        if in_ft and phone not in free_trial_user_msg_count:
+            disk_count = _get_ft_msg_count_from_disk(phone)
+            if disk_count > 0:
+                free_trial_user_msg_count[phone] = disk_count
         prev_ft = free_trial_user_msg_count.get(phone, 0)
         n_ft = prev_ft + 1
-        in_ft = in_first_free_trial_session(phone)
 
         if in_ft and n_ft == FREE_TRIAL_90_PCT_USER_MESSAGE and not free_trial_90_warned.get(phone):
             free_trial_90_warned[phone] = True
@@ -2927,6 +2978,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
             await blooio_send_message(phone, FREE_TRIAL_CLOSE_TEXT)
             mark_free_trial_completed(phone)
             free_trial_user_msg_count[phone] = FREE_TRIAL_USER_MESSAGE_CAP
+            _delete_ft_msg_count(phone)
             awaiting_stripe_confirmation[phone] = True
             cancel_session_timeout(phone)
             await end_session(phone)
@@ -2962,6 +3014,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 )
                 if in_ft:
                     free_trial_user_msg_count[phone] = n_ft
+                    _save_ft_msg_count(phone, n_ft)
                 return
 
             opener_script = await generate_returning_greeting(
@@ -2990,6 +3043,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
             if in_ft:
                 free_trial_user_msg_count[phone] = n_ft
+                _save_ft_msg_count(phone, n_ft)
             return
 
         message_received_at = asyncio.get_event_loop().time()
@@ -3073,6 +3127,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
 
         if in_ft:
             free_trial_user_msg_count[phone] = n_ft
+            _save_ft_msg_count(phone, n_ft)
 
 
 async def handle_inbound_message(phone: str, user_text: str) -> None:
