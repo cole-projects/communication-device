@@ -583,6 +583,7 @@ PAID_ACCESS_PATH = _BOT_DIR / "logs" / "paid_access.json"
 FREE_TRIAL_COMPLETED_PATH = _BOT_DIR / "logs" / "free_trial_completed.json"
 FREE_TRIAL_MSG_COUNT_PATH = _BOT_DIR / "logs" / "free_trial_msg_counts.json"
 SUBSCRIPTION_START_PATH = _BOT_DIR / "logs" / "subscription_starts.json"
+SESSION_SNAPSHOT_PATH = _BOT_DIR / "logs" / "session_snapshot.json"
 USAGE_CSV_FIELDNAMES = [
     "log_id",
     "timestamp",
@@ -3008,7 +3009,6 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 )
 
             if not is_ret:
-                asyncio.ensure_future(blooio_send_vcard(phone))
                 bridge, followup = await prepare_new_client_opener_parts(user_text)
                 elapsed_since_anchor = asyncio.get_event_loop().time() - session_turn_anchor_time
                 remaining_open = RESPONSE_DELAY_SECONDS - elapsed_since_anchor
@@ -3551,7 +3551,100 @@ async def stripe_webhook_endpoint(request: Request) -> Response:
     return await handle_stripe_webhook(request)
 
 
+def _write_session_snapshot() -> None:
+    """Write all live session state to disk before shutdown so it survives a redeploy."""
+    try:
+        data: dict = {
+            "conversations": conversations,
+            "session_files": {p: str(v) for p, v in session_files.items()},
+            "session_numbers": session_numbers,
+            "client_names": client_names,
+            "last_activity": {p: v.isoformat() for p, v in last_activity.items()},
+            "awaiting_stripe_confirmation": awaiting_stripe_confirmation,
+            "awaiting_topup_confirmation": awaiting_topup_confirmation,
+            "awaiting_delete_confirmation": awaiting_delete_confirmation,
+            "pending_first_message_opener": pending_first_message_opener,
+            "free_trial_user_msg_count": free_trial_user_msg_count,
+        }
+        SESSION_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_SNAPSHOT_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        logger.info("Snapshot written: %d active sessions", len(session_files))
+    except Exception as e:
+        logger.error("Failed to write session snapshot: %s", e)
+
+
+def _restore_session_snapshot() -> None:
+    """Restore in-memory state from the snapshot written before last shutdown."""
+    if not SESSION_SNAPSHOT_PATH.exists():
+        return
+    try:
+        data = json.loads(SESSION_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        cutoff = datetime.datetime.now() - datetime.timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+
+        # Restore last_activity first so we can filter stale sessions
+        raw_activity: dict[str, str] = data.get("last_activity", {})
+        restored_activity: dict[str, datetime.datetime] = {}
+        for phone, iso in raw_activity.items():
+            try:
+                restored_activity[phone] = datetime.datetime.fromisoformat(iso)
+            except ValueError:
+                pass
+
+        # Only restore sessions that haven't timed out while the server was down
+        active_phones = {
+            p for p, t in restored_activity.items() if t >= cutoff
+        }
+
+        raw_files: dict[str, str] = data.get("session_files", {})
+        for phone in active_phones:
+            if phone in raw_files:
+                p = Path(raw_files[phone])
+                if p.exists():
+                    session_files[phone] = p
+
+        raw_convs: dict = data.get("conversations", {})
+        for phone in active_phones:
+            if phone in raw_convs:
+                conversations[phone] = raw_convs[phone]
+
+        for phone in active_phones:
+            if phone in restored_activity:
+                last_activity[phone] = restored_activity[phone]
+
+        for src, dst in (
+            ("session_numbers", session_numbers),
+            ("client_names", client_names),
+            ("free_trial_user_msg_count", free_trial_user_msg_count),
+        ):
+            for phone, val in data.get(src, {}).items():
+                if phone in active_phones:
+                    dst[phone] = val  # type: ignore[index]
+
+        for src, dst in (
+            ("awaiting_stripe_confirmation", awaiting_stripe_confirmation),
+            ("awaiting_topup_confirmation", awaiting_topup_confirmation),
+            ("awaiting_delete_confirmation", awaiting_delete_confirmation),
+            ("pending_first_message_opener", pending_first_message_opener),
+        ):
+            for phone, val in data.get(src, {}).items():
+                dst[phone] = val  # type: ignore[index]
+
+        SESSION_SNAPSHOT_PATH.unlink()
+        logger.info(
+            "Snapshot restored: %d active sessions (%d timed out while down)",
+            len(active_phones),
+            len(raw_activity) - len(active_phones),
+        )
+    except Exception as e:
+        logger.error("Failed to restore session snapshot: %s", e)
+        try:
+            SESSION_SNAPSHOT_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 async def _startup() -> None:
+    _restore_session_snapshot()
     init_usage_csv_file()
     for _mp in _MESH_PHONES:
         mesh_tanyatalk_included[_mp] = True
@@ -3574,6 +3667,7 @@ async def _startup() -> None:
 
 
 async def _shutdown() -> None:
+    _write_session_snapshot()
     await tanya_followup.shutdown_scheduler()
 
 
