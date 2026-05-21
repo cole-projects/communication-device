@@ -2006,7 +2006,7 @@ async def merge_focus_for_next_session_profile(phone: str, problem_one_liner: st
         insert_at = start + (m.start() if m else len(rest))
         new_text = existing[:insert_at] + "\n" + bullet + existing[insert_at:]
     await asyncio.to_thread(_write_path_utf8, path, new_text)
-    logger.info("Focus for Next Session updated for %s", client_name)
+    logger.info("Focus for Next Session updated for phone_key=%s", phone_to_hash(phone)[:12])
 
 
 async def update_client_profile(phone_hash: str, client_name: str, session_num: int, history: list):
@@ -2533,6 +2533,7 @@ async def end_session(phone: str):
     voice_note_redirects.pop(phone, None)
     pending_first_message_opener.pop(phone, None)
     awaiting_contact_save.pop(phone, None)
+    awaiting_topup_confirmation.pop(phone, None)
     free_trial_user_msg_count.pop(phone, None)
     free_trial_90_warned.pop(phone, None)
     last_activity.pop(phone, None)
@@ -2650,6 +2651,7 @@ async def delete_client_data(phone: str) -> None:
         mesh_tanyatalk_included,
         awaiting_stripe_confirmation,
         awaiting_delete_confirmation,
+        awaiting_topup_confirmation,
         awaiting_contact_save,
         pending_first_message_opener,
         referral_nudge_used_this_session,
@@ -3258,6 +3260,7 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         return
 
     if awaiting_stripe_confirmation.get(phone):
+        await blooio_typing_on(phone)
         lock = await _get_chat_message_lock(phone)
         async with lock:
             intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
@@ -3296,6 +3299,7 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
 
     # Delete confirmation: client already triggered the delete flow, waiting on yes/no.
     if awaiting_delete_confirmation.get(phone):
+        await blooio_typing_on(phone)
         intent = await classify_delete_confirmation_intent(user_text)
         if intent == "affirmative":
             awaiting_delete_confirmation.pop(phone, None)
@@ -3319,6 +3323,7 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
 
     # Top-up confirmation: client hit monthly cap and we asked if they want the link.
     if awaiting_topup_confirmation.get(phone):
+        await blooio_typing_on(phone)
         normalized = user_text.strip().lower().rstrip("!.? ")
         is_yes = any(word in normalized for word in ("yes", "yeah", "yep", "sure", "send", "ok", "okay"))
         is_no = any(word in normalized for word in ("no", "nope", "not", "wait", "later", "next month"))
@@ -3364,6 +3369,7 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         return
 
     # Cancel / delete triggers — phrase match first (free), then parallel AI fallback.
+    await blooio_typing_on(phone)
     user_text_lower = user_text.strip().lower()
     cancel_phrase = any(t in user_text_lower for t in CANCEL_TRIGGERS)
     delete_phrase = any(t in user_text_lower for t in DELETE_TRIGGERS)
@@ -3489,6 +3495,7 @@ async def handle_stripe_webhook(request: Request) -> Response:
                     ph = phone_to_hash(phone)
                     await billing_db.grant_access(ph)
                     paid_tanyatalk_access[phone] = True  # update memory cache immediately
+                    awaiting_stripe_confirmation.pop(phone, None)  # clear gate so next message routes normally
                     await billing_db.record_subscription_start(ph)
                     logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
                     try:
