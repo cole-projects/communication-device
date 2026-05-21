@@ -23,6 +23,7 @@ import anthropic
 import httpx
 
 import tanya_followup
+import billing_db
 
 load_dotenv()
 
@@ -100,7 +101,7 @@ FREE_TRIAL_90_WARNING = (
     "After a couple more messages from you, I will share how to keep going with TanyaTalk."
 )
 POST_FREE_TRIAL_BLOCK_MESSAGE = (
-    "You have used up your free session with me. If you want to keep going, it's $21 a month for 250 messages. "
+    "If you'd like to use TanyaTalk, it's $21 a month for 250 messages. "
     "Reply yes and I'll send you the link."
 )
 POST_TRIAL_RESET_DENIED_MESSAGE = (
@@ -268,6 +269,23 @@ if not BLOOIO_API_KEY:
     raise RuntimeError("BLOOIO_API_KEY not set")
 
 claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+async def _claude_create(**kwargs) -> anthropic.types.Message:
+    """Wrapper around claude.messages.create with exponential backoff on transient errors."""
+    delays = [1, 2, 4, 8, 16]
+    for attempt, delay in enumerate(delays, 1):
+        try:
+            return await claude.messages.create(**kwargs)
+        except (anthropic.RateLimitError, anthropic.InternalServerError) as e:
+            if attempt == len(delays):
+                raise
+            logger.warning("Claude API transient error (attempt %d): %s — retrying in %ds", attempt, e, delay)
+            await asyncio.sleep(delay)
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
+_http = httpx.AsyncClient()
 
 # ---------------------------------------------------------------------------
 # Blooio transport helpers
@@ -519,11 +537,8 @@ REFERRAL_STATE_PATH = _BOT_DIR / "logs" / "referral_nudges.json"
 
 _USAGE_CSV_LOCK = threading.Lock()
 _REFERRAL_STATE_LOCK = threading.Lock()
-_MONTHLY_USAGE_LOCK = threading.Lock()
-_EXTRA_MESSAGES_LOCK = threading.Lock()
-_FREE_TRIAL_LOCK = threading.Lock()
-_FT_COUNT_LOCK = threading.Lock()
 _VAULT_GIT_LOCK = threading.Lock()
+_VAULT_INDEX_LOCK = asyncio.Lock()
 
 
 def ensure_vault() -> None:
@@ -609,12 +624,6 @@ async def push_vault_changes(client_name: str, session_num: int) -> None:
     await asyncio.to_thread(_do_push)
 
 
-MONTHLY_USAGE_PATH = _BOT_DIR / "logs" / "monthly_usage.json"
-EXTRA_MESSAGES_PATH = _BOT_DIR / "logs" / "extra_messages.json"
-PAID_ACCESS_PATH = _BOT_DIR / "logs" / "paid_access.json"
-FREE_TRIAL_COMPLETED_PATH = _BOT_DIR / "logs" / "free_trial_completed.json"
-FREE_TRIAL_MSG_COUNT_PATH = _BOT_DIR / "logs" / "free_trial_msg_counts.json"
-SUBSCRIPTION_START_PATH = _BOT_DIR / "logs" / "subscription_starts.json"
 SESSION_SNAPSHOT_PATH = _BOT_DIR / "logs" / "session_snapshot.json"
 USAGE_CSV_FIELDNAMES = [
     "log_id",
@@ -841,240 +850,69 @@ def record_coaching_usage(phone: str, username: str, response) -> None:
         logger.error("Could not write %s: %s", USAGE_CSV_PATH, e)
 
 
-def _monthly_key() -> str:
-    return datetime.date.today().strftime("%Y-%m")
-
-
-_SUB_START_LOCK = threading.Lock()
-
-
-def _load_sub_starts_unlocked() -> dict:
-    if not SUBSCRIPTION_START_PATH.exists():
-        return {}
-    try:
-        return json.loads(SUBSCRIPTION_START_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def record_subscription_start(phone: str) -> None:
-    """Record today as this phone's subscription start date (30-day billing anchor)."""
-    ph = phone_to_hash(phone)
-    with _SUB_START_LOCK:
-        data = _load_sub_starts_unlocked()
-        data[ph] = datetime.date.today().isoformat()
-        SUBSCRIPTION_START_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SUBSCRIPTION_START_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-def get_billing_period_key(phone: str) -> str:
-    """Return the ISO start date of this user's current 30-day billing period.
-    Falls back to YYYY-MM calendar key for users with no recorded start date."""
-    ph = phone_to_hash(phone)
-    with _SUB_START_LOCK:
-        data = _load_sub_starts_unlocked()
-    start_str = data.get(ph)
-    if not start_str:
-        return _monthly_key()
-    try:
-        start = datetime.date.fromisoformat(start_str)
-        days_elapsed = (datetime.date.today() - start).days
-        period_start = start + datetime.timedelta(days=30 * (days_elapsed // 30))
-        return period_start.isoformat()
-    except Exception:
-        return _monthly_key()
-
-
-def _load_monthly_usage_unlocked() -> dict:
-    if not MONTHLY_USAGE_PATH.exists():
-        return {}
-    try:
-        return json.loads(MONTHLY_USAGE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def get_monthly_message_count(phone: str) -> int:
-    ph = phone_to_hash(phone)
-    with _MONTHLY_USAGE_LOCK:
-        return _load_monthly_usage_unlocked().get(ph, {}).get(get_billing_period_key(phone), 0)
-
-
-def increment_monthly_message_count(phone: str) -> int:
-    """Increment this billing period's count and return the new total."""
-    ph = phone_to_hash(phone)
-    key = get_billing_period_key(phone)
-    with _MONTHLY_USAGE_LOCK:
-        data = _load_monthly_usage_unlocked()
-        user_data = data.setdefault(ph, {})
-        count = user_data.get(key, 0) + 1
-        user_data[key] = count
-        MONTHLY_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MONTHLY_USAGE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return count
-
-
-def credit_monthly_messages(phone: str, amount: int) -> int:
-    """Decrease this billing period's count by amount to reflect a top-up purchase. Returns new count."""
-    ph = phone_to_hash(phone)
-    key = get_billing_period_key(phone)
-    with _MONTHLY_USAGE_LOCK:
-        data = _load_monthly_usage_unlocked()
-        user_data = data.setdefault(ph, {})
-        count = max(0, user_data.get(key, 0) - amount)
-        user_data[key] = count
-        MONTHLY_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MONTHLY_USAGE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return count
-
-
-def _load_extra_messages_unlocked() -> dict:
-    if not EXTRA_MESSAGES_PATH.exists():
-        return {}
-    try:
-        return json.loads(EXTRA_MESSAGES_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def get_extra_messages(phone: str) -> int:
-    ph = phone_to_hash(phone)
-    with _EXTRA_MESSAGES_LOCK:
-        return _load_extra_messages_unlocked().get(ph, 0)
-
-
-def add_extra_messages(phone: str, amount: int) -> int:
-    ph = phone_to_hash(phone)
-    with _EXTRA_MESSAGES_LOCK:
-        data = _load_extra_messages_unlocked()
-        total = data.get(ph, 0) + amount
-        data[ph] = total
-        EXTRA_MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        EXTRA_MESSAGES_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return total
-
-
-def consume_extra_message(phone: str) -> None:
-    ph = phone_to_hash(phone)
-    with _EXTRA_MESSAGES_LOCK:
-        data = _load_extra_messages_unlocked()
-        current = data.get(ph, 0)
-        if current > 0:
-            data[ph] = current - 1
-            EXTRA_MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
-            EXTRA_MESSAGES_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-_PAID_ACCESS_LOCK = threading.Lock()
-
-
-def _load_paid_access() -> set[str]:
-    if not PAID_ACCESS_PATH.exists():
-        return set()
-    try:
-        return set(json.loads(PAID_ACCESS_PATH.read_text(encoding="utf-8")))
-    except Exception:
-        return set()
-
-
-def grant_tanyatalk_access(phone: str) -> None:
-    ph = phone_to_hash(phone)
-    with _PAID_ACCESS_LOCK:
-        ids = _load_paid_access()
-        ids.add(ph)
-        PAID_ACCESS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PAID_ACCESS_PATH.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
-    paid_tanyatalk_access[phone] = True
-
-
-def revoke_tanyatalk_access(phone: str) -> None:
-    ph = phone_to_hash(phone)
-    with _PAID_ACCESS_LOCK:
-        ids = _load_paid_access()
-        ids.discard(ph)
-        PAID_ACCESS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PAID_ACCESS_PATH.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
-    paid_tanyatalk_access.pop(phone, None)
-    logger.info("Access revoked for phone_key=%s", ph[:12])
-
-
-def load_paid_access_into_memory() -> None:
-    # At startup we load hashes from disk but can't reverse to phones —
-    # access is re-granted when Stripe webhook fires with the phone.
-    pass
-
-
 FREE_TRIAL_MIN_MSGS_FOR_CLOSE = 5
 
 
-def _load_ft_msg_counts() -> dict[str, int]:
-    if not FREE_TRIAL_MSG_COUNT_PATH.exists():
-        return {}
-    try:
-        return json.loads(FREE_TRIAL_MSG_COUNT_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+# ---------------------------------------------------------------------------
+# Billing helpers — thin async wrappers around billing_db
+# ---------------------------------------------------------------------------
 
-
-def _save_ft_msg_count(phone: str, count: int) -> None:
+async def has_tanyatalk_access(phone: str) -> bool:
+    """Memory-first check; falls back to SQLite (caches result for session duration)."""
+    if paid_tanyatalk_access.get(phone):
+        return True
+    if mesh_tanyatalk_included.get(phone):
+        return True
+    if phone in _POST_TRIAL_BYPASS_PHONES:
+        return True
     ph = phone_to_hash(phone)
-    with _FT_COUNT_LOCK:
-        data = _load_ft_msg_counts()
-        data[ph] = count
-        FREE_TRIAL_MSG_COUNT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        FREE_TRIAL_MSG_COUNT_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    if await billing_db.has_access(ph):
+        paid_tanyatalk_access[phone] = True
+        return True
+    return False
 
 
-def _get_ft_msg_count_from_disk(phone: str) -> int:
-    ph = phone_to_hash(phone)
-    with _FT_COUNT_LOCK:
-        return _load_ft_msg_counts().get(ph, 0)
+async def should_block_unpaid_after_free_trial(phone: str) -> bool:
+    if not BLOCK_AFTER_FREE_TRIAL:
+        return False
+    if phone in _POST_TRIAL_BYPASS_PHONES:
+        return False
+    if not await _has_completed_free_trial(phone):
+        return False
+    if await has_tanyatalk_access(phone):
+        return False
+    return True
 
 
-def _delete_ft_msg_count(phone: str) -> None:
-    ph = phone_to_hash(phone)
-    with _FT_COUNT_LOCK:
-        data = _load_ft_msg_counts()
-        data.pop(ph, None)
-        FREE_TRIAL_MSG_COUNT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        FREE_TRIAL_MSG_COUNT_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-def _load_free_trial_completed_ids() -> set[str]:
-    if not FREE_TRIAL_COMPLETED_PATH.exists():
-        return set()
-    try:
-        return set(json.loads(FREE_TRIAL_COMPLETED_PATH.read_text(encoding="utf-8")))
-    except Exception:
-        return set()
-
-
-def mark_free_trial_completed(phone: str) -> None:
-    ph = phone_to_hash(phone)
-    free_trial_completed[phone] = True
-    with _FREE_TRIAL_LOCK:
-        ids = _load_free_trial_completed_ids()
-        ids.add(ph)
-        FREE_TRIAL_COMPLETED_PATH.parent.mkdir(parents=True, exist_ok=True)
-        FREE_TRIAL_COMPLETED_PATH.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
-
-
-def load_free_trial_completed_into_memory() -> None:
-    # Hashes on disk can't be reversed to phones — mark_free_trial_completed
-    # is called at message time when we have the live phone.
-    pass
-
-
-def _has_completed_free_trial(phone: str) -> bool:
-    """Check in-memory first, fall back to disk to survive server restarts."""
+async def _has_completed_free_trial(phone: str) -> bool:
+    """Memory-first; falls back to SQLite to survive restarts."""
     if free_trial_completed.get(phone):
         return True
     ph = phone_to_hash(phone)
-    with _FREE_TRIAL_LOCK:
-        if ph in _load_free_trial_completed_ids():
-            free_trial_completed[phone] = True
-            return True
+    if await billing_db.has_completed_trial(ph):
+        free_trial_completed[phone] = True
+        return True
     return False
+
+
+async def mark_free_trial_completed(phone: str) -> None:
+    ph = phone_to_hash(phone)
+    free_trial_completed[phone] = True
+    await billing_db.mark_trial_completed(ph)
+
+
+async def in_first_free_trial_session(phone: str) -> bool:
+    if session_numbers.get(phone) != 1:
+        return False
+    return not await _has_completed_free_trial(phone)
+
+
+async def _check_monthly_cap_for_followup(phone: str) -> bool:
+    """Async cap check passed to tanya_followup — True when client has no messages left."""
+    ph = phone_to_hash(phone)
+    count = await billing_db.get_monthly_message_count(ph)
+    extra = await billing_db.get_extra_messages(ph)
+    return count >= MONTHLY_MESSAGE_CAP + extra
 
 
 conversations: dict[str, list[dict]] = {}
@@ -1118,6 +956,15 @@ SESSION_END_NORMALIZED = frozenset(
         "end session please",
         "end session now",
         "lets end session",
+        "done",
+        "im done",
+        "i'm done",
+        "all done",
+        "done for today",
+        "done for now",
+        "done for the day",
+        "im all done",
+        "i'm all done",
     }
 )
 
@@ -1555,69 +1402,73 @@ FRAMEWORK_ROUTES = [
 # Used by the Haiku framework-selection call so it can reason across every framework,
 # not just the keyword-routed subset.
 FRAMEWORK_DESCRIPTIONS: dict[str, str] = {
-    "4 step reset.md": "Four-step process for interrupting a spiral and resetting emotional state",
-    "Alignment Formula.md": "Formula for returning to alignment when life feels off-track",
-    "Alignment.md": "Core alignment principles — living from true values and direction",
-    "Belief Excavation.md": "Excavating and rewriting limiting beliefs at the root level",
-    "Coherence Protocol.md": "Restoring inner coherence when energy feels scattered or flat",
-    "Dips and Sips.md": "Understanding energy dips and how to restore without bypassing",
-    "Emotions vs Feelings.md": "Distinguishing emotions (body signals) from feelings (mental interpretations)",
-    "Expectations.md": "Examining how unspoken expectations create disappointment and disconnect",
-    "Frequency choices.md": "Making decisions from frequency alignment rather than fear or logic alone",
-    "Future casting vs Rewriting.md": "When to future-cast vs. rewrite — knowing which tool the moment calls for",
-    "Meditation Alignment RYTE Origin.md": "Origin meditation for alignment and nervous system anchoring",
-    "Negative manifestations.md": "Understanding how negative beliefs attract unwanted outcomes",
-    "Neutrality and Wholness.md": "Finding neutrality and wholeness — releasing resistance, accepting what is",
-    "Origin.md": "Tracing recurring patterns back to their original source wound",
-    "Patience Embodiment_.md": "Embodying patience as a frequency, not just a behavior",
-    "Power Reclamation (Franks question).md": "Reclaiming personal power when it has been given away to others",
-    "Scaffolding vs Bypassing.md": "Knowing when to build gradually (scaffold) vs. when bypassing is happening",
-    "The Alignment Arc.md": "The arc of alignment across a full coaching journey",
-    "Ubiquitous Assimilation.md": "Integrating new identity so it becomes the default, not the exception",
-    "Yin Yang.md": "Balancing masculine and feminine energy, effort and surrender",
-    "FutureYou/FutureYou 7 Day Challenge.md": "7-day future-casting challenge for accelerating identity shift",
-    "FutureYou/FutureYou Actualization vs Acquisition.md": "Distinguishing becoming (actualization) from getting (acquisition)",
-    "FutureYou/FutureYou Anchoring.md": "Anchoring a breakthrough or shifted state so it sticks after the session",
-    "FutureYou/FutureYou Belonging.md": "Future-casting belonging — stepping into a version of self that belongs",
-    "FutureYou/FutureYou Billionaire Clarity.md": "Clarity exercise using an abundance and expansion mindset lens",
-    "FutureYou/FutureYou Dealers Choice V1.md": "Open-format future-casting — client chooses the focus area (V1)",
-    "FutureYou/FutureYou Dealers Choice V2.md": "Open-format future-casting — client chooses the focus area (V2)",
-    "FutureYou/FutureYou Dealers Choice V3.md": "Open-format future-casting — client chooses the focus area (V3)",
-    "FutureYou/FutureYou EASE.md": "Future-casting ease — experiencing what effortless forward motion feels like",
-    "FutureYou/FutureYou Fear as Motivator.md": "Reframing fear as a compass pointing toward growth, not a stop sign",
-    "FutureYou/FutureYou Frequency 101.md": "Introduction to frequency — how energy and vibration shape reality",
-    "FutureYou/FutureYou Frequency meditation on space between thoughts.md": "Meditation on the space between thoughts as a portal to frequency",
-    "FutureYou/FutureYou Glimpses.md": "Recognizing and amplifying glimpses where the future self is already showing up",
-    "FutureYou/FutureYou on Health & Vitality Presentation.md": "Future-casting health and vitality — embodying a thriving, well version of self",
-    "FutureYou/FutureYou on Self Worth Presentation.md": "Future-casting self-worth and deservedness — embodying inherent worth as a felt reality",
-    "FutureYou/FutureYou Past Cast.md": "Casting from the past — using past evidence of strength as a springboard forward",
-    "FutureYou/FutureYou Purpose of Goals.md": "Reframing goals as direction-setters, not worth-validators",
-    "FutureYou/FutureYou Q&A after 7 Day Challenge.md": "Integration Q&A after completing the 7-day future-casting challenge",
-    "FutureYou/FutureYou Quantum Healing Experiment.md": "Quantum healing experiment — using consciousness to shift physical state",
-    "FutureYou/FutureYou Quantum Healing.md": "Quantum healing — the intersection of belief, frequency, and physical wellbeing",
-    "FutureYou/FutureYou Quantum Zeno Effect.md": "Quantum Zeno Effect — how consistent observation locks in identity",
-    "FutureYou/FutureYou Scaffolding.md": "Future-casting with scaffolding — building new identity in small, safe steps",
-    "FutureYou/FutureYou SEE.md": "SEE framework — State, Embody, Express as the identity shift cycle",
-    "FutureYou/FutureYou Strained Relationships.md": "Future-casting strained relationships — who does the future self show up as",
-    "FutureYou/FutureYou The After State.md": "The After State — what life feels and looks like once the transformation has landed",
-    "FutureYou/FutureYou Thriving Business.md": "Future-casting a thriving business — identity first, strategy second",
-    "FutureYou/FutureYou Upper Limits.md": "Upper limit patterns — how success triggers self-sabotage and how to move through it",
-    "FYF/FYF BE the Source.md": "BE the Source — becoming the energy you want to attract, not chasing it externally",
-    "FYF/FYF Desire Excavation.md": "Excavating true desire beneath the surface want or stated goal",
-    "FYF/FYF Energy Check.md": "Quick energy audit — where energy is leaking or blocked right now",
-    "FYF/FYF Manifestation Proof.md": "Finding proof of manifestation already at work — shifting focus to evidence",
-    "FYF/FYF Meditation Alignment.md": "Alignment meditation for centering before a session or important decision",
-    "FYF/FYF Moments of Me2.0.md": "Capturing and amplifying moments where the new identity already showed up",
-    "FYF/FYF The Born Identity.md": "Identity rehearsal — when belief is there but embodiment and action haven't caught up yet",
-    "FYF/FYF Upgraded Problems.md": "Reframing problems as proof of leveling up — upgraded problems signal an upgraded self",
-    "FYF/FYF Vision Timeline.md": "Creating a vision timeline — mapping the becoming across a concrete future arc",
-    "Core-Program/Week-1-Circumstance-vs-Thought.md": "Week 1: Separating circumstance from thought — facts vs. the story we tell about them",
-    "Core-Program/Week-2-Catch-Call-Choose.md": "Week 2: Catch the thought, call it out, choose a new one — the basic rewrite cycle",
-    "Core-Program/Week-3-Bypassing-vs-Rewriting.md": "Week 3: Knowing when you're bypassing an emotion vs. genuinely rewriting a belief",
-    "Core-Program/Week-4-Emotional-Holding.md": "Week 4: Holding emotions without collapsing into or suppressing them",
-    "Core-Program/Week-5-Regulation-Stabilization.md": "Week 5: Nervous system regulation and stabilization practices",
-    "Core-Program/Week-6-Integration.md": "Week 6: Integrating new beliefs into daily life and lived identity",
-    "Core-Program/Week-7-Belief-Formation.md": "Week 7: How beliefs form and how to install new ones intentionally",
+    # --- Standalone frameworks ---
+    "4 step reset.md": "Four-step reset: name the feeling, find the thought driving it, reframe it, build airtime for the new perspective",
+    "Alignment Formula.md": "Two-step formula: soften the body's resistance through presence, then rewrite the thought driving it",
+    "Alignment.md": "Return to the aware self beneath thoughts and emotion — the stable inner ground underneath all identity",
+    "Belief Excavation.md": "Dismantle limiting beliefs by naming the emotion, identifying the root belief, finding counterexamples, anchoring new truth",
+    "Coherence Protocol.md": "Collapse indecision between two aligned paths by checking energetic coherence — which choice your body already knows",
+    "Dips and Sips.md": "Reframe frustration as the feeling of learning; resilience comes from staying in the discomfort longer, not escaping",
+    "Emotions vs Feelings.md": "Emotions are body data moving as energy; feelings are the meaning your mind assigns — know the difference",
+    "Expectations.md": "Reframe unmet expectations as alignment filtering — what falls away isn't failing you, it's serving you",
+    "Frequency choices.md": "Choose between paths using your nervous system as compass — which option your body recognizes as aligned",
+    "Future casting vs Rewriting.md": "Rewriting clears resistance; future casting activates the next identity — each does a different job",
+    "Meditation Alignment RYTE Origin.md": "Guided meditation to drop into the Still Core beneath thought and access the meta-awareness where alignment accelerates",
+    "Negative manifestations.md": "Locate the body-level energy around what you want, identify the blocking belief, shift the frequency through imagination",
+    "Neutrality and Wholness.md": "Move beyond labeling experiences as lack or abundance — find the neutral wholeness underneath where neither pole controls you",
+    "Origin.md": "Seven origin-point practices for embodying your Source-self through identity, not effort — remembering what you actually are",
+    "Patience Embodiment_.md": "Build patience as a felt identity — body safety, micro-proofs, and identity lock-in, not just behavioral waiting",
+    "Power Reclamation (Franks question).md": "Reclaim yourself as the source of results — stop outsourcing to tools, other people, or circumstances",
+    "Scaffolding vs Bypassing.md": "Scaffolding consciously rehearses a new identity; bypassing uses external fixes to avoid the inner work behind them",
+    "The Alignment Arc.md": "15-minute guided arc through belief excavation, nervous system reset, future-identity embodiment, and aligned action",
+    "Ubiquitous Assimilation.md": "Recognize pervasive cultural conditioning and doublethink that block authentic alignment — reclaim individual thinking",
+    "Yin Yang.md": "Balance Source-grounded being (Yin) with aligned action (Yang) — neither completes the bridge without the other",
+    # --- FutureYou frameworks ---
+    "FutureYou/FutureYou 7 Day Challenge.md": "Stabilize a new identity through 7 daily believable actions aligned with who you're becoming",
+    "FutureYou/FutureYou Actualization vs Acquisition.md": "Collapse the false gap between who you are and what you want — it's remembering, not acquiring",
+    "FutureYou/FutureYou Anchoring.md": "ABSORB method: borrow past emotional states, overlay them into future scenes, lock in with physical anchors",
+    "FutureYou/FutureYou Belonging.md": "Belong to yourself first — magnetic presence comes from internal sovereignty, not performing for others",
+    "FutureYou/FutureYou Billionaire Clarity.md": "Strip desire down from fixing lack to pure expansion — what would you choose if nothing was broken",
+    "FutureYou/FutureYou Dealers Choice V1.md": "Client-chosen focus future-cast with teaching on negativity bias and mirror neurons science",
+    "FutureYou/FutureYou Dealers Choice V2.md": "Journaling-based open future-cast with mirror neuron science and the 5 ingredients for it to stick",
+    "FutureYou/FutureYou Dealers Choice V3.md": "Streamlined journaling future-cast — same science as V2, shorter teaching, client picks the topic",
+    "FutureYou/FutureYou EASE.md": "Quick realignment sequence: evoke awareness, anchor identity, see an evidence scene, engage with aligned action",
+    "FutureYou/FutureYou Fear as Motivator.md": "Distinguish growth fear (energizing, aligned) from survival fear (exhausting, misaligned) — fear as compass",
+    "FutureYou/FutureYou Frequency 101.md": "Intro to frequency: reality mirrors your broadcast — pause urgency so alignment can reorganize what shows up",
+    "FutureYou/FutureYou Frequency meditation on space between thoughts.md": "Guided meditation into the still awareness beneath thoughts — the space where frequency naturally resets",
+    "FutureYou/FutureYou Glimpses.md": "Brief vivid sensory snapshots of the desired state — emotional intensity in small moments embeds new frequency",
+    "FutureYou/FutureYou on Health & Vitality Presentation.md": "Future-cast health as frequency — activate the body's healing response through elevated emotion and gratitude",
+    "FutureYou/FutureYou on Self Worth Presentation.md": "Future-cast inherent worth and deservedness as a felt body reality — the energetic foundation for manifesting",
+    "FutureYou/FutureYou Past Cast.md": "Observer-position cast from a past memory — borrow the body's familiar resolution state and project it forward",
+    "FutureYou/FutureYou Purpose of Goals.md": "Goals as a landing strip for energy — they translate vibration into visible form, not a test of worth",
+    "FutureYou/FutureYou Q&A after 7 Day Challenge.md": "Post-challenge integration: micro-proof over big results — tiny congruent moments signal the field",
+    "FutureYou/FutureYou Quantum Healing Experiment.md": "Healing as identity transcendence — peace with the body shifts the field that drives it; practice session",
+    "FutureYou/FutureYou Quantum Healing.md": "Healing through field-level identity shift — align belief, trust, body safety, and identity for biological change",
+    "FutureYou/FutureYou Quantum Zeno Effect.md": "Sustained focus on a version of someone locks it in as your experience — your frequency determines the version you access",
+    "FutureYou/FutureYou Scaffolding.md": "Build emotional scaffolding for a dream step by step — reframe resistance, unhook the saboteur, plant micro-evidence",
+    "FutureYou/FutureYou SEE.md": "Settle into presence, envision an ordinary future moment, embody its dominant emotions without forcing the timeline",
+    "FutureYou/FutureYou Strained Relationships.md": "Shift your relational field rather than waiting for the other person — your frequency determines which version of them you experience",
+    "FutureYou/FutureYou The After State.md": "Borrow a body-known resolution feeling and use it as a nervous system reference state for the future you're building",
+    "FutureYou/FutureYou Thriving Business.md": "Future-cast business identity and frequency first — results follow the state of being, not the hustle",
+    "FutureYou/FutureYou Upper Limits.md": "When success triggers self-sabotage — recognize upper limit patterns and normalize expansion through identity",
+    # --- FYF frameworks ---
+    "FYF/FYF BE the Source.md": "Identify what you're outsourcing (safety, worth, belonging) and reclaim it as an internal state you generate",
+    "FYF/FYF Desire Excavation.md": "Strip fear-contamination from desire — find the authentic soul-level want and act from that frequency instead",
+    "FYF/FYF Energy Check.md": "Energy work is the quality of presence in each moment, not a ritual — check if each choice comes from love or proving",
+    "FYF/FYF Manifestation Proof.md": "Shift from chasing things to fill lack toward becoming someone who manifests from worthiness and wholeness",
+    "FYF/FYF Meditation Alignment.md": "Ground identity in Source-awareness — stable alignment requires anchoring to what you actually are, not just who you're becoming",
+    "FYF/FYF Moments of Me2.0.md": "Future-cast a single vivid moment of the new identity — one emotionally real moment shifts more than a big distant vision",
+    "FYF/FYF The Born Identity.md": "When belief is present but action isn't yet — rehearse the felt experience of the next identity before action arrives",
+    "FYF/FYF Upgraded Problems.md": "Name the problem your future self would have — build momentum through participation in that identity right now",
+    "FYF/FYF Vision Timeline.md": "Map current reality and desired endpoint on a concrete timeline to anchor the frequency of where you're going",
+    # --- Core Program ---
+    "Core-Program/Week-1-Circumstance-vs-Thought.md": "Week 1: Separate neutral facts from the story your mind creates about them — your power lives in the gap",
+    "Core-Program/Week-2-Catch-Call-Choose.md": "Week 2: Catch the thought, call it out, choose a new one — the basic rewrite cycle that weakens old patterns",
+    "Core-Program/Week-3-Bypassing-vs-Rewriting.md": "Week 3: Distinguish fear-based suppression from truth-based expansion — real rewriting shifts state, not just words",
+    "Core-Program/Week-4-Emotional-Holding.md": "Week 4: Stay with yourself through discomfort via acceptance and surrender before attempting to regulate or rewrite",
+    "Core-Program/Week-5-Regulation-Stabilization.md": "Week 5: Nervous system regulation through breath, movement, and grounding so rewrites can actually land",
+    "Core-Program/Week-6-Integration.md": "Week 6: Self-connection first, then regulation, then reorientation — the sequence that makes embodied change stick",
+    "Core-Program/Week-7-Belief-Formation.md": "Week 7: Beliefs form through repetition or intensity — interrupt old patterns and practice new lenses to rewire",
 }
 
 
@@ -1655,7 +1506,7 @@ async def select_frameworks_via_claude(
         "Reply with ONLY the 2 framework filenames, one per line. Exact filenames, no explanation."
     )
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_HAIKU_MODEL,
             max_tokens=80,
             messages=[{"role": "user", "content": prompt}],
@@ -2024,7 +1875,7 @@ Return ONLY markdown lines in this exact format (no extra prose):
 Use concise phrases. No em dashes. No space before commas."""
 
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_HAIKU_MODEL,
             max_tokens=1200,
             messages=[{"role": "user", "content": prompt}],
@@ -2150,7 +2001,7 @@ Fill in as much as you can from the session. Add a row to the Sessions table: | 
 Return ONLY the completed profile markdown — nothing else."""
 
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
@@ -2165,6 +2016,11 @@ Return ONLY the completed profile markdown — nothing else."""
 
 async def update_vault_index_files(phone_hash: str, client_name: str, session_num: int, today: str, profile: str, transcript: str):
     """Use Claude to update Client Hub and 02-Client-Sessions.md to stay in sync."""
+    async with _VAULT_INDEX_LOCK:
+        await _update_vault_index_files_locked(phone_hash, client_name, session_num, today, profile, transcript)
+
+
+async def _update_vault_index_files_locked(phone_hash: str, client_name: str, session_num: int, today: str, profile: str, transcript: str):
     hub_path = Path(VAULT_PATH) / "02-Client-Sessions" / "Client Hub.md"
     index_path = Path(VAULT_PATH) / "02-Client-Sessions.md"
 
@@ -2231,7 +2087,7 @@ Return both files separated by exactly this delimiter on its own line:
 ===FILE_SEPARATOR==="""
 
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_HAIKU_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
@@ -2273,7 +2129,7 @@ Do not invent prior conversations, topics, or sessions that are not clearly supp
 This is a returning client only. Never imply a first meeting. Return only the greeting — nothing else."""
 
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_MODEL,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
@@ -2282,6 +2138,34 @@ This is a returning client only. Never imply a first meeting. Return only the gr
     except Exception as e:
         logger.error("Returning greeting generation failed: %s", e)
         return f"Hey {client_name}, good to have you back. What's on your mind today?"
+
+
+async def generate_session_start_nudge(client_name: str, profile: str) -> str:
+    """One short varied sentence inviting the returning client to start — different every session."""
+    system = f"""You are Tanya, a life coach. {client_name} just opened a new session and heard your voice note opener.
+
+Write ONE short sentence (8 words max) that warmly invites them to start wherever they are. The energy is permissive and grounding — like "allowing mode." There is no wrong place to begin. The right example of this: "Just start wherever feels right."
+
+Rules:
+- One sentence only, 8 words max
+- Grounded and permissive — never perky, clinical, or directive
+- Vary the phrasing each session — never repeat the same sentence
+- No em dashes
+- Do not start with "I"
+- Do not reference prior sessions, client details, or specific themes
+- Return only that sentence, nothing else"""
+
+    try:
+        response = await _claude_create(
+            model=CLAUDE_HAIKU_MODEL,
+            max_tokens=40,
+            system=system,
+            messages=[{"role": "user", "content": profile[:500] if profile else "returning client"}],
+        )
+        return response.content[0].text.strip().replace("—", ",").replace("–", ",")
+    except Exception as e:
+        logger.error("Session start nudge generation failed: %s", e)
+        return "Just start wherever feels right."
 
 
 async def generate_new_client_opener_bridge(first_message: str) -> str:
@@ -2303,7 +2187,7 @@ Rules:
 - Return only this opening, nothing else"""
 
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_HAIKU_MODEL,
             max_tokens=150,
             system=system,
@@ -2334,7 +2218,7 @@ Rules:
 - Return only that line, nothing else"""
 
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_HAIKU_MODEL,
             max_tokens=80,
             system=system,
@@ -2401,7 +2285,7 @@ Decide intent:
 Reply with exactly one word on the first line: affirmative OR negative OR unclear. Nothing else."""
 
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_HAIKU_MODEL,
             max_tokens=30,
             system=system,
@@ -2421,42 +2305,8 @@ Reply with exactly one word on the first line: affirmative OR negative OR unclea
 
 
 SESSION_CLOSE_CONFIRMATION = "I've saved our session. When you're here, I'm here. 💛"
+SESSION_CLOSE_PS = "ps — send \"done\" when you're ready to end a session."
 LINK_RESPONSE = "I can't open links, but I'm here with you. What's on your mind?"
-
-
-def in_first_free_trial_session(phone: str) -> bool:
-    return (
-        session_numbers.get(phone) == 1
-        and not _has_completed_free_trial(phone)
-    )
-
-
-def has_tanyatalk_access(phone: str) -> bool:
-    if paid_tanyatalk_access.get(phone):
-        return True
-    if mesh_tanyatalk_included.get(phone):
-        return True
-    if phone in _POST_TRIAL_BYPASS_PHONES:
-        return True
-    # Disk fallback: re-hydrate after server restart (hashes can't be reversed)
-    ph = phone_to_hash(phone)
-    with _PAID_ACCESS_LOCK:
-        if ph in _load_paid_access():
-            paid_tanyatalk_access[phone] = True
-            return True
-    return False
-
-
-def should_block_unpaid_after_free_trial(phone: str) -> bool:
-    if not BLOCK_AFTER_FREE_TRIAL:
-        return False
-    if phone in _POST_TRIAL_BYPASS_PHONES:
-        return False
-    if not _has_completed_free_trial(phone):
-        return False
-    if has_tanyatalk_access(phone):
-        return False
-    return True
 
 
 def _referral_state_load_unlocked() -> dict[str, int]:
@@ -2574,7 +2424,7 @@ async def end_session(phone: str):
         transcript = "\n".join(transcript_lines)
 
         user_turns = sum(1 for m in history if m["role"] == "user")
-        if session_path and user_turns >= MIN_EXCHANGES_FOR_FOLLOWUP and has_tanyatalk_access(phone):
+        if session_path and user_turns >= MIN_EXCHANGES_FOR_FOLLOWUP and await has_tanyatalk_access(phone):
             ended_at = datetime.datetime.now(timezone.utc)
             await append_follow_up_extraction(
                 session_path, client_name, session_num, history, ended_at
@@ -2605,12 +2455,13 @@ async def end_session(phone: str):
     free_trial_90_warned.pop(phone, None)
     last_activity.pop(phone, None)
     new_client_voice_followup_snippet.pop(phone, None)
+    timeout_tasks.pop(phone, None)
 
 
 async def ai_detects_cancel_intent(text: str) -> bool:
     """Return True if Claude thinks the message is a subscription cancellation request."""
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_HAIKU_MODEL,
             max_tokens=5,
             system="Reply with only 'yes' or 'no'. No other text.",
@@ -2626,7 +2477,7 @@ async def ai_detects_cancel_intent(text: str) -> bool:
 async def ai_detects_delete_intent(text: str) -> bool:
     """Return True if Claude thinks the message is a data-deletion request."""
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_HAIKU_MODEL,
             max_tokens=5,
             system="Reply with only 'yes' or 'no'. No other text.",
@@ -2651,7 +2502,7 @@ async def classify_delete_confirmation_intent(user_text: str) -> str:
         "Reply with exactly one word: affirmative OR negative OR unclear. Nothing else."
     )
     try:
-        response = await claude.messages.create(
+        response = await _claude_create(
             model=CLAUDE_HAIKU_MODEL,
             max_tokens=10,
             system=system,
@@ -2700,15 +2551,9 @@ async def delete_client_data(phone: str) -> None:
         await asyncio.to_thread(profile_file.rename, profiles_deleted_bin / deleted_profile_name)
         logger.info("Anonymized profile file for phone_key=%s → _Deleted/%s", ph[:12], deleted_profile_name)
 
-    # Remove monthly usage entry so the user starts completely fresh on return.
-    def _scrub_monthly_usage():
-        with _MONTHLY_USAGE_LOCK:
-            usage = _load_monthly_usage_unlocked()
-            if ph in usage:
-                del usage[ph]
-                MONTHLY_USAGE_PATH.write_text(json.dumps(usage, indent=2))
-
-    await asyncio.to_thread(_scrub_monthly_usage)
+    # Wipe monthly usage only. Trial flag and access record are kept intentionally —
+    # a returning deleted client routes to the subscription offer, not a new free trial.
+    await billing_db.delete_monthly_usage(ph)
 
     # Cancel any pending follow-up jobs for this client.
     try:
@@ -2815,7 +2660,7 @@ async def session_timeout_task(phone: str) -> None:
     is_ft = False
     async with lock:
         if phone in conversations and conversations[phone]:
-            is_ft = in_first_free_trial_session(phone)
+            is_ft = await in_first_free_trial_session(phone)
             ft_count = free_trial_user_msg_count.get(phone, 0)
             if is_ft and ft_count < FREE_TRIAL_MIN_MSGS_FOR_CLOSE:
                 logger.info(
@@ -2825,8 +2670,9 @@ async def session_timeout_task(phone: str) -> None:
                 return
             logger.info("Session timeout for phone_key=%s", _phone_key(phone))
             if is_ft:
-                mark_free_trial_completed(phone)
-                _delete_ft_msg_count(phone)
+                ph = phone_to_hash(phone)
+                await mark_free_trial_completed(phone)
+                await billing_db.delete_trial_msg_count(ph)
                 awaiting_stripe_confirmation[phone] = True
             await end_session(phone)
             ended = True
@@ -2861,7 +2707,7 @@ async def _cache_warm_loop(phone: str) -> None:
             )
             break
         try:
-            response = await claude.messages.create(
+            response = await _claude_create(
                 model=CLAUDE_MODEL,
                 max_tokens=1,
                 system=[
@@ -2914,7 +2760,7 @@ async def perform_session_close(phone: str, user_text: str) -> bool:
             )
             return False
 
-        is_ft = in_first_free_trial_session(phone)
+        is_ft = await in_first_free_trial_session(phone)
         close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
 
         client_name = client_names.get(phone, "Client")
@@ -2933,8 +2779,9 @@ async def perform_session_close(phone: str, user_text: str) -> bool:
             conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
 
         if is_ft:
-            mark_free_trial_completed(phone)
-            _delete_ft_msg_count(phone)
+            ph = phone_to_hash(phone)
+            await mark_free_trial_completed(phone)
+            await billing_db.delete_trial_msg_count(ph)
             awaiting_stripe_confirmation[phone] = True
 
         cancel_session_timeout(phone)
@@ -2980,26 +2827,26 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
     ph = phone_to_hash(phone)
 
     # Monthly cap (paid users only; free trial has its own 25-message hard stop)
-    if has_tanyatalk_access(phone) and phone not in _POST_TRIAL_BYPASS_PHONES:
-        count = get_monthly_message_count(phone)
-        extra = get_extra_messages(phone)
+    if await has_tanyatalk_access(phone) and phone not in _POST_TRIAL_BYPASS_PHONES:
+        count = await billing_db.get_monthly_message_count(ph)
+        extra = await billing_db.get_extra_messages(ph)
         effective_cap = MONTHLY_MESSAGE_CAP + extra
         if count >= effective_cap:
             if count == effective_cap:
-                increment_monthly_message_count(phone)
+                await billing_db.increment_monthly_message_count(ph)
             if not awaiting_topup_confirmation.get(phone):
                 awaiting_topup_confirmation[phone] = True
                 await blooio_send_message(phone, MONTHLY_CAP_BLOCK_MESSAGE)
             return
-        new_count = increment_monthly_message_count(phone)
+        new_count = await billing_db.increment_monthly_message_count(ph)
         if new_count > MONTHLY_MESSAGE_CAP:
-            consume_extra_message(phone)
+            await billing_db.consume_extra_message(ph)
         if new_count == MONTHLY_CAP_WARNING_AT:
             await blooio_send_message(phone, MONTHLY_CAP_WARNING_MESSAGE)
 
     lock = await _get_chat_message_lock(phone)
     async with lock:
-        if should_block_unpaid_after_free_trial(phone):
+        if await should_block_unpaid_after_free_trial(phone):
             if awaiting_stripe_confirmation.get(phone):
                 intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
                 if intent == "affirmative":
@@ -3060,9 +2907,9 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
         if session_user_msgs == SESSION_CAP_WARNING_AT:
             await blooio_send_message(phone, SESSION_CAP_WARNING_MESSAGE)
 
-        in_ft = in_first_free_trial_session(phone)
+        in_ft = await in_first_free_trial_session(phone)
         if in_ft and phone not in free_trial_user_msg_count:
-            disk_count = _get_ft_msg_count_from_disk(phone)
+            disk_count = await billing_db.get_trial_msg_count(ph)
             if disk_count > 0:
                 free_trial_user_msg_count[phone] = disk_count
         prev_ft = free_trial_user_msg_count.get(phone, 0)
@@ -3108,9 +2955,9 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 FREE_TRIAL_CLOSE_TEXT,
             )
             await blooio_send_message(phone, FREE_TRIAL_CLOSE_TEXT)
-            mark_free_trial_completed(phone)
+            await mark_free_trial_completed(phone)
             free_trial_user_msg_count[phone] = FREE_TRIAL_USER_MESSAGE_CAP
-            _delete_ft_msg_count(phone)
+            await billing_db.delete_trial_msg_count(ph)
             awaiting_stripe_confirmation[phone] = True
             cancel_session_timeout(phone)
             await end_session(phone)
@@ -3144,7 +2991,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 )
                 if in_ft:
                     free_trial_user_msg_count[phone] = n_ft
-                    _save_ft_msg_count(phone, n_ft)
+                    await billing_db.save_trial_msg_count(ph, n_ft)
 
                 elapsed_since_anchor = asyncio.get_event_loop().time() - session_turn_anchor_time
                 remaining_open = RESPONSE_DELAY_SECONDS - elapsed_since_anchor
@@ -3175,13 +3022,19 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
             if remaining_open > 0:
                 await asyncio.sleep(remaining_open)
 
-            audio_url = await synthesize_and_host_voice(opener_script)
+            audio_url, start_nudge = await asyncio.gather(
+                synthesize_and_host_voice(opener_script),
+                generate_session_start_nudge(user_name, session_profiles.get(phone, "")),
+            )
             if audio_url:
                 await blooio_send_audio(phone, audio_url)
                 logger.info("Returning client opener sent as voice for %s", user_name)
             else:
                 await blooio_send_message(phone, opener_script)
                 logger.info("Returning client opener sent as text (ElevenLabs unavailable) for %s", user_name)
+
+            second_text = f"{start_nudge} {SESSION_CLOSE_PS}"
+            await blooio_send_message(phone, second_text)
 
             pending_first_message_opener.pop(phone, None)
             await asyncio.to_thread(append_tanya_message, session_files[phone], opener_script)
@@ -3190,7 +3043,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
             if in_ft:
                 free_trial_user_msg_count[phone] = n_ft
-                _save_ft_msg_count(phone, n_ft)
+                await billing_db.save_trial_msg_count(ph, n_ft)
             return
 
         message_received_at = asyncio.get_event_loop().time()
@@ -3236,7 +3089,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
         )
 
         try:
-            response = await claude.messages.create(
+            response = await _claude_create(
                 model=CLAUDE_MODEL,
                 max_tokens=1024,
                 system=system_blocks,
@@ -3274,7 +3127,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
 
         if in_ft:
             free_trial_user_msg_count[phone] = n_ft
-            _save_ft_msg_count(phone, n_ft)
+            await billing_db.save_trial_msg_count(ph, n_ft)
 
 
 async def handle_inbound_message(phone: str, user_text: str) -> None:
@@ -3519,8 +3372,10 @@ async def handle_stripe_webhook(request: Request) -> Response:
             try:
                 if product_type == "subscription":
                     # Access control first — if this fails, return 500 so Stripe retries
-                    grant_tanyatalk_access(phone)
-                    record_subscription_start(phone)
+                    ph = phone_to_hash(phone)
+                    await billing_db.grant_access(ph)
+                    paid_tanyatalk_access[phone] = True  # update memory cache immediately
+                    await billing_db.record_subscription_start(ph)
                     logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
                     try:
                         await blooio_send_message(
@@ -3539,7 +3394,7 @@ async def handle_stripe_webhook(request: Request) -> Response:
                     )
                     qty = session_expanded.line_items.data[0].quantity if session_expanded.line_items.data else 1
                     # Credits first — if this fails, return 500 so Stripe retries
-                    total_extra = add_extra_messages(phone, qty * 60)
+                    total_extra = await billing_db.add_extra_messages(phone_to_hash(phone), qty * 60)
                     logger.info(
                         "Top-up: added %d bonus messages to phone_key=%s (total bonus now %d)",
                         qty * 60,
@@ -3572,7 +3427,8 @@ async def handle_stripe_webhook(request: Request) -> Response:
             return Response(status_code=200)
         if phone:
             try:
-                revoke_tanyatalk_access(phone)
+                await billing_db.revoke_access(phone_to_hash(phone))
+                paid_tanyatalk_access.pop(phone, None)  # clear memory cache immediately
                 tanya_followup.cancel_all_followup_jobs_for_chat(phone)
                 logger.info("Access revoked for phone_key=%s via subscription.deleted", _phone_key(phone))
             except Exception as e:
@@ -3869,6 +3725,9 @@ def _restore_session_snapshot() -> None:
 
 
 async def _startup() -> None:
+    billing_db.configure(_BOT_DIR / "logs" / "billing.db")
+    await billing_db.init_db()
+    await billing_db.migrate_from_json(_BOT_DIR / "logs")
     _restore_session_snapshot()
     init_usage_csv_file()
     for _mp in _MESH_PHONES:
@@ -3881,9 +3740,7 @@ async def _startup() -> None:
         send_message=blooio_send_message,
         merge_focus_for_next_session=merge_focus_for_next_session_profile,
         open_coaching_session=open_coaching_session_after_mini,
-        check_monthly_cap=lambda p: (
-            get_monthly_message_count(p) >= MONTHLY_MESSAGE_CAP + get_extra_messages(p)
-        ),
+        check_monthly_cap=_check_monthly_cap_for_followup,
         typing_on=blooio_typing_on,
     )
     await tanya_followup.start_scheduler()
@@ -3894,6 +3751,7 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     _write_session_snapshot()
     await tanya_followup.shutdown_scheduler()
+    await _http.aclose()
 
 
 def main() -> None:

@@ -22,11 +22,25 @@ from enum import Enum
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import anthropic
 from anthropic import AsyncAnthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 logger = logging.getLogger(__name__)
+
+
+async def _claude_create(_client: AsyncAnthropic, **kwargs) -> anthropic.types.Message:
+    delays = [1, 2, 4, 8, 16]
+    for attempt, delay in enumerate(delays, 1):
+        try:
+            return await _client.messages.create(**kwargs)
+        except (anthropic.RateLimitError, anthropic.InternalServerError) as e:
+            if attempt == len(delays):
+                raise
+            logger.warning("Claude API transient error (attempt %d): %s — retrying in %ds", attempt, e, delay)
+            await asyncio.sleep(delay)
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 FU_INTERVAL_SEC = 172800  # exactly 48 hours
 
@@ -58,7 +72,7 @@ _send_message: Callable[[str, str], Awaitable[None]] | None = None
 _typing_on_cb: Callable[[str], Awaitable[None]] | None = None
 _merge_focus_cb: Callable[[str, str], Awaitable[None]] | None = None
 _open_session_cb: Callable[..., Awaitable[None]] | None = None
-_check_monthly_cap_cb: Callable[[str], bool] | None = None  # phone -> True if capped
+_check_monthly_cap_cb: Callable[[str], Awaitable[bool]] | None = None  # phone -> True if capped
 
 _scheduler: AsyncIOScheduler | None = None
 _mini: dict[str, MiniSessionCtx] = {}
@@ -209,7 +223,7 @@ Session excerpts:
 Return ONLY the message text, nothing else."""
 
     assert _claude is not None
-    response = await _claude.messages.create(
+    response = await _claude_create(_claude,
         model=_claude_haiku_model,
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
@@ -230,7 +244,7 @@ async def followup_job_fire(
         return
 
     # Skip if client has used their full message allotment this month
-    if _check_monthly_cap_cb and _check_monthly_cap_cb(phone):
+    if _check_monthly_cap_cb and await _check_monthly_cap_cb(phone):
         logger.info("Follow-up skipped for phone_key=%s — monthly cap reached", _phone_key(phone))
         return
 
@@ -289,7 +303,7 @@ async def _send_session_prompt_question(phone: str, ctxm: MiniSessionCtx) -> Non
 
 Output ONLY JSON: {{"reply":"<message>"}}"""
     try:
-        response = await _claude.messages.create(
+        response = await _claude_create(_claude,
             model=_claude_haiku_model,
             max_tokens=250,
             system=sys,
@@ -350,7 +364,7 @@ If they already clearly said now or later in their last message, set choice acco
 If they decline or say they're not interested, set choice to "declined" and reply warmly closing the conversation."""
 
     try:
-        response = await _claude.messages.create(
+        response = await _claude_create(_claude,
             model=_claude_haiku_model,
             max_tokens=500,
             system=sys,
