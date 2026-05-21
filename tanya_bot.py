@@ -462,6 +462,16 @@ async def create_stripe_portal_url(phone: str) -> str | None:
         ph = phone_to_hash(phone)
         customer_id = await billing_db.get_stripe_customer_id(ph)
         if not customer_id:
+            # Fallback: search by phone stored in customer metadata at payment time
+            results = await asyncio.to_thread(
+                stripe_lib.Customer.search,
+                query=f"metadata['phone']:'{phone}'",
+                limit=1,
+            )
+            if results.data:
+                customer_id = results.data[0]["id"]
+                await billing_db.store_stripe_customer_id(ph, customer_id)
+        if not customer_id:
             return None
         session = await asyncio.to_thread(
             stripe_lib.billing_portal.Session.create,
@@ -3514,6 +3524,15 @@ async def handle_stripe_webhook(request: Request) -> Response:
                     customer_id = session_obj.get("customer", "")
                     if customer_id:
                         await billing_db.store_stripe_customer_id(ph, customer_id)
+                        try:
+                            stripe_lib.api_key = STRIPE_SECRET_KEY
+                            await asyncio.to_thread(
+                                stripe_lib.Customer.modify,
+                                customer_id,
+                                metadata={"phone": phone},
+                            )
+                        except Exception as e:
+                            logger.warning("Could not set customer metadata.phone: %s", e)
                     logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
                     try:
                         await blooio_send_message(

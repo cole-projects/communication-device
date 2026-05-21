@@ -75,6 +75,10 @@ async def init_db() -> None:
                     phone_hash   TEXT PRIMARY KEY,
                     onboarded_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS stripe_customer_ids (
+                    phone_hash  TEXT PRIMARY KEY,
+                    customer_id TEXT NOT NULL
+                );
             """)
             await db.commit()
         _initialized = True
@@ -442,3 +446,25 @@ async def delete_monthly_usage(phone_hash: str) -> None:
         await db.execute("DELETE FROM monthly_usage WHERE phone_hash = ?", (phone_hash,))
         await db.execute("DELETE FROM free_trial_msg_counts WHERE phone_hash = ?", (phone_hash,))
         await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Stripe customer ID cache
+# ---------------------------------------------------------------------------
+
+async def store_stripe_customer_id(phone_hash: str, customer_id: str) -> None:
+    async with _conn() as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO stripe_customer_ids (phone_hash, customer_id) VALUES (?, ?)",
+            (phone_hash, customer_id),
+        )
+        await db.commit()
+
+
+async def get_stripe_customer_id(phone_hash: str) -> str | None:
+    async with _conn() as db:
+        async with db.execute(
+            "SELECT customer_id FROM stripe_customer_ids WHERE phone_hash = ?", (phone_hash,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
