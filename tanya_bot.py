@@ -63,6 +63,7 @@ BLOOIO_WEBHOOK_SECRET = os.getenv("BLOOIO_WEBHOOK_SECRET", "").strip()
 BLOOIO_PHONE_NUMBER = os.getenv("BLOOIO_PHONE_NUMBER", "+13177282783").strip()
 ADMIN_PHONE_NUMBERS = os.getenv("ADMIN_PHONE_NUMBERS", "").strip()
 ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
+GITHUB_ISSUES_PAT = os.getenv("GITHUB_ISSUES_PAT", "").strip()
 BLOOIO_BASE_URL = "https://backend.blooio.com/v2/api"
 TANYA_PUBLIC_URL = os.getenv("TANYA_PUBLIC_URL", "https://worker-production-32fb.up.railway.app").rstrip("/")
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
@@ -143,6 +144,9 @@ TANYA_VCARD = _build_vcard(BLOOIO_PHONE_NUMBER)
 CONTACT_SAVE_PROMPT = (
     "Save my contact so you can always find me. "
     "When you're done, introduce yourself briefly, I'd love to know a little about you before we get started."
+)
+CONTACT_SAVE_PROMPT_RETURNING = (
+    "In case you didn't save my contact the first time, here it is again."
 )
 
 OPENER_INTRO = (
@@ -455,14 +459,10 @@ async def create_stripe_portal_url(phone: str) -> str | None:
     try:
         import stripe as stripe_lib
         stripe_lib.api_key = STRIPE_SECRET_KEY
-        customers = await asyncio.to_thread(
-            stripe_lib.Customer.search,
-            query=f'phone:"{phone}"',
-            limit=1,
-        )
-        if not customers.data:
+        ph = phone_to_hash(phone)
+        customer_id = await billing_db.get_stripe_customer_id(ph)
+        if not customer_id:
             return None
-        customer_id = customers.data[0]["id"]
         session = await asyncio.to_thread(
             stripe_lib.billing_portal.Session.create,
             customer=customer_id,
@@ -1391,7 +1391,10 @@ def profile_indicates_prior_session(content: str) -> bool:
 
 
 def is_returning_client(phone_hash: str) -> bool:
-    """True only if a real profile exists with evidence of a prior session."""
+    """True if a real profile exists with session evidence, or if a session folder exists on disk."""
+    session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
+    if session_dir.exists() and any(session_dir.iterdir()):
+        return True
     path = profile_path_for(phone_hash)
     if not path.exists():
         return False
@@ -2495,7 +2498,10 @@ async def end_session(phone: str):
         logger.info("Ending session for hash %s session %d (%d messages)", ph[:12], session_num, len(history))
         today = datetime.date.today().isoformat()
 
-        await update_client_profile(ph, client_name, session_num, history)
+        try:
+            await update_client_profile(ph, client_name, session_num, history)
+        except Exception as e:
+            logger.error("Profile update failed for phone_key=%s session=%d: %s", ph[:12], session_num, e)
 
         profile = await asyncio.to_thread(load_file, profile_path_for(ph))
         transcript_lines = []
@@ -2519,8 +2525,11 @@ async def end_session(phone: str):
                 ph[:12], session_num, user_turns, MIN_EXCHANGES_FOR_FOLLOWUP,
             )
 
-        await update_vault_index_files(ph, client_name, session_num, today, profile, transcript)
-        mark_vault_dirty()
+        try:
+            await update_vault_index_files(ph, client_name, session_num, today, profile, transcript)
+            mark_vault_dirty()
+        except Exception as e:
+            logger.error("Vault index update failed for phone_key=%s session=%d: %s", ph[:12], session_num, e)
 
     cancel_cache_warming(phone)
     _cached_static_prompts.pop(phone, None)
@@ -3106,6 +3115,11 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 await billing_db.record_new_user_onboard(ph)
                 return
 
+            # Resend vCard on session 2 only — once is a reminder, more is annoying.
+            if session_numbers.get(phone, 1) == 2:
+                await blooio_send_vcard(phone)
+                await blooio_send_message(phone, CONTACT_SAVE_PROMPT_RETURNING)
+
             # Crash detection: if previous session ended without a clean close, send cut-off acknowledgment
             cutoff_detected = await asyncio.to_thread(
                 _detect_interrupted_previous_session, ph, session_numbers.get(phone, 1)
@@ -3497,6 +3511,9 @@ async def handle_stripe_webhook(request: Request) -> Response:
                     paid_tanyatalk_access[phone] = True  # update memory cache immediately
                     awaiting_stripe_confirmation.pop(phone, None)  # clear gate so next message routes normally
                     await billing_db.record_subscription_start(ph)
+                    customer_id = session_obj.get("customer", "")
+                    if customer_id:
+                        await billing_db.store_stripe_customer_id(ph, customer_id)
                     logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
                     try:
                         await blooio_send_message(
@@ -3625,26 +3642,30 @@ async def report_error(request: Request) -> Response:
     phone = (body.get("phone") or "").strip()
     if not description:
         return Response(status_code=400)
-    from datetime import datetime, timezone
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    phone_line = f"**Phone:** {phone}\n" if phone else ""
-    entry = f"\n## {timestamp}\n{phone_line}**Issue:** {description}\n\n---\n"
-    report_path = Path(VAULT_PATH) / "00-Archive" / "Error Reports.md"
-    try:
-        await asyncio.to_thread(_append_error_report, report_path, entry)
-        logger.info("Error report logged: %s chars", len(description))
-    except Exception as e:
-        logger.warning("Error report write failed: %s", e)
+    if not GITHUB_ISSUES_PAT:
+        logger.warning("GITHUB_ISSUES_PAT not set — error report dropped")
         return Response(status_code=500)
-    return Response(status_code=200)
-
-
-def _append_error_report(path: Path, entry: str) -> None:
-    if not path.exists():
-        path.write_text("# Error Reports\n" + entry, encoding="utf-8")
-    else:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(entry)
+    title = description[:72] + ("…" if len(description) > 72 else "")
+    body_md = f"**Phone:** {phone}\n\n**Description:**\n{description}" if phone else f"**Description:**\n{description}"
+    try:
+        resp = await _http.post(
+            "https://api.github.com/repos/cole-projects/tanya-landing/issues",
+            headers={
+                "Authorization": f"Bearer {GITHUB_ISSUES_PAT}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={"title": title, "body": body_md, "labels": ["user-report"]},
+            timeout=10,
+        )
+        if resp.status_code == 201:
+            logger.info("Error report → GitHub issue #%s", resp.json().get("number"))
+            return Response(status_code=200)
+        logger.warning("GitHub issue creation failed %d: %s", resp.status_code, resp.text[:200])
+        return Response(status_code=500)
+    except Exception as e:
+        logger.warning("Error report request failed: %s", e)
+        return Response(status_code=500)
 
 
 @_fastapi_app.get("/audio/{filename}")
