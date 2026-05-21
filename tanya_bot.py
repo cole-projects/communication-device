@@ -390,25 +390,34 @@ async def blooio_typing_off(phone: str) -> None:
         logger.debug("Typing off error: %s", e)
 
 
+async def _blooio_post(url: str, payload: dict, *, label: str = "send") -> None:
+    """POST to Blooio with 2 attempts (3s delay). Retries on 5xx and network errors; not on 4xx."""
+    headers = {
+        "Authorization": f"Bearer {BLOOIO_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    for attempt in range(1, 3):
+        try:
+            resp = await _http.post(url, headers=headers, json=payload, timeout=30.0)
+            if resp.status_code in (200, 202):
+                return
+            if resp.status_code < 500:
+                logger.error("Blooio %s failed %d: %s", label, resp.status_code, resp.text[:200])
+                return
+            logger.warning("Blooio %s transient %d (attempt %d): %s", label, resp.status_code, attempt, resp.text[:200])
+        except Exception as e:
+            logger.warning("Blooio %s network error (attempt %d): %s", label, attempt, e)
+        if attempt < 2:
+            await asyncio.sleep(3)
+    logger.error("Blooio %s failed after 2 attempts", label)
+
+
 async def blooio_send_message(phone: str, text: str) -> None:
     """Send a text message via Blooio API v2."""
     await blooio_typing_off(phone)
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
-    try:
-        resp = await _http.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {BLOOIO_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"text": text},
-            timeout=30.0,
-        )
-        if resp.status_code not in (200, 202):
-            logger.error("Blooio send failed %d: %s", resp.status_code, resp.text[:200])
-    except Exception as e:
-        logger.error("Blooio send error: %s", e)
+    await _blooio_post(url, {"text": text}, label="send_message")
 
 
 async def blooio_send_vcard(phone: str) -> None:
@@ -416,20 +425,11 @@ async def blooio_send_vcard(phone: str) -> None:
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
     vcf_url = "https://worker-production-32fb.up.railway.app/tanya.vcf"
-    try:
-        resp = await _http.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {BLOOIO_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"attachments": [{"url": vcf_url, "name": "My Contact.vcf"}]},
-            timeout=30.0,
-        )
-        if resp.status_code not in (200, 202):
-            logger.warning("Blooio vCard send failed %d: %s", resp.status_code, resp.text[:200])
-    except Exception as e:
-        logger.error("Blooio vCard send error: %s", e)
+    await _blooio_post(
+        url,
+        {"attachments": [{"url": vcf_url, "name": "My Contact.vcf"}]},
+        label="send_vcard",
+    )
 
 
 def verify_blooio_signature(raw_body: bytes, signature_header: str) -> bool:
@@ -1401,10 +1401,15 @@ def profile_indicates_prior_session(content: str) -> bool:
 
 
 def is_returning_client(phone_hash: str) -> bool:
-    """True if a real profile exists with session evidence, or if a session folder exists on disk."""
+    """True if a real profile exists with session evidence, or if prior session files exist on disk."""
     session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
-    if session_dir.exists() and any(session_dir.iterdir()):
-        return True
+    if session_dir.exists():
+        prior_sessions = [
+            f for f in session_dir.iterdir()
+            if f.name.startswith("Session ") and f.suffix == ".md"
+        ]
+        if len(prior_sessions) > 1:
+            return True
     path = profile_path_for(phone_hash)
     if not path.exists():
         return False
@@ -3409,8 +3414,11 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
     if cancel_intent:
         if await has_tanyatalk_access(phone):
             portal_url = await create_stripe_portal_url(phone) or STRIPE_PORTAL_LINK
-            msg = CANCEL_MESSAGE_WITH_LINK.format(portal_link=portal_url)
-            await blooio_send_message(phone, msg)
+            if portal_url:
+                msg = CANCEL_MESSAGE_WITH_LINK.format(portal_link=portal_url)
+                await blooio_send_message(phone, msg)
+            else:
+                await blooio_send_message(phone, "To cancel, just reply here and I'll help you sort it out.")
         else:
             await blooio_send_message(
                 phone,
