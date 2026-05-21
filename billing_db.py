@@ -71,6 +71,10 @@ async def init_db() -> None:
                     count      INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (phone_hash, period_key)
                 );
+                CREATE TABLE IF NOT EXISTS new_user_onboards (
+                    phone_hash   TEXT PRIMARY KEY,
+                    onboarded_at TEXT NOT NULL
+                );
             """)
             await db.commit()
         _initialized = True
@@ -401,6 +405,30 @@ async def credit_monthly_messages(phone_hash: str, amount: int) -> int:
         ) as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Daily new-user onboarding cap
+# ---------------------------------------------------------------------------
+
+async def get_new_user_count_last_24h() -> int:
+    """Count distinct new users onboarded in the rolling 24-hour window."""
+    async with _conn() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM new_user_onboards WHERE onboarded_at > datetime('now', '-24 hours')"
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def record_new_user_onboard(phone_hash: str) -> None:
+    """Record a successful new-user onboard with current UTC timestamp. Idempotent."""
+    async with _conn() as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO new_user_onboards (phone_hash, onboarded_at) VALUES (?, datetime('now'))",
+            (phone_hash,),
+        )
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------

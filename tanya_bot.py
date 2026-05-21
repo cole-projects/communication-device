@@ -3,7 +3,9 @@ import io
 import re
 import csv
 import hmac
+import math
 from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo
 import hashlib
 import asyncio
 import logging
@@ -211,6 +213,31 @@ DELETE_CANCELLED_MESSAGE = (
     "Nothing touched. I'm still here whenever you need me."
 )
 
+# Daily new-user onboarding cap — configurable via env var.
+DAILY_NEW_USER_CAP = int(os.getenv("DAILY_NEW_USER_CAP", "50"))
+DISPLAY_TIMEZONE = os.getenv("DISPLAY_TIMEZONE", "America/New_York")
+
+
+def _round_up_to_10min(dt: datetime.datetime) -> datetime.datetime:
+    remainder = dt.minute % 10
+    if remainder == 0:
+        return dt.replace(second=0, microsecond=0)
+    return (dt + datetime.timedelta(minutes=10 - remainder)).replace(second=0, microsecond=0)
+
+
+def build_daily_cap_message() -> str:
+    try:
+        tz = ZoneInfo(DISPLAY_TIMEZONE)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+    target = _round_up_to_10min(datetime.datetime.now(tz) + datetime.timedelta(hours=24))
+    time_str = target.strftime("%-I:%M%p").lower()
+    return (
+        f"I can only take on a limited number of new people each day. "
+        f"Once you're in, you're in, this is the only time you'll ever see this. "
+        f"Text me back tomorrow at {time_str} and we'll get started."
+    )
+
 # Monthly message cap for paid subscribers ($20/month = 250 messages).
 MONTHLY_MESSAGE_CAP = 250
 MONTHLY_CAP_WARNING_AT = 230
@@ -313,11 +340,11 @@ async def blooio_typing_on(phone: str) -> None:
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/typing"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as http:
-            await http.post(
-                url,
-                headers={"Authorization": f"Bearer {BLOOIO_API_KEY}"},
-            )
+        await _http.post(
+            url,
+            headers={"Authorization": f"Bearer {BLOOIO_API_KEY}"},
+            timeout=10.0,
+        )
     except Exception as e:
         logger.debug("Typing on error: %s", e)
 
@@ -327,11 +354,11 @@ async def blooio_typing_off(phone: str) -> None:
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/typing"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as http:
-            await http.delete(
-                url,
-                headers={"Authorization": f"Bearer {BLOOIO_API_KEY}"},
-            )
+        await _http.delete(
+            url,
+            headers={"Authorization": f"Bearer {BLOOIO_API_KEY}"},
+            timeout=10.0,
+        )
     except Exception as e:
         logger.debug("Typing off error: %s", e)
 
@@ -342,17 +369,17 @@ async def blooio_send_message(phone: str, text: str) -> None:
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            resp = await http.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {BLOOIO_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={"text": text},
-            )
-            if resp.status_code not in (200, 202):
-                logger.error("Blooio send failed %d: %s", resp.status_code, resp.text[:200])
+        resp = await _http.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {BLOOIO_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"text": text},
+            timeout=30.0,
+        )
+        if resp.status_code not in (200, 202):
+            logger.error("Blooio send failed %d: %s", resp.status_code, resp.text[:200])
     except Exception as e:
         logger.error("Blooio send error: %s", e)
 
@@ -363,17 +390,17 @@ async def blooio_send_vcard(phone: str) -> None:
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
     vcf_url = "https://www.tanya-talk.com/tanya.vcf"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            resp = await http.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {BLOOIO_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={"attachments": [{"url": vcf_url, "name": "Tanya.vcf"}]},
-            )
-            if resp.status_code not in (200, 202):
-                logger.warning("Blooio vCard send failed %d: %s", resp.status_code, resp.text[:200])
+        resp = await _http.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {BLOOIO_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"attachments": [{"url": vcf_url, "name": "Tanya.vcf"}]},
+            timeout=30.0,
+        )
+        if resp.status_code not in (200, 202):
+            logger.warning("Blooio vCard send failed %d: %s", resp.status_code, resp.text[:200])
     except Exception as e:
         logger.error("Blooio vCard send error: %s", e)
 
@@ -463,12 +490,12 @@ async def _blooio_failure_poll_loop() -> None:
         await asyncio.sleep(30)
         try:
             since_ts = int(_last_failure_poll_at * 1000) if _last_failure_poll_at else 0
-            async with httpx.AsyncClient(timeout=15.0) as http:
-                resp = await http.get(
-                    f"{BLOOIO_BASE_URL}/webhook-logs",
-                    headers={"Authorization": f"Bearer {BLOOIO_API_KEY}"},
-                    params={"status": "failed", "limit": 100, "since": since_ts},
-                )
+            resp = await _http.get(
+                f"{BLOOIO_BASE_URL}/webhook-logs",
+                headers={"Authorization": f"Bearer {BLOOIO_API_KEY}"},
+                params={"status": "failed", "limit": 100, "since": since_ts},
+                timeout=15.0,
+            )
             if resp.status_code == 404:
                 # Endpoint not available on this plan — poll silently
                 pass
@@ -582,46 +609,63 @@ def ensure_vault() -> None:
         logger.error("Failed to clone vault: %s", e)
 
 
-async def push_vault_changes(client_name: str, session_num: int) -> None:
-    """Push session and profile updates back to GitHub after session end."""
-    if not GITHUB_PAT:
-        return
+_vault_dirty: bool = False
+
+
+def mark_vault_dirty() -> None:
+    global _vault_dirty
+    _vault_dirty = True
+
+
+def _do_vault_push() -> None:
+    """Run git add/commit/push synchronously inside a thread. Caller holds _VAULT_GIT_LOCK."""
     vault = Path(VAULT_PATH)
-    if not (vault / ".git").exists():
-        logger.warning("Vault is not a git repo — skipping push")
-        return
+    try:
+        subprocess.run(["git", "-C", str(vault), "add", "."], capture_output=True, timeout=30)
+        status = subprocess.run(
+            ["git", "-C", str(vault), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if not status.stdout.strip():
+            logger.info("No vault changes to push")
+            return
+        result = subprocess.run(
+            ["git", "-C", str(vault), "commit", "-m", "Vault sync"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.error("git commit failed: %s", result.stderr)
+            return
+        result = subprocess.run(
+            ["git", "-C", str(vault), "push"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            logger.error("git push failed: %s", result.stderr)
+        else:
+            logger.info("Vault pushed successfully")
+    except Exception as e:
+        logger.error("Failed to push vault changes: %s", e)
 
-    def _do_push() -> None:
-        with _VAULT_GIT_LOCK:
-            try:
-                subprocess.run(["git", "-C", str(vault), "add", "."], capture_output=True, timeout=30)
-                status = subprocess.run(
-                    ["git", "-C", str(vault), "status", "--porcelain"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if not status.stdout.strip():
-                    logger.info("No vault changes to push")
-                    return
-                commit_msg = f"Session update: {client_name} Session {session_num}"
-                result = subprocess.run(
-                    ["git", "-C", str(vault), "commit", "-m", commit_msg],
-                    capture_output=True, text=True, timeout=30,
-                )
-                if result.returncode != 0:
-                    logger.error("git commit failed: %s", result.stderr)
-                    return
-                result = subprocess.run(
-                    ["git", "-C", str(vault), "push"],
-                    capture_output=True, text=True, timeout=60,
-                )
-                if result.returncode != 0:
-                    logger.error("git push failed: %s", result.stderr)
-                else:
-                    logger.info("Vault pushed: %s session %d", client_name, session_num)
-            except Exception as e:
-                logger.error("Failed to push vault changes: %s", e)
 
-    await asyncio.to_thread(_do_push)
+async def _vault_push_loop() -> None:
+    """Background loop: push vault to GitHub every 10 minutes when dirty."""
+    await asyncio.sleep(60)  # brief startup delay
+    while True:
+        await asyncio.sleep(600)
+        global _vault_dirty
+        if not _vault_dirty:
+            continue
+        if not GITHUB_PAT:
+            continue
+        vault = Path(VAULT_PATH)
+        if not (vault / ".git").exists():
+            continue
+        _vault_dirty = False
+        def _push_locked() -> None:
+            with _VAULT_GIT_LOCK:
+                _do_vault_push()
+        await asyncio.to_thread(_push_locked)
 
 
 SESSION_SNAPSHOT_PATH = _BOT_DIR / "logs" / "session_snapshot.json"
@@ -1012,29 +1056,29 @@ async def synthesize_voice(text: str) -> bytes | None:
     if not ELEVENLABS_API_KEY:
         return None
     try:
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            resp = await http.post(
-                ELEVENLABS_TTS_URL,
-                headers={
-                    "xi-api-key": ELEVENLABS_API_KEY,
-                    "Content-Type": "application/json",
-                    "Accept": "audio/mpeg",
+        resp = await _http.post(
+            ELEVENLABS_TTS_URL,
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+            json={
+                "text": text,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {
+                    "stability": 0.71,
+                    "similarity_boost": 0.85,
+                    "style": 0.64,
+                    "use_speaker_boost": False,
+                    "speed": 0.95,
                 },
-                json={
-                    "text": text,
-                    "model_id": "eleven_multilingual_v2",
-                    "voice_settings": {
-                        "stability": 0.71,
-                        "similarity_boost": 0.85,
-                        "style": 0.64,
-                        "use_speaker_boost": False,
-                        "speed": 0.95,
-                    },
-                },
-            )
-            if resp.status_code == 200:
-                return resp.content
-            logger.error("ElevenLabs error %d: %s", resp.status_code, resp.text[:200])
+            },
+            timeout=30.0,
+        )
+        if resp.status_code == 200:
+            return resp.content
+        logger.error("ElevenLabs error %d: %s", resp.status_code, resp.text[:200])
     except Exception as e:
         logger.error("ElevenLabs request failed: %s", e)
     return None
@@ -1057,17 +1101,17 @@ async def blooio_send_audio(phone: str, audio_url: str) -> None:
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            resp = await http.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {BLOOIO_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={"attachments": [{"url": audio_url, "type": "audio/mpeg"}]},
-            )
-            if resp.status_code not in (200, 202):
-                logger.warning("Blooio audio send failed %d: %s", resp.status_code, resp.text[:200])
+        resp = await _http.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {BLOOIO_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"attachments": [{"url": audio_url, "type": "audio/mpeg"}]},
+            timeout=30.0,
+        )
+        if resp.status_code not in (200, 202):
+            logger.warning("Blooio audio send failed %d: %s", resp.status_code, resp.text[:200])
     except Exception as e:
         logger.error("Blooio audio send error: %s", e)
 
@@ -2439,7 +2483,7 @@ async def end_session(phone: str):
             )
 
         await update_vault_index_files(ph, client_name, session_num, today, profile, transcript)
-        asyncio.create_task(push_vault_changes(client_name, session_num))
+        mark_vault_dirty()
 
     cancel_cache_warming(phone)
     _cached_static_prompts.pop(phone, None)
@@ -2748,7 +2792,6 @@ def cancel_cache_warming(phone: str) -> None:
 
 async def perform_session_close(phone: str, user_text: str) -> bool:
     """End active session if one exists; log close to transcript + history, then send confirmation."""
-    # Same rhythm as debounced coaching: typing indicator after TYPING_BUBBLE_DELAY_SEC, not immediate.
     await asyncio.sleep(TYPING_BUBBLE_DELAY_SEC)
     await blooio_typing_on(phone)
     lock = await _get_chat_message_lock(phone)
@@ -2785,8 +2828,10 @@ async def perform_session_close(phone: str, user_text: str) -> bool:
             awaiting_stripe_confirmation[phone] = True
 
         cancel_session_timeout(phone)
-        await end_session(phone)
+
+    await asyncio.sleep(1.0)
     await blooio_send_message(phone, close_text)
+    asyncio.ensure_future(end_session(phone))
     return True
 
 
@@ -2973,6 +3018,16 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 )
 
             if not is_ret:
+                daily_count = await billing_db.get_new_user_count_last_24h()
+                if daily_count >= DAILY_NEW_USER_CAP:
+                    cap_msg = build_daily_cap_message()
+                    pending_first_message_opener.pop(phone, None)
+                    cancel_session_timeout(phone)
+                    await end_session(phone)
+                    await blooio_send_message(phone, cap_msg)
+                    logger.info("Daily new-user cap reached (%d). Blocked: %s", daily_count, ph[:12])
+                    return
+
                 bridge, followup = await prepare_new_client_opener_parts(user_text)
                 opener_script = f"{bridge}\n\n{OPENER_INTRO}\n\n{followup}"
 
@@ -2998,6 +3053,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 if remaining_open > 0:
                     await asyncio.sleep(remaining_open)
                 await deliver_new_client_opener_messages(phone, user_name, bridge, followup)
+                await billing_db.record_new_user_onboard(ph)
                 return
 
             # Crash detection: if previous session ended without a clean close, send cut-off acknowledgment
@@ -3745,6 +3801,7 @@ async def _startup() -> None:
     )
     await tanya_followup.start_scheduler()
     asyncio.ensure_future(_blooio_failure_poll_loop())
+    asyncio.ensure_future(_vault_push_loop())
     logger.info("Tanya Talk iMessage server started")
 
 
