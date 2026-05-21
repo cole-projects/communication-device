@@ -42,7 +42,8 @@ async def _claude_create(_client: AsyncAnthropic, **kwargs) -> anthropic.types.M
             await asyncio.sleep(delay)
     raise RuntimeError("unreachable")  # pragma: no cover
 
-FU_INTERVAL_SEC = 172800  # exactly 48 hours
+import os as _os
+FU_INTERVAL_SEC = int(_os.getenv("FOLLOWUP_DELAY_SECONDS", "172800"))  # default 48 hours; override for testing
 
 
 def _phone_key(phone: str) -> str:
@@ -59,9 +60,7 @@ class MiniState(str, Enum):
 class MiniSessionCtx:
     state: MiniState
     history: list[dict] = field(default_factory=list)
-    problem_summary: str | None = None
     follow_up_1_text: str | None = None
-    good_news_only: bool = False
 
 
 # Populated by configure() before scheduler starts
@@ -290,41 +289,6 @@ def in_mini_session(phone: str) -> bool:
     return phone in _mini
 
 
-async def _send_session_prompt_question(phone: str, ctxm: MiniSessionCtx) -> None:
-    """Ask if they want a session now or later after LISTENING phase names the issue."""
-    if not _claude or not _send_message:
-        return
-    ctx = (
-        "keeping the positive momentum going"
-        if ctxm.good_news_only
-        else f"what you named: {ctxm.problem_summary or 'this'}"
-    )
-    sys = f"""You are Tanya. Send ONE short message asking if they want to start a coaching session now or later, framed around {ctx}. Reference the issue naturally. No em dashes. No two questions.
-
-Output ONLY JSON: {{"reply":"<message>"}}"""
-    try:
-        response = await _claude_create(_claude,
-            model=_claude_haiku_model,
-            max_tokens=250,
-            system=sys,
-            messages=ctxm.history[-16:],
-        )
-        raw = response.content[0].text.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        data = json.loads(raw)
-        reply2 = (data.get("reply") or "").strip().replace(" — ", ", ").replace("—", ", ").replace(" – ", ", ").replace("–", ", ").replace(" ,", ",")
-    except Exception as e:
-        logger.error("Mini-session prompt error: %s", e)
-        reply2 = (
-            "want to do a session around that now, or save it for when you're ready?"
-            if not ctxm.good_news_only
-            else "want to book a session soon to keep this energy going?"
-        )
-    ctxm.history.append({"role": "assistant", "content": reply2})
-    await _send_message(phone, reply2)
-
-
 async def handle_mini_session_turn(phone: str, user_text: str) -> None:
     ctxm = _mini.get(phone)
     if not ctxm or not _claude or not _send_message:
@@ -335,91 +299,66 @@ async def handle_mini_session_turn(phone: str, user_text: str) -> None:
     ctxm.history.append({"role": "user", "content": user_text})
 
     if ctxm.state == MiniState.LISTENING:
-        sys = """You are Tanya in MINI-SESSION mode. The client texted back after you sent a short personal check-in (not a formal coaching session).
-
-LISTENING rules:
-- No coaching moves, no powerful questions, no frameworks, no BecomingYou language.
-- Warm friend energy. Short. Match their tone. Room to be vulnerable.
-- If they share a real struggle that has been present since their last session, your reply gently names it in one short beat (no analysis, no reframe), and set advance to "problem_named" with problem_short a 3-8 word label.
-- If it is only good news and no struggle, celebrate briefly and set advance to "good_news" (problem_short null).
-- If they decline or say they're fine / not interested, set advance to "declined".
-- If you need more listening, set advance to "still_listening".
-
-Never use em dashes. Output ONLY valid JSON (no markdown):
-{"reply":"<message>","advance":"still_listening|problem_named|good_news|declined","problem_short":null|string}"""
-
-    else:
-        ctx = (
-            "momentum / keeping progress going"
-            if ctxm.good_news_only
-            else f"the issue: {ctxm.problem_summary or 'what they shared'}"
+        # Turn 3: one response — warm acknowledgment + session question.
+        checkin_ref = f' You sent them: "{ctxm.follow_up_1_text}".' if ctxm.follow_up_1_text else ""
+        sys = (
+            f"You are Tanya.{checkin_ref} The client just replied to your personal check-in.\n\n"
+            "Write ONE response (2-3 short sentences max):\n"
+            "- Acknowledge what they said warmly and briefly. No coaching, no frameworks, warm and present.\n"
+            "- Then ask if they would like to talk about this in a session.\n\n"
+            "No em dashes. Output ONLY JSON: {\"reply\":\"<message>\"}"
         )
-        sys = f"""You are Tanya in MINI-SESSION mode. You need to ask if they want to start a coaching session now or later, framed around {ctx}.
+        try:
+            response = await _claude_create(_claude,
+                model=_claude_haiku_model,
+                max_tokens=300,
+                system=sys,
+                messages=ctxm.history[-8:],
+            )
+            raw = response.content[0].text.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            reply = (json.loads(raw).get("reply") or "").strip()
+        except Exception as e:
+            logger.error("Mini-session LISTENING error: %s", e)
+            reply = "I hear you. Would you like to talk about this in a session?"
+        reply = reply.replace(" — ", ", ").replace("—", ", ").replace(" – ", ", ").replace("–", ", ").replace(" ,", ",")
+        ctxm.history.append({"role": "assistant", "content": reply})
+        await _send_message(phone, reply)
+        ctxm.state = MiniState.SESSION_PROMPT
+        return
 
-One short message. Reference the issue naturally, not generically. No em dashes.
-
-Output ONLY JSON: {{"reply":"<your message>","choice":"session_now|session_later|unclear"}}
-
-If they already clearly said now or later in their last message, set choice accordingly and make reply a brief acknowledgment plus confirmation.
-If they decline or say they're not interested, set choice to "declined" and reply warmly closing the conversation."""
-
+    # Turn 4 (SESSION_PROMPT): client responded to "would you like a session?"
+    # Explicit decline → close warmly. Everything else → open session.
+    sys = (
+        "You are Tanya. You just asked if the client wants to start a coaching session.\n\n"
+        "Read their reply:\n"
+        "- If they clearly decline (no, not now, I'm fine, maybe later, pass) → close warmly in 1 sentence, set choice to \"declined\"\n"
+        "- For everything else (yes, sure, ambiguous, still talking, any engagement at all) → brief warm acknowledgment, set choice to \"session_now\"\n\n"
+        "No em dashes. Output ONLY JSON: {\"reply\":\"<message>\",\"choice\":\"session_now|declined\"}"
+    )
     try:
         response = await _claude_create(_claude,
             model=_claude_haiku_model,
-            max_tokens=500,
+            max_tokens=200,
             system=sys,
-            messages=ctxm.history[-16:],
+            messages=ctxm.history[-8:],
         )
         raw = response.content[0].text.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         data = json.loads(raw)
-        reply = (data.get("reply") or "").strip().replace(" — ", ", ").replace("—", ", ").replace(" – ", ", ").replace("–", ", ").replace(" ,", ",")
+        reply = (data.get("reply") or "").strip()
+        choice = (data.get("choice") or "session_now").lower()
     except Exception as e:
-        logger.error("Mini-session Claude error: %s", e)
-        reply = "thanks for texting back. i'm here."
-        data = {}
+        logger.error("Mini-session SESSION_PROMPT error: %s", e)
+        reply = "I'm here whenever you're ready."
+        choice = "session_now"
 
+    reply = reply.replace(" — ", ", ").replace("—", ", ").replace(" – ", ", ").replace("–", ", ").replace(" ,", ",")
     ctxm.history.append({"role": "assistant", "content": reply})
     await _send_message(phone, reply)
+    clear_mini(phone)
 
-    if ctxm.state == MiniState.LISTENING:
-        adv = (data.get("advance") or "still_listening").lower()
-        ps = data.get("problem_short")
-        if adv == "problem_named" and ps:
-            ctxm.problem_summary = str(ps).strip()
-            if _merge_focus_cb:
-                await _merge_focus_cb(phone, ctxm.problem_summary)
-            ctxm.good_news_only = False
-            ctxm.state = MiniState.SESSION_PROMPT
-            await _send_session_prompt_question(phone, ctxm)
-        elif adv == "good_news":
-            ctxm.good_news_only = True
-            ctxm.problem_summary = None
-            ctxm.state = MiniState.SESSION_PROMPT
-            await _send_session_prompt_question(phone, ctxm)
-        elif adv == "declined":
-            clear_mini(phone)
-        return
-
-    choice = (data.get("choice") or "unclear").lower()
-    low = user_text.lower()
-    if choice in ("session_now", "session_later", "declined"):
-        final = choice
-    elif any(w in low for w in ("now", "let's do it", "lets do it", "yes now", "start now")):
-        final = "session_now"
-    elif any(w in low for w in ("later", "not now", "another time", "tomorrow", "next week")):
-        final = "session_later"
-    elif any(w in low for w in ("no", "nope", "not interested", "i'm good", "im good", "all good")):
-        final = "declined"
-    else:
-        final = "unclear"
-
-    if final == "session_now":
-        clear_mini(phone)
-        if _open_session_cb:
-            await _open_session_cb(phone, "")
-    elif final == "session_later":
-        clear_mini(phone)
-    elif final == "declined":
-        clear_mini(phone)
+    if choice != "declined" and _open_session_cb:
+        await _open_session_cb(phone, "")
