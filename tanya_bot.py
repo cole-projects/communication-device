@@ -4,6 +4,7 @@ import re
 import csv
 import hmac
 import math
+import difflib
 from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 import hashlib
@@ -1009,6 +1010,14 @@ SESSION_END_NORMALIZED = frozenset(
         "done for the day",
         "im all done",
         "i'm all done",
+        "done session",
+        "done with session",
+        "session done",
+        "end the session",
+        "close session",
+        "close the session",
+        "finish session",
+        "finished session",
     }
 )
 
@@ -1037,11 +1046,19 @@ SESSION_END_TAIL_PHRASES = frozenset(
 
 
 def is_session_end_message(text: str) -> bool:
-    """True when the message is or ends with a recognized session-end phrase."""
+    """True when the message is, contains, or closely resembles a recognized session-end phrase."""
     normalized = normalize_session_end_candidate(text)
+    # Exact match
     if normalized in SESSION_END_NORMALIZED:
         return True
-    return any(normalized.endswith(phrase) for phrase in SESSION_END_TAIL_PHRASES)
+    # Contains or ends with a known tail phrase ("end session I mean", "please end session")
+    if any(phrase in normalized for phrase in SESSION_END_TAIL_PHRASES):
+        return True
+    # Fuzzy match for misspellings — compares full normalized text against each known phrase
+    for phrase in SESSION_END_NORMALIZED:
+        if difflib.SequenceMatcher(None, normalized, phrase).ratio() >= 0.82:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2206,7 +2223,7 @@ Rules:
             system=system,
             messages=[{"role": "user", "content": profile[:500] if profile else "returning client"}],
         )
-        return response.content[0].text.strip().replace("—", ",").replace("–", ",")
+        return response.content[0].text.strip().replace("—", ", ").replace("–", ", ")
     except Exception as e:
         logger.error("Session start nudge generation failed: %s", e)
         return "Just start wherever feels right."
@@ -2510,7 +2527,7 @@ async def ai_detects_cancel_intent(text: str) -> bool:
             max_tokens=5,
             system="Reply with only 'yes' or 'no'. No other text.",
             messages=[{"role": "user", "content": (
-                f"Does this message express a desire to cancel, stop, or end a subscription or billing?\n\nMessage: {text}"
+                f"Does this message express a desire to cancel their paid subscription or stop being billed? Answer yes only if it is clearly about billing or payment, not about ending a conversation or coaching session.\n\nMessage: {text}"
             )}],
         )
         return response.content[0].text.strip().lower().startswith("yes")
@@ -3154,7 +3171,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
             )
             raw_reply = response.content[0].text
             reply, referral_marked = strip_referral_nudge_marker(raw_reply)
-            reply = reply.replace(" — ", ", ").replace("—", ",").replace(" – ", ", ").replace("–", ",").replace(" - ", ", ").replace(" ,", ",")
+            reply = reply.replace(" — ", ", ").replace("—", ", ").replace(" – ", ", ").replace("–", ", ").replace(" - ", ", ").replace(" ,", ",")
             await asyncio.to_thread(record_coaching_usage, phone, user_name, response)
             if referral_marked:
                 referral_nudge_used_this_session[phone] = True
@@ -3301,6 +3318,20 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
             await blooio_send_message(phone, TOPUP_UNCLEAR_REPLY)
         return
 
+    # Session end check runs first — before cancel/delete AI — so "done session" etc.
+    # never reaches the cancellation classifier.
+    if is_session_end_message(user_text):
+        existing = _debounce_tasks.pop(phone, None)
+        if existing and not existing.done():
+            existing.cancel()
+        existing_typing = _typing_tasks.pop(phone, None)
+        if existing_typing and not existing_typing.done():
+            existing_typing.cancel()
+        _pending_messages.pop(phone, None)
+        _pending_phones.pop(phone, None)
+        await perform_session_close(phone, user_text)
+        return
+
     # Cancel / delete triggers — phrase match first (free), then parallel AI fallback.
     user_text_lower = user_text.strip().lower()
     cancel_phrase = any(t in user_text_lower for t in CANCEL_TRIGGERS)
@@ -3321,20 +3352,6 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
 
     if delete_intent:
         awaiting_delete_confirmation[phone] = True
-
-    # Session end: whole message matches SESSION_END_NORMALIZED; not model-decided.
-    if is_session_end_message(user_text):
-        # Cancel debounced coaching / pending typing so "end session" wins; then use same 3s-then-typing as other messages.
-        existing = _debounce_tasks.pop(phone, None)
-        if existing and not existing.done():
-            existing.cancel()
-        existing_typing = _typing_tasks.pop(phone, None)
-        if existing_typing and not existing_typing.done():
-            existing_typing.cancel()
-        _pending_messages.pop(phone, None)
-        _pending_phones.pop(phone, None)
-        await perform_session_close(phone, user_text)
-        return
 
     # Debounce: buffer this message and wait for more before firing to Claude.
     _pending_messages.setdefault(phone, []).append(user_text)
@@ -3411,13 +3428,15 @@ async def create_subscription_checkout_url(phone: str) -> str:
 
 async def handle_stripe_webhook(request: Request) -> Response:
     import stripe as stripe_lib
+    import json as _json
     payload = await request.body()
     sig_header = request.headers.get("Stripe-Signature", "")
     try:
-        event = stripe_lib.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        stripe_lib.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
         logger.warning("Stripe webhook verification failed: %s", e)
         return Response(status_code=400)
+    event = _json.loads(payload)  # plain dict — StripeObject.get() is unreliable across SDK versions
 
     if event["type"] == "checkout.session.completed":
         session_obj = event["data"]["object"]
