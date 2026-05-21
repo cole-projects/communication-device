@@ -140,6 +140,11 @@ def _build_vcard(phone: str) -> str:
 
 TANYA_VCARD = _build_vcard(BLOOIO_PHONE_NUMBER)
 
+CONTACT_SAVE_PROMPT = (
+    "Save my contact so you can always find me. "
+    "When you're done, introduce yourself briefly, I'd love to know a little about you before we get started."
+)
+
 OPENER_INTRO = (
     "Hi, I'm Tanya. I've spent years helping people work through what's on their mind, "
     "and I'm here for you too. Everything here is built with my heart, so you always "
@@ -414,7 +419,7 @@ async def blooio_send_vcard(phone: str) -> None:
                 "Authorization": f"Bearer {BLOOIO_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={"attachments": [{"url": vcf_url, "name": "TanyaTalk.vcf"}]},
+            json={"attachments": [{"url": vcf_url, "name": "My Contact.vcf"}]},
             timeout=30.0,
         )
         if resp.status_code not in (200, 202):
@@ -991,6 +996,7 @@ free_trial_user_msg_count: dict[str, int] = {}
 free_trial_90_warned: dict[str, bool] = {}
 free_trial_completed: dict[str, bool] = {}  # survives end_session; do not pop
 awaiting_stripe_confirmation: dict[str, bool] = {}
+awaiting_contact_save: dict[str, bool] = {}
 pending_first_message_opener: dict[str, bool] = {}
 paid_tanyatalk_access: dict[str, bool] = {}  # True when Stripe subscription active
 mesh_tanyatalk_included: dict[str, bool] = {}  # True when client is in MESH with TanyaTalk included
@@ -2323,10 +2329,7 @@ async def deliver_new_client_opener_messages(
     bridge: str,
     followup: str,
 ) -> str:
-    """Outbound flow: (1) vCard; (2) bridge + OPENER_INTRO; (3) coaching invite — no delays."""
-    await blooio_send_message(phone, "Save this contact if you haven't already")
-    await blooio_send_vcard(phone)
-
+    """Outbound flow: (1) bridge + OPENER_INTRO; (2) coaching invite. vCard was sent in step 1."""
     main_combined = f"{bridge}\n\n{OPENER_INTRO}"
     await blooio_send_message(phone, main_combined)
     logger.info("New client opener: main block sent for %s", user_name)
@@ -2529,6 +2532,7 @@ async def end_session(phone: str):
     session_profiles.pop(phone, None)
     voice_note_redirects.pop(phone, None)
     pending_first_message_opener.pop(phone, None)
+    awaiting_contact_save.pop(phone, None)
     free_trial_user_msg_count.pop(phone, None)
     free_trial_90_warned.pop(phone, None)
     last_activity.pop(phone, None)
@@ -2646,6 +2650,7 @@ async def delete_client_data(phone: str) -> None:
         mesh_tanyatalk_included,
         awaiting_stripe_confirmation,
         awaiting_delete_confirmation,
+        awaiting_contact_save,
         pending_first_message_opener,
         referral_nudge_used_this_session,
         cache_warm_tasks,
@@ -3052,16 +3057,25 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 )
 
             if not is_ret:
-                daily_count = await billing_db.get_new_user_count_last_24h()
-                if daily_count >= DAILY_NEW_USER_CAP:
-                    cap_msg = build_daily_cap_message()
-                    pending_first_message_opener.pop(phone, None)
-                    cancel_session_timeout(phone)
-                    await end_session(phone)
-                    await blooio_send_message(phone, cap_msg)
-                    logger.info("Daily new-user cap reached (%d). Blocked: %s", daily_count, ph[:12])
-                    return
+                if not awaiting_contact_save.get(phone):
+                    # Step 1: check cap, send vCard + save prompt, then wait for their reply.
+                    daily_count = await billing_db.get_new_user_count_last_24h()
+                    if daily_count >= DAILY_NEW_USER_CAP:
+                        cap_msg = build_daily_cap_message()
+                        pending_first_message_opener.pop(phone, None)
+                        cancel_session_timeout(phone)
+                        await end_session(phone)
+                        await blooio_send_message(phone, cap_msg)
+                        logger.info("Daily new-user cap reached (%d). Blocked: %s", daily_count, ph[:12])
+                        return
+                    await blooio_send_vcard(phone)
+                    await blooio_send_message(phone, CONTACT_SAVE_PROMPT)
+                    awaiting_contact_save[phone] = True
+                    logger.info("Contact save prompt sent; waiting for intro reply from %s", ph[:12])
+                    return  # pending_first_message_opener stays set — next message triggers opener
 
+                # Step 2: they replied — fire the opener.
+                awaiting_contact_save.pop(phone, None)
                 bridge, followup = await prepare_new_client_opener_parts(user_text)
                 opener_script = f"{bridge}\n\n{OPENER_INTRO}\n\n{followup}"
 
@@ -3363,8 +3377,16 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         cancel_intent, delete_intent = cancel_phrase, delete_phrase
 
     if cancel_intent:
-        msg = CANCEL_MESSAGE_WITH_LINK.format(portal_link=STRIPE_PORTAL_LINK)
-        await blooio_send_message(phone, msg)
+        if await has_tanyatalk_access(phone):
+            portal_url = await create_stripe_portal_url(phone) or STRIPE_PORTAL_LINK
+            msg = CANCEL_MESSAGE_WITH_LINK.format(portal_link=portal_url)
+            await blooio_send_message(phone, msg)
+        else:
+            await blooio_send_message(
+                phone,
+                "You're still in your free trial, so there's nothing to cancel yet. "
+                "If you ever subscribe and want to stop, just let me know.",
+            )
         return
 
     if delete_intent:
@@ -3693,6 +3715,7 @@ def _write_session_snapshot() -> None:
             "awaiting_stripe_confirmation": awaiting_stripe_confirmation,
             "awaiting_topup_confirmation": awaiting_topup_confirmation,
             "awaiting_delete_confirmation": awaiting_delete_confirmation,
+            "awaiting_contact_save": awaiting_contact_save,
             "pending_first_message_opener": pending_first_message_opener,
             "free_trial_user_msg_count": free_trial_user_msg_count,
             "free_trial_90_warned": free_trial_90_warned,
@@ -3758,6 +3781,7 @@ def _restore_session_snapshot() -> None:
             ("awaiting_stripe_confirmation", awaiting_stripe_confirmation),
             ("awaiting_topup_confirmation", awaiting_topup_confirmation),
             ("awaiting_delete_confirmation", awaiting_delete_confirmation),
+            ("awaiting_contact_save", awaiting_contact_save),
         ):
             for phone, val in data.get(src, {}).items():
                 dst[phone] = val  # type: ignore[index]
