@@ -440,11 +440,11 @@ async def record_new_user_onboard(phone_hash: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def delete_monthly_usage(phone_hash: str) -> None:
-    """Wipe usage counts only. Trial flag and access record are intentionally preserved
-    so a returning deleted client cannot re-use the free trial."""
+    """Wipe usage counts only. Trial flag, trial message count, and access record are
+    intentionally preserved so a returning deleted client picks up where they left off
+    in the free trial rather than starting fresh."""
     async with _conn() as db:
         await db.execute("DELETE FROM monthly_usage WHERE phone_hash = ?", (phone_hash,))
-        await db.execute("DELETE FROM free_trial_msg_counts WHERE phone_hash = ?", (phone_hash,))
         await db.commit()
 
 
