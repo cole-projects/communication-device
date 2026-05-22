@@ -682,10 +682,10 @@ def _do_vault_push() -> None:
 
 
 async def _vault_push_loop() -> None:
-    """Background loop: push vault to GitHub every 10 minutes when dirty."""
+    """Background loop: push vault to GitHub every 2 minutes when dirty."""
     await asyncio.sleep(60)  # brief startup delay
     while True:
-        await asyncio.sleep(600)
+        await asyncio.sleep(120)
         global _vault_dirty
         if not _vault_dirty:
             continue
@@ -3498,6 +3498,7 @@ async def create_topup_checkout_url(phone: str) -> str:
             "adjustable_quantity": {"enabled": True, "minimum": 1, "maximum": 99},
         }],
         mode="payment",
+        phone_number_collection={"enabled": True},
         metadata={"phone": phone},
         success_url="https://stripe.com",
         cancel_url="https://stripe.com",
@@ -3513,6 +3514,7 @@ async def create_subscription_checkout_url(phone: str) -> str:
         line_items=[{"price": STRIPE_SUBSCRIPTION_PRICE_ID, "quantity": 1}],
         mode="subscription",
         allow_promotion_codes=True,
+        phone_number_collection={"enabled": True},
         metadata={"phone": phone, "product_type": "subscription"},
         success_url="https://stripe.com",
         cancel_url="https://stripe.com",
@@ -3946,6 +3948,11 @@ async def _startup() -> None:
 
 async def _shutdown() -> None:
     _write_session_snapshot()
+    if _vault_dirty and GITHUB_PAT:
+        vault = Path(VAULT_PATH)
+        if (vault / ".git").exists():
+            with _VAULT_GIT_LOCK:
+                _do_vault_push()
     await tanya_followup.shutdown_scheduler()
     await _http.aclose()
 
