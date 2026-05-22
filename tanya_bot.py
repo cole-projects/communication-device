@@ -3755,6 +3755,8 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
     text = payload.get("text", "")
     is_group = payload.get("is_group", False)
     logger.info("Webhook payload: phone_key=%s text_len=%s is_group=%s keys=%s", _phone_key(phone) if phone else "", len(text) if text else 0, is_group, list(payload.keys()))
+    if payload.get("error_code") or payload.get("error_message"):
+        logger.warning("Blooio delivery error: error_code=%s error_message=%s message_id=%s", payload.get("error_code"), payload.get("error_message"), payload.get("message_id"))
     if phone and not is_group:
         if text:
             asyncio.ensure_future(handle_inbound_message(phone, text))
