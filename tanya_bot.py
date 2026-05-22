@@ -3714,10 +3714,10 @@ async def serve_audio(filename: str) -> Response:
     return Response(content=content, media_type="audio/mpeg")
 
 
-@_fastapi_app.get("/tanya.vcf")
-async def serve_vcard() -> Response:
+@_fastapi_app.api_route("/tanya.vcf", methods=["GET", "HEAD"])
+async def serve_vcard(request: Request) -> Response:
     return Response(
-        content=TANYA_VCARD,
+        content=None if request.method == "HEAD" else TANYA_VCARD,
         media_type="text/vcard",
         headers={"Content-Disposition": 'attachment; filename="TanyaTalk.vcf"'},
     )
