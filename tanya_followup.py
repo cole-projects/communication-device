@@ -204,13 +204,14 @@ async def _generate_follow_up_message(
 
     prompt = f"""Generate a follow-up text message from Tanya to client {client_name}.
 
+Structure: 2 sentences total.
+- Sentence 1: A warm statement that references something specific from the session — a commitment they made, an emotional moment, or a phrase they used. Implies Tanya is thinking of them.
+- Sentence 2: One short, natural question tied to what was just referenced. Examples of the right tone: "How have things been going since then?", "Have you given that any thought?", "Any movement on that since we talked?" Vary the phrasing — never repeat the same question.
+
 Rules:
-- 1 sentence only. Maximum 2 short sentences.
-- References something specific from the session: a commitment they made, an emotional moment, or a phrase they used.
-- Implies Tanya is thinking of them — does NOT invite a response or ask a question.
 - Never use: checking in, follow-up, just wanted to, hope you're doing well.
 - Never use em dashes.
-- Reads like a warm text from someone who genuinely remembers — not a prompt to reply.
+- Both sentences should sound like a warm text from someone who genuinely remembers — not a form letter.
 - Gold standard: the client thinks "I can't believe she remembered that."
 
 Session excerpts:
