@@ -3546,7 +3546,7 @@ async def handle_stripe_webhook(request: Request) -> Response:
                         await blooio_send_message(
                             phone,
                             "You're in. Your subscription is active and your 250 messages are ready. "
-                            "Come back whenever you are and we will pick up right where we left off.",
+                            "Come back whenever and we will pick up right where we left off.",
                         )
                     except Exception as e:
                         logger.error("Subscription welcome message failed (access already granted): %s", e)
@@ -3748,8 +3748,13 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
     text = payload.get("text", "")
     is_group = payload.get("is_group", False)
     logger.info("Webhook payload: phone_key=%s text_len=%s is_group=%s keys=%s", _phone_key(phone) if phone else "", len(text) if text else 0, is_group, list(payload.keys()))
-    if phone and text and not is_group:
-        asyncio.ensure_future(handle_inbound_message(phone, text))
+    if phone and not is_group:
+        if text:
+            asyncio.ensure_future(handle_inbound_message(phone, text))
+        else:
+            # No text — voice note or media attachment. Route through session logic
+            # so the system prompt's voice note redirect fires in the right context.
+            asyncio.ensure_future(handle_inbound_message(phone, "[voice note]"))
     return Response(status_code=200)
 
 
