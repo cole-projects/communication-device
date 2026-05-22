@@ -70,7 +70,7 @@ TANYA_PUBLIC_URL = os.getenv("TANYA_PUBLIC_URL", "https://worker-production-32fb
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
 _POST_TRIAL_BYPASS_PHONES: frozenset[str] = frozenset(
     x.strip()
-    for x in os.getenv("POST_TRIAL_ALLOW_PHONES", "").split(",")
+    for x in os.getenv("POST_TRIAL_BYPASS_PHONES", os.getenv("POST_TRIAL_ALLOW_PHONES", "")).split(",")
     if x.strip()
 )
 # Phones included in a MESH package (TanyaTalk access without a direct Stripe subscription)
