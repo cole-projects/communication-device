@@ -2607,6 +2607,16 @@ async def ai_detects_delete_intent(text: str) -> bool:
 
 async def classify_delete_confirmation_intent(user_text: str) -> str:
     """Haiku sentiment check for delete confirmation: affirmative | negative | unclear."""
+    _clean = user_text.strip().lower().rstrip(".,!?")
+    _YES = {"yes", "y", "yep", "yeah", "yup", "sure", "ok", "okay", "confirmed",
+            "confirm", "go ahead", "do it", "delete it", "delete", "affirmative"}
+    _NO  = {"no", "n", "nope", "nah", "cancel", "stop", "never mind", "nevermind",
+            "i changed my mind", "keep it", "don't", "dont", "negative"}
+    if _clean in _YES:
+        return "affirmative"
+    if _clean in _NO:
+        return "negative"
+
     system = (
         "A client was asked to confirm they want all their data permanently deleted. "
         "Classify their reply.\n\n"
