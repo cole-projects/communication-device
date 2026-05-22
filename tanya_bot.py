@@ -69,10 +69,14 @@ TANYA_PUBLIC_URL = os.getenv("TANYA_PUBLIC_URL", "https://worker-production-32fb
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
 _POST_TRIAL_BYPASS_PHONES: frozenset[str] = frozenset(
-    x.strip()
+    x.strip().lstrip("+")
     for x in os.getenv("POST_TRIAL_BYPASS_PHONES", os.getenv("POST_TRIAL_ALLOW_PHONES", "")).split(",")
     if x.strip()
 )
+
+
+def _is_bypass_phone(phone: str) -> bool:
+    return phone.lstrip("+") in _POST_TRIAL_BYPASS_PHONES
 # Phones included in a MESH package (TanyaTalk access without a direct Stripe subscription)
 _MESH_PHONES: frozenset[str] = frozenset(
     x.strip()
@@ -940,7 +944,7 @@ async def has_tanyatalk_access(phone: str) -> bool:
         return True
     if mesh_tanyatalk_included.get(phone):
         return True
-    if phone in _POST_TRIAL_BYPASS_PHONES:
+    if _is_bypass_phone(phone):
         return True
     ph = phone_to_hash(phone)
     if await billing_db.has_access(ph):
@@ -952,7 +956,7 @@ async def has_tanyatalk_access(phone: str) -> bool:
 async def should_block_unpaid_after_free_trial(phone: str) -> bool:
     if not BLOCK_AFTER_FREE_TRIAL:
         return False
-    if phone in _POST_TRIAL_BYPASS_PHONES:
+    if _is_bypass_phone(phone):
         return False
     if not await _has_completed_free_trial(phone):
         return False
@@ -2954,7 +2958,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
     ph = phone_to_hash(phone)
 
     # Monthly cap (paid users only; free trial has its own 25-message hard stop)
-    if await has_tanyatalk_access(phone) and phone not in _POST_TRIAL_BYPASS_PHONES:
+    if await has_tanyatalk_access(phone) and not _is_bypass_phone(phone):
         count = await billing_db.get_monthly_message_count(ph)
         extra = await billing_db.get_extra_messages(ph)
         effective_cap = MONTHLY_MESSAGE_CAP + extra
