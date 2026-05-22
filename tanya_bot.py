@@ -2415,7 +2415,7 @@ Reply with exactly one word on the first line: affirmative OR negative OR unclea
 
 
 SESSION_CLOSE_CONFIRMATION = "I've saved our session. When you're here, I'm here. 💛"
-SESSION_CLOSE_PS = "ps — send \"done\" when you're ready to end a session."
+SESSION_CLOSE_PS = "ps: send \"END SESSION\" when you're ready to end a session."
 LINK_RESPONSE = "I can't open links, but I'm here with you. What's on your mind?"
 
 
@@ -3189,7 +3189,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 await blooio_send_message(phone, opener_script)
                 logger.info("Returning client opener sent as text (ElevenLabs unavailable) for %s", user_name)
 
-            second_text = f"{start_nudge} {SESSION_CLOSE_PS}"
+            second_text = f"{start_nudge}\n\n{SESSION_CLOSE_PS}"
             await blooio_send_message(phone, second_text)
 
             pending_first_message_opener.pop(phone, None)
