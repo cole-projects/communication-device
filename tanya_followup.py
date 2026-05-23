@@ -2,8 +2,9 @@
 Follow-up engine: persisted 48h timers (APScheduler + SQLite), mini-session state,
 and transport-agnostic outbound messaging via a send_message hook.
 
-V1 design: one follow-up per session only. Timer cancels on any inbound message.
-New timer starts only after the next session ends.
+V1 design: one follow-up per session only, starting at Session 2 (Session 1 / free trial
+never schedules follow-up). Timer cancels on any inbound message. New timer starts only
+after the next session ends.
 Three outcomes after follow-up fires:
   (1) no response — no further action
   (2) client wants a session — Haiku acknowledges, opens Sonnet session, counts toward 250
@@ -12,10 +13,10 @@ Three outcomes after follow-up fires:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -44,11 +45,15 @@ async def _claude_create(_client: AsyncAnthropic, **kwargs) -> anthropic.types.M
 
 import os as _os
 FU_INTERVAL_SEC = int(_os.getenv("FOLLOWUP_DELAY_SECONDS", "172800"))  # default 48 hours; override for testing
+FU_EXTRACTION_RETRY_SEC = int(_os.getenv("FOLLOWUP_EXTRACTION_RETRY_SECONDS", "300"))  # 5 min
+FU_EXTRACTION_MAX_RETRIES = int(_os.getenv("FOLLOWUP_EXTRACTION_MAX_RETRIES", "24"))  # ~2 hours
+MIN_SESSION_NUM_FOR_FOLLOWUP = 2
 
 
 def _phone_key(phone: str) -> str:
-    """16-char SHA-256 prefix of the phone number — used in scheduler job IDs only."""
-    return hashlib.sha256(phone.encode()).hexdigest()[:16]
+    """16-char SHA-256 prefix — must match tanya_bot.phone_to_hash for job cancel."""
+    from tanya_bot import phone_to_hash
+    return phone_to_hash(phone)[:16]
 
 
 class MiniState(str, Enum):
@@ -76,6 +81,127 @@ _check_monthly_cap_cb: Callable[[str], Awaitable[bool]] | None = None  # phone -
 _scheduler: AsyncIOScheduler | None = None
 _mini: dict[str, MiniSessionCtx] = {}
 _post_fu1: dict[str, dict] = {}  # phone -> {session_path, fu1_text, correlation}
+_followup_state_path: Path | None = None
+_followup_state_lock = threading.Lock()
+
+
+def _mini_to_dict(ctx: MiniSessionCtx) -> dict:
+    return {
+        "state": ctx.state.value,
+        "history": ctx.history,
+        "follow_up_1_text": ctx.follow_up_1_text,
+    }
+
+
+def _mini_from_dict(data: dict) -> MiniSessionCtx:
+    return MiniSessionCtx(
+        state=MiniState(data["state"]),
+        history=data.get("history", []),
+        follow_up_1_text=data.get("follow_up_1_text"),
+    )
+
+
+def _session_followup_sent(session_path: Path) -> bool:
+    try:
+        return "<!-- followup:sent" in session_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def _read_session_followup_message(session_path: Path) -> str | None:
+    try:
+        text = session_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r"<!-- followup:sent\s+(\{.*?\})\s+-->", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1)).get("text")
+    except json.JSONDecodeError:
+        return None
+
+
+def _mark_session_followup_sent(session_path: Path, message: str) -> None:
+    payload = json.dumps({"text": message}, ensure_ascii=False)
+    with session_path.open("a", encoding="utf-8") as f:
+        f.write(f"\n<!-- followup:sent {payload} -->\n")
+
+
+def _session_ended_at_from_extraction(session_path: Path) -> datetime | None:
+    try:
+        text = session_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    raw = read_follow_up_extraction(text).get("session_ended_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _ensure_post_fu1_restored(phone: str, session_path: Path, fu1_text: str | None) -> None:
+    if phone in _post_fu1:
+        return
+    if not fu1_text:
+        return
+    _post_fu1[phone] = {
+        "session_path": session_path,
+        "fu1_text": fu1_text,
+        "pending_send": False,
+    }
+    _persist_followup_state()
+
+
+def _persist_followup_state() -> None:
+    if not _followup_state_path:
+        return
+    with _followup_state_lock:
+        payload = {
+            "post_fu1": {
+                phone: {
+                    "session_path": str(v["session_path"]) if v.get("session_path") else "",
+                    "fu1_text": v.get("fu1_text"),
+                    "pending_send": bool(v.get("pending_send")),
+                }
+                for phone, v in _post_fu1.items()
+            },
+            "mini": {phone: _mini_to_dict(ctx) for phone, ctx in _mini.items()},
+        }
+        _followup_state_path.parent.mkdir(parents=True, exist_ok=True)
+        _followup_state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _restore_followup_state() -> None:
+    if not _followup_state_path or not _followup_state_path.exists():
+        return
+    try:
+        data = json.loads(_followup_state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Could not restore follow-up state: %s", e)
+        return
+    _post_fu1.clear()
+    _mini.clear()
+    for phone, entry in (data.get("post_fu1") or {}).items():
+        session_path_str = entry.get("session_path", "")
+        _post_fu1[phone] = {
+            "session_path": Path(session_path_str) if session_path_str else None,
+            "fu1_text": entry.get("fu1_text"),
+            "pending_send": bool(entry.get("pending_send")),
+        }
+    for phone, entry in (data.get("mini") or {}).items():
+        try:
+            _mini[phone] = _mini_from_dict(entry)
+        except (KeyError, ValueError) as e:
+            logger.warning("Skipping invalid mini-session state for %s: %s", phone[:8], e)
+    if _post_fu1 or _mini:
+        logger.info(
+            "Follow-up state restored: %d post-FU window(s), %d mini-session(s)",
+            len(_post_fu1),
+            len(_mini),
+        )
 
 
 def configure(
@@ -86,7 +212,7 @@ def configure(
     send_message: Callable[[str, str], Awaitable[None]],
     merge_focus_for_next_session: Callable[[str, str], Awaitable[None]],
     open_coaching_session: Callable[..., Awaitable[None]],
-    check_monthly_cap: Callable[[str], bool] | None = None,
+    check_monthly_cap: Callable[[str], Awaitable[bool]] | None = None,
     typing_on: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     global _claude, _claude_model, _claude_haiku_model, _send_message
@@ -102,10 +228,11 @@ def configure(
 
 
 def init_scheduler(jobstore_sqlite_path: Path) -> None:
-    global _scheduler
+    global _scheduler, _followup_state_path
     if _scheduler is not None:
         return
     jobstore_sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    _followup_state_path = jobstore_sqlite_path.parent / "followup_state.json"
     url = f"sqlite:///{jobstore_sqlite_path.resolve()}"
     _scheduler = AsyncIOScheduler(
         jobstores={"default": SQLAlchemyJobStore(url=url)},
@@ -113,9 +240,32 @@ def init_scheduler(jobstore_sqlite_path: Path) -> None:
     )
 
 
+async def _recover_incomplete_mini_sessions() -> None:
+    """Resume mini-sessions interrupted after the client texted but before Tanya replied."""
+    for phone, ctx in list(_mini.items()):
+        if not ctx.history or ctx.history[-1]["role"] != "user":
+            continue
+        last_user = ctx.history.pop()["content"]
+        _persist_followup_state()
+        logger.info(
+            "Resuming interrupted mini-session for phone_key=%s (state=%s)",
+            _phone_key(phone), ctx.state.value,
+        )
+        try:
+            await handle_mini_session_turn(phone, last_user)
+        except Exception as e:
+            logger.error(
+                "Failed to resume mini-session for phone_key=%s: %s",
+                _phone_key(phone), e,
+            )
+
+
 async def start_scheduler() -> None:
     if _scheduler and not _scheduler.running:
         _scheduler.start()
+        _restore_followup_state()
+        await _recover_pending_followup_sends()
+        await _recover_incomplete_mini_sessions()
         logger.info("Follow-up scheduler started (SQLite job store)")
 
 
@@ -139,6 +289,58 @@ def cancel_all_followup_jobs_for_chat(phone: str) -> None:
                 logger.warning("Could not remove job %s: %s", jid, e)
     _post_fu1.pop(phone, None)
     clear_mini(phone)
+    _persist_followup_state()
+
+
+def ensure_follow_up_scheduled(
+    phone: str,
+    client_name: str,
+    session_path: Path,
+    session_num: int,
+    ended_at_utc: datetime,
+) -> None:
+    """Schedule (or keep) one follow-up job per session — idempotent across finalize retries."""
+    if session_num < MIN_SESSION_NUM_FOR_FOLLOWUP:
+        logger.info(
+            "Follow-up not scheduled for phone_key=%s session %d — session 1 only",
+            _phone_key(phone), session_num,
+        )
+        return
+    if not _scheduler:
+        logger.warning("Scheduler not initialized; skip follow-up scheduling")
+        return
+    if _session_followup_sent(session_path):
+        logger.info(
+            "Follow-up already sent for phone_key=%s session %d — not rescheduling",
+            _phone_key(phone), session_num,
+        )
+        return
+    pk = _phone_key(phone)
+    job_id = f"fu1-{pk}-{session_num}"
+    run_at = ended_at_utc + timedelta(seconds=FU_INTERVAL_SEC)
+    now = datetime.now(timezone.utc)
+    if run_at <= now:
+        run_at = now + timedelta(seconds=30)
+    _scheduler.add_job(
+        followup_job_fire,
+        "date",
+        run_date=run_at,
+        kwargs={
+            "phone": phone,
+            "session_path_str": str(session_path),
+            "client_name": client_name,
+            "session_num": session_num,
+            "retry_count": 0,
+        },
+        id=job_id,
+        replace_existing=True,
+    )
+    logger.info(
+        "Scheduled follow-up for phone_key=%s at %s (job %s)",
+        pk,
+        run_at,
+        job_id,
+    )
 
 
 def schedule_follow_up_1(
@@ -148,12 +350,21 @@ def schedule_follow_up_1(
     session_num: int,
     ended_at_utc: datetime,
 ) -> None:
+    ensure_follow_up_scheduled(phone, client_name, session_path, session_num, ended_at_utc)
+
+
+def _reschedule_followup_for_extraction(
+    phone: str,
+    session_path: Path,
+    client_name: str,
+    session_num: int,
+    retry_count: int,
+) -> None:
     if not _scheduler:
-        logger.warning("Scheduler not initialized; skip follow-up scheduling")
         return
     pk = _phone_key(phone)
-    run_at = ended_at_utc + timedelta(seconds=FU_INTERVAL_SEC)
-    job_id = f"fu1-{pk}-{session_num}-{int(ended_at_utc.timestamp())}"
+    job_id = f"fu1-{pk}-{session_num}"
+    run_at = datetime.now(timezone.utc) + timedelta(seconds=FU_EXTRACTION_RETRY_SEC)
     _scheduler.add_job(
         followup_job_fire,
         "date",
@@ -162,15 +373,15 @@ def schedule_follow_up_1(
             "phone": phone,
             "session_path_str": str(session_path),
             "client_name": client_name,
+            "session_num": session_num,
+            "retry_count": retry_count,
         },
         id=job_id,
-        replace_existing=False,
+        replace_existing=True,
     )
     logger.info(
-        "Scheduled follow-up for phone_key=%s at %s (job %s)",
-        pk,
-        run_at,
-        job_id,
+        "Follow-up waiting on extraction for phone_key=%s session %d — retry %d at %s",
+        pk, session_num, retry_count, run_at,
     )
 
 
@@ -235,12 +446,43 @@ async def followup_job_fire(
     phone: str,
     session_path_str: str,
     client_name: str,
+    session_num: int = 0,
+    retry_count: int = 0,
 ) -> None:
     session_path = Path(session_path_str)
     if not session_path.exists():
         logger.error("Follow-up: session file missing %s", session_path)
         return
     if _send_message is None:
+        return
+
+    if session_num < MIN_SESSION_NUM_FOR_FOLLOWUP:
+        logger.info(
+            "Follow-up skipped for phone_key=%s session %d — session 2+ only",
+            _phone_key(phone), session_num,
+        )
+        return
+
+    if _session_followup_sent(session_path):
+        saved_msg = _read_session_followup_message(session_path)
+        _ensure_post_fu1_restored(phone, session_path, saved_msg)
+        logger.info(
+            "Follow-up already sent for phone_key=%s session %d — skipping duplicate fire",
+            _phone_key(phone), session_num,
+        )
+        return
+
+    session_text = await asyncio.to_thread(session_path.read_text, encoding="utf-8")
+    if not read_follow_up_extraction(session_text):
+        if retry_count >= FU_EXTRACTION_MAX_RETRIES:
+            logger.error(
+                "Follow-up abandoned for phone_key=%s session %d — extraction never appeared",
+                _phone_key(phone), session_num,
+            )
+            return
+        _reschedule_followup_for_extraction(
+            phone, session_path, client_name, session_num, retry_count + 1,
+        )
         return
 
     # Skip if client has used their full message allotment this month
@@ -250,14 +492,51 @@ async def followup_job_fire(
 
     try:
         msg = await _generate_follow_up_message(client_name, session_path)
-        await _send_message(phone, msg)
         _post_fu1[phone] = {
             "session_path": session_path,
             "fu1_text": msg,
+            "pending_send": True,
         }
+        _persist_followup_state()
+        await _send_message(phone, msg)
+        _mark_session_followup_sent(session_path, msg)
+        _post_fu1[phone] = {
+            "session_path": session_path,
+            "fu1_text": msg,
+            "pending_send": False,
+        }
+        _persist_followup_state()
         logger.info("Follow-up sent to phone_key=%s", _phone_key(phone))
     except Exception as e:
         logger.error("Follow-up job failed: %s", e)
+
+
+async def _recover_pending_followup_sends() -> None:
+    """Finish follow-up sends interrupted by redeploy (state persisted before send)."""
+    for phone, info in list(_post_fu1.items()):
+        session_path = info.get("session_path")
+        if not session_path:
+            continue
+        if _session_followup_sent(session_path):
+            if info.get("pending_send"):
+                info["pending_send"] = False
+            if not info.get("fu1_text"):
+                info["fu1_text"] = _read_session_followup_message(session_path)
+            _persist_followup_state()
+            continue
+        if not info.get("pending_send"):
+            continue
+        fu1_text = info.get("fu1_text")
+        if not fu1_text or not _send_message:
+            continue
+        try:
+            await _send_message(phone, fu1_text)
+            _mark_session_followup_sent(session_path, fu1_text)
+            info["pending_send"] = False
+            _persist_followup_state()
+            logger.info("Recovered pending follow-up send for phone_key=%s", _phone_key(phone))
+        except Exception as e:
+            logger.error("Failed to recover pending follow-up for phone_key=%s: %s", _phone_key(phone), e)
 
 
 def on_user_message_cancel_followup(phone: str) -> bool:
@@ -280,10 +559,25 @@ def enter_mini_session_after_fu1(phone: str, fu1_text: str | None) -> None:
     info = _post_fu1.pop(phone, None) or {}
     text = fu1_text if fu1_text is not None else info.get("fu1_text")
     _mini[phone] = MiniSessionCtx(state=MiniState.LISTENING, follow_up_1_text=text)
+    _persist_followup_state()
 
 
 def clear_mini(phone: str) -> None:
-    _mini.pop(phone, None)
+    if phone in _mini:
+        _mini.pop(phone, None)
+        _persist_followup_state()
+
+
+def _format_mini_session_transcript(history: list[dict]) -> str:
+    """Format mini-session turns for profile ## Focus for Next Session."""
+    lines: list[str] = []
+    for msg in history:
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        speaker = "Tanya" if msg.get("role") == "assistant" else "Client"
+        lines.append(f"{speaker}: {content}")
+    return "\n".join(lines)
 
 
 def in_mini_session(phone: str) -> bool:
@@ -298,6 +592,7 @@ async def handle_mini_session_turn(phone: str, user_text: str) -> None:
     if _typing_on_cb:
         await _typing_on_cb(phone)
     ctxm.history.append({"role": "user", "content": user_text})
+    _persist_followup_state()
 
     if ctxm.state == MiniState.LISTENING:
         # Turn 3: one response — warm acknowledgment + session question.
@@ -327,6 +622,7 @@ async def handle_mini_session_turn(phone: str, user_text: str) -> None:
         ctxm.history.append({"role": "assistant", "content": reply})
         await _send_message(phone, reply)
         ctxm.state = MiniState.SESSION_PROMPT
+        _persist_followup_state()
         return
 
     # Turn 4 (SESSION_PROMPT): client responded to "would you like a session?"
@@ -359,7 +655,17 @@ async def handle_mini_session_turn(phone: str, user_text: str) -> None:
     reply = reply.replace(" — ", ", ").replace("—", ", ").replace(" – ", ", ").replace("–", ", ").replace(" ,", ",")
     ctxm.history.append({"role": "assistant", "content": reply})
     await _send_message(phone, reply)
+
+    opening_session = choice != "declined"
+    if opening_session and _merge_focus_cb:
+        transcript = _format_mini_session_transcript(ctxm.history)
+        if transcript:
+            try:
+                await _merge_focus_cb(phone, transcript)
+            except Exception as e:
+                logger.error("Mini-session merge_focus failed for %s: %s", _phone_key(phone), e)
+
     clear_mini(phone)
 
-    if choice != "declined" and _open_session_cb:
+    if opening_session and _open_session_cb:
         await _open_session_cb(phone, "")

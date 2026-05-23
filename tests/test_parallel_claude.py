@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Concurrency smoke test: two different chat_ids handling a message at the same time
+Concurrency smoke test: two phones handling a coaching turn at the same time
 should overlap slow Claude work (not run strictly one-after-the-other).
 
 Also verifies PID single-instance lock is still wired in main().
@@ -23,9 +23,8 @@ _COMM_DEVICE_ROOT = Path(__file__).resolve().parent.parent
 if str(_COMM_DEVICE_ROOT) not in sys.path:
     sys.path.insert(0, str(_COMM_DEVICE_ROOT))
 
-# Must be set before importing tanya_bot (module raises if missing).
-os.environ.setdefault("TELEGRAM_TOKEN", "test-token-concurrency")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-concurrency")
+os.environ.setdefault("BLOOIO_API_KEY", "test-blooio-key")
 
 import tanya_bot as tb  # noqa: E402
 
@@ -39,38 +38,22 @@ def verify_pid_lock_wired_in_main() -> None:
         raise AssertionError("main() must call acquire_single_instance_lock()")
     if "release_single_instance_lock()" not in src:
         raise AssertionError("main() must call release_single_instance_lock()")
-    if "run_polling()" not in src:
-        raise AssertionError("main() must call run_polling()")
+    if "uvicorn.run(" not in src:
+        raise AssertionError("main() must call uvicorn.run()")
     acquire_i = src.index("acquire_single_instance_lock()")
-    poll_i = src.index("run_polling()")
+    run_i = src.index("uvicorn.run(")
     release_i = src.index("release_single_instance_lock()")
-    if not (acquire_i < poll_i < release_i):
+    if not (acquire_i < run_i < release_i):
         raise AssertionError(
-            "Expected acquire_single_instance_lock, then run_polling, then release in finally"
+            "Expected acquire_single_instance_lock, then uvicorn.run, then release in finally"
         )
 
 
-def _make_update(chat_id: int, first_name: str, text: str) -> MagicMock:
-    update = MagicMock()
-    update.effective_chat.id = chat_id
-    update.message.text = text
-    update.effective_user.first_name = first_name
-    update.message.reply_text = AsyncMock()
-    return update
-
-
-def _make_context() -> MagicMock:
-    ctx = MagicMock()
-    ctx.bot = AsyncMock()
-    return ctx
-
-
-async def run_parallel_handle_message_test() -> tuple[bool, float, list[tuple[str, float]]]:
-    """Return (overlap_ok, wall_seconds, events)."""
+async def run_parallel_coaching_test() -> tuple[bool, float]:
+    """Return (overlap_ok, wall_seconds)."""
     tmp = Path(tempfile.mkdtemp())
     events: list[tuple[str, int, float]] = []
 
-    # Minimal session state so handle_message skips begin_session_with_opening.
     tb.conversations.clear()
     tb.session_files.clear()
     tb.session_outlines.clear()
@@ -79,27 +62,26 @@ async def run_parallel_handle_message_test() -> tuple[bool, float, list[tuple[st
     tb.client_names.clear()
     tb.last_activity.clear()
     tb.timeout_tasks.clear()
-    tb.voice_enabled.clear()
 
-    for cid in (91001, 91002):
-        p = tmp / f"session_{cid}.md"
+    phones = ("+19100000001", "+19100000002")
+    for phone in phones:
+        p = tmp / f"session_{phone}.md"
         p.write_text("# Test session\n\n", encoding="utf-8")
-        tb.session_files[cid] = p
-        tb.session_outlines[cid] = "outline"
-        tb.session_profiles[cid] = ""
-        tb.session_numbers[cid] = 1
-        tb.conversations[cid] = []
+        tb.session_files[phone] = p
+        tb.session_outlines[phone] = "outline"
+        tb.session_profiles[phone] = ""
+        tb.session_numbers[phone] = 2
+        tb.conversations[phone] = [{"role": "assistant", "content": "Hi"}]
+        tb.client_names[phone] = "Test"
 
     call_seq = {"n": 0}
 
     async def slow_create(*args, **kwargs):
         i = call_seq["n"]
         call_seq["n"] += 1
-        t0 = time.perf_counter()
-        events.append(("start", i, t0))
+        events.append(("start", i, time.perf_counter()))
         await asyncio.sleep(CLAUDE_SLEEP_SEC)
-        t1 = time.perf_counter()
-        events.append(("end", i, t1))
+        events.append(("end", i, time.perf_counter()))
         response = MagicMock()
         response.content = [MagicMock(text=f"Reply {i}.")]
         u = MagicMock()
@@ -110,60 +92,56 @@ async def run_parallel_handle_message_test() -> tuple[bool, float, list[tuple[st
         response.usage = u
         return response
 
-    u1 = _make_update(91001, "UserA", "Hello A")
-    u2 = _make_update(91002, "UserB", "Hello B")
-    c1 = _make_context()
-    c2 = _make_context()
-
     t_wall0 = time.perf_counter()
     with (
-        patch.object(tb, "is_allowed", return_value=True),
+        patch.object(tb, "blooio_typing_on", new_callable=AsyncMock),
+        patch.object(tb, "should_block_unpaid_after_free_trial", new_callable=AsyncMock, return_value=False),
+        patch.object(tb, "has_tanyatalk_access", new_callable=AsyncMock, return_value=False),
+        patch.object(tb, "in_first_free_trial_session", new_callable=AsyncMock, return_value=False),
+        patch.object(tb, "select_frameworks_for_session", new_callable=AsyncMock, return_value=[]),
+        patch.object(tb, "start_cache_warming", lambda *_a, **_k: None),
+        patch.object(tb, "record_coaching_usage", lambda *_a, **_k: None),
         patch.object(tb, "reset_timeout", lambda *_a, **_k: None),
-        patch.object(tb, "send_with_voice", new_callable=AsyncMock),
-        patch.object(tb.claude.messages, "create", AsyncMock(side_effect=slow_create)),
+        patch.object(tb, "blooio_send_message", new_callable=AsyncMock),
+        patch.object(tb, "RESPONSE_DELAY_SECONDS", 0),
+        patch.object(tb, "_claude_create", AsyncMock(side_effect=slow_create)),
     ):
         await asyncio.gather(
-            tb.handle_message(u1, c1),
-            tb.handle_message(u2, c2),
+            tb._fire_coaching_message(phones[0], "UserA", "Hello A"),
+            tb._fire_coaching_message(phones[1], "UserB", "Hello B"),
         )
     wall = time.perf_counter() - t_wall0
 
     starts = sorted((e[2], e[1]) for e in events if e[0] == "start")
     ends = sorted((e[2], e[1]) for e in events if e[0] == "end")
-    if len(starts) != 2 or len(ends) != 2:
-        raise AssertionError(f"Expected 2 starts and 2 ends, got {events}")
+    if len(starts) < 2 or len(ends) < 2:
+        raise AssertionError(f"Expected at least 2 Claude calls, got {events}")
 
-    start_times = [s[0] for s in starts]
-    end_times = [e[0] for e in ends]
-    # True concurrency: both calls begin before either finishes.
-    overlap_ok = max(start_times) < min(end_times)
-    return overlap_ok, wall, [(e[0], e[1], e[2]) for e in events]
+    # True concurrency: some call begins before another finishes.
+    overlap_ok = max(s[0] for s in starts[:2]) < min(e[0] for e in ends[:2])
+    return overlap_ok, wall
 
 
 def main() -> None:
     print("=== PID lock wiring (static check of tanya_bot.main) ===")
     verify_pid_lock_wired_in_main()
-    print("OK: acquire_single_instance_lock() runs before run_polling();")
-    print("    release_single_instance_lock() runs in finally after run_polling().")
-    print("    (Second process still fails fast with O_EXCL on logs/tanya_bot.pid.)")
+    print("OK: acquire_single_instance_lock() runs before uvicorn.run();")
+    print("    release_single_instance_lock() runs in finally after uvicorn.run().")
     print()
 
-    print("=== Parallel Claude simulation (two chat_ids, asyncio.gather) ===")
-    overlap_ok, wall, events = asyncio.run(run_parallel_handle_message_test())
-    print(f"Wall-clock for 2x handle_message (each Claude mock sleeps {CLAUDE_SLEEP_SEC}s): {wall:.3f}s")
+    print("=== Parallel Claude simulation (two phones, asyncio.gather) ===")
+    overlap_ok, wall = asyncio.run(run_parallel_coaching_test())
+    print(f"Wall-clock for 2x _fire_coaching_message (each Claude mock sleeps {CLAUDE_SLEEP_SEC}s): {wall:.3f}s")
     print(f"If serialized: ~{2 * CLAUDE_SLEEP_SEC:.2f}s+ ; if parallel: ~{CLAUDE_SLEEP_SEC:.2f}s+")
-    for kind, idx, t in events:
-        print(f"  {kind:5s} call={idx} t={t:.6f}")
     print(f"Both starts before first end (parallel): {overlap_ok}")
     if not overlap_ok:
         raise SystemExit(1)
-    # Allow thread-pool file I/O + logging; should stay well under 2x CLAUDE_SLEEP if parallel.
     if wall > 2 * CLAUDE_SLEEP_SEC - 0.15:
         raise SystemExit(
             f"Wall time {wall:.3f}s looks serialized (expected < ~{2 * CLAUDE_SLEEP_SEC - 0.15:.2f}s for parallel)"
         )
     print()
-    print("PASS: two users’ Claude work overlapped in time.")
+    print("PASS: two clients' Claude work overlapped in time.")
 
 
 if __name__ == "__main__":

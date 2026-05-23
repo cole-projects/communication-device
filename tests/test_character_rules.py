@@ -10,8 +10,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("TELEGRAM_TOKEN", "fake-token")
 os.environ.setdefault("ANTHROPIC_API_KEY", "fake-key")
+os.environ.setdefault("BLOOIO_API_KEY", "fake-blooio-key")
 
 import tanya_bot
+import tanya_followup
 
 PASS = "\033[92mPASS\033[0m"
 FAIL = "\033[91mFAIL\033[0m"
@@ -44,15 +46,15 @@ check(
 )
 check(
     "Rule 4: No em dashes",
-    "Never use em dashes in any response" in prompt,
+    "Never use em dashes, en dashes, or hyphens as connective punctuation" in prompt,
 )
 check(
     "Rule 5: Calm/supportive tone",
     "Calm, supportive, emotionally attuned tone" in prompt,
 )
 check(
-    "Rule 6: Interruption handling",
-    "It felt like we got cut off" in prompt,
+    "Rule 6: Session close handled by system",
+    "session-end sign-off is handled by the system" in prompt,
 )
 check(
     "Rule 7: Voice note redirect in prompt",
@@ -67,73 +69,12 @@ check(
 )
 check(
     "No duplicate em dash rule in bot code",
-    prompt.count("Never use em dashes in any response") == 1,
+    prompt.count("Never use em dashes, en dashes, or hyphens as connective punctuation") == 1,
     "bot's own rule should appear exactly once (vault may reinforce separately)",
 )
 
 
-# ── Test 2: Voice note handler responses ──
-
-print("\n== Voice Note Handler ==")
-
-check(
-    "VOICE_REDIRECT_FIRST defined",
-    hasattr(tanya_bot, "VOICE_REDIRECT_FIRST")
-    and "I'd love to hear your voice" in tanya_bot.VOICE_REDIRECT_FIRST,
-)
-check(
-    "VOICE_REDIRECT_REPEAT defined",
-    hasattr(tanya_bot, "VOICE_REDIRECT_REPEAT")
-    and "Text helps me be fully present" in tanya_bot.VOICE_REDIRECT_REPEAT,
-)
-check(
-    "First and repeat are different messages",
-    tanya_bot.VOICE_REDIRECT_FIRST != tanya_bot.VOICE_REDIRECT_REPEAT,
-)
-
-# Simulate counter logic: 1st, 2nd, 3rd voice note
-fake_chat = -999
-tanya_bot.voice_note_redirects[fake_chat] = 0
-
-count_0 = tanya_bot.voice_note_redirects[fake_chat]
-first_response = count_0 == 0
-tanya_bot.voice_note_redirects[fake_chat] = count_0 + 1
-
-count_1 = tanya_bot.voice_note_redirects[fake_chat]
-second_response = count_1 != 0
-tanya_bot.voice_note_redirects[fake_chat] = count_1 + 1
-
-count_2 = tanya_bot.voice_note_redirects[fake_chat]
-third_response = count_2 != 0
-
-check("1st voice note → first redirect (count==0)", first_response)
-check("2nd voice note → repeat redirect (count==1)", second_response)
-check("3rd voice note → repeat redirect (count==2)", third_response)
-
-# Cleanup
-tanya_bot.voice_note_redirects.pop(fake_chat, None)
-
-
-# ── Test 3: Voice note counter resets on session start/end ──
-
-print("\n== Voice Counter Session Lifecycle ==")
-
-check(
-    "voice_note_redirects dict exists",
-    hasattr(tanya_bot, "voice_note_redirects")
-    and isinstance(tanya_bot.voice_note_redirects, dict),
-)
-
-# Simulate session end clearing the counter
-tanya_bot.voice_note_redirects[-888] = 3
-tanya_bot.voice_note_redirects.pop(-888, None)
-check(
-    "Counter cleared on pop (simulated session end)",
-    -888 not in tanya_bot.voice_note_redirects,
-)
-
-
-# ── Test 4: Follow-up threshold ──
+# ── Test 2: Follow-up threshold ──
 
 print("\n== Follow-Up Minimum Exchange Threshold ==")
 
@@ -179,14 +120,22 @@ check(
     len(exact_history) >= tanya_bot.MIN_EXCHANGES_FOR_FOLLOWUP,
 )
 
+# ── Test 3: Follow-up session minimum ──
 
-# ── Test 5: Voice handler registered for VOICE and AUDIO filters ──
-
-print("\n== Handler Registration ==")
+print("\n== Follow-Up Session Minimum ==")
 
 check(
-    "handle_voice_note function exists",
-    hasattr(tanya_bot, "handle_voice_note") and callable(tanya_bot.handle_voice_note),
+    "MIN_SESSION_NUM_FOR_FOLLOWUP == 2",
+    tanya_followup.MIN_SESSION_NUM_FOR_FOLLOWUP == 2,
+    f"actual value: {tanya_followup.MIN_SESSION_NUM_FOR_FOLLOWUP}",
+)
+check(
+    "Session 1 is below follow-up threshold",
+    1 < tanya_followup.MIN_SESSION_NUM_FOR_FOLLOWUP,
+)
+check(
+    "Session 2 is eligible for follow-up",
+    2 >= tanya_followup.MIN_SESSION_NUM_FOR_FOLLOWUP,
 )
 
 

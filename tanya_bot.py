@@ -63,26 +63,43 @@ BLOOIO_WEBHOOK_SECRET = os.getenv("BLOOIO_WEBHOOK_SECRET", "").strip()
 BLOOIO_PHONE_NUMBER = os.getenv("BLOOIO_PHONE_NUMBER", "+13177282783").strip()
 ADMIN_PHONE_NUMBERS = os.getenv("ADMIN_PHONE_NUMBERS", "").strip()
 ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
+REPORT_ERROR_KEY = os.getenv("REPORT_ERROR_KEY", "").strip() or ADMIN_KEY
 GITHUB_ISSUES_PAT = os.getenv("GITHUB_ISSUES_PAT", "").strip()
 BLOOIO_BASE_URL = "https://backend.blooio.com/v2/api"
 TANYA_PUBLIC_URL = os.getenv("TANYA_PUBLIC_URL", "https://worker-production-32fb.up.railway.app").rstrip("/")
+
+
+def normalize_phone(phone: str) -> str:
+    """Canonical E.164 (+1XXXXXXXXXX for US) — matches Blooio sender format."""
+    s = re.sub(r"\s+", "", phone.strip())
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return s
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return f"+{digits}"
+
+
+def _phones_from_env(*keys: str) -> frozenset[str]:
+    raw = ""
+    for key in keys:
+        raw = os.getenv(key, "")
+        if raw:
+            break
+    return frozenset(normalize_phone(x) for x in raw.split(",") if x.strip())
+
+
 # After free trial, block coaching unless paid / MESH / bypass (set 0 for local dev if needed).
 BLOCK_AFTER_FREE_TRIAL = os.getenv("BLOCK_AFTER_FREE_TRIAL", "1").lower() in ("1", "true", "yes")
-_POST_TRIAL_BYPASS_PHONES: frozenset[str] = frozenset(
-    x.strip().lstrip("+")
-    for x in os.getenv("POST_TRIAL_BYPASS_PHONES", os.getenv("POST_TRIAL_ALLOW_PHONES", "")).split(",")
-    if x.strip()
-)
+_POST_TRIAL_BYPASS_PHONES: frozenset[str] = _phones_from_env("POST_TRIAL_BYPASS_PHONES", "POST_TRIAL_ALLOW_PHONES")
+_MESH_PHONES: frozenset[str] = _phones_from_env("MESH_PHONES")
+_ADMIN_PHONES: frozenset[str] = _phones_from_env("ADMIN_PHONE_NUMBERS")
 
 
 def _is_bypass_phone(phone: str) -> bool:
-    return phone.lstrip("+") in _POST_TRIAL_BYPASS_PHONES
-# Phones included in a MESH package (TanyaTalk access without a direct Stripe subscription)
-_MESH_PHONES: frozenset[str] = frozenset(
-    x.strip()
-    for x in os.getenv("MESH_PHONES", "").split(",")
-    if x.strip()
-)
+    return normalize_phone(phone) in _POST_TRIAL_BYPASS_PHONES
 
 # Optional: log approximate USD per API call (coaching messages). Set to 0/false to show tokens only.
 # Prices are per 1M tokens — confirm against https://www.anthropic.com/pricing for your model.
@@ -114,7 +131,8 @@ POST_FREE_TRIAL_BLOCK_MESSAGE = (
 )
 POST_TRIAL_RESET_DENIED_MESSAGE = (
     "That cannot start another free session. Your trial is complete. "
-    "Subscribe through TanyaTalk when you are ready, and we continue from there."
+    "Subscribe through TanyaTalk when you are ready, and we continue from there. "
+    "Reply yes if you would like me to send you the link to continue."
 )
 
 _TANYA_PHOTO_B64 = (
@@ -262,7 +280,7 @@ def build_daily_cap_message() -> str:
     except Exception:
         tz = ZoneInfo("America/New_York")
     target = _round_up_to_10min(datetime.datetime.now(tz) + datetime.timedelta(hours=24))
-    time_str = target.strftime("%-I:%M%p").lower()
+    time_str = target.strftime("%I:%M%p").lstrip("0").lower()
     return (
         f"I can only take on a limited number of new people each day. "
         f"Once you're in, you're in, this is the only time you'll ever see this. "
@@ -351,8 +369,7 @@ _http = httpx.AsyncClient()
 
 def phone_to_hash(phone: str) -> str:
     """SHA-256 of normalized E.164 phone. Used for ALL file paths and log identifiers."""
-    normalized = re.sub(r"\s+", "", phone)
-    return hashlib.sha256(normalized.encode()).hexdigest()
+    return hashlib.sha256(normalize_phone(phone).encode()).hexdigest()
 
 
 def _phone_key(phone: str) -> str:
@@ -361,9 +378,7 @@ def _phone_key(phone: str) -> str:
 
 
 def is_admin_phone(phone: str) -> bool:
-    if not ADMIN_PHONE_NUMBERS:
-        return False
-    return phone in {p.strip() for p in ADMIN_PHONE_NUMBERS.split(",") if p.strip()}
+    return normalize_phone(phone) in _ADMIN_PHONES
 
 
 async def blooio_typing_on(phone: str) -> None:
@@ -592,6 +607,7 @@ def _write_path_utf8(path: Path, text: str) -> None:
 _BOT_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = _BOT_DIR / "audio"
 AUDIO_DIR.mkdir(exist_ok=True)
+AUDIO_RETENTION_SEC = 3600  # keep MP3s long enough for Blooio/CDN retries
 COACHING_BLEND_CONFIG_PATH = _BOT_DIR / "logs" / "coaching_blend.json"
 PID_FILE_PATH = _BOT_DIR / "logs" / "tanya_bot.pid"
 USAGE_CSV_PATH = _BOT_DIR / "logs" / "tanya_usage.csv"
@@ -654,7 +670,29 @@ def mark_vault_dirty() -> None:
     _vault_dirty = True
 
 
-def _do_vault_push() -> None:
+def _vault_has_unpushed_work(vault: Path) -> bool:
+    """True if the vault has uncommitted changes or commits not yet pushed."""
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(vault), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if status.stdout.strip():
+            return True
+        ahead = subprocess.run(
+            ["git", "-C", str(vault), "rev-list", "--count", "@{upstream}..HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if ahead.returncode == 0:
+            count = ahead.stdout.strip()
+            if count.isdigit() and int(count) > 0:
+                return True
+    except Exception as e:
+        logger.warning("Could not check vault git status: %s", e)
+    return False
+
+
+def _do_vault_push() -> bool:
     """Run git add/commit/push synchronously inside a thread. Caller holds _VAULT_GIT_LOCK."""
     vault = Path(VAULT_PATH)
     try:
@@ -665,24 +703,26 @@ def _do_vault_push() -> None:
         )
         if not status.stdout.strip():
             logger.info("No vault changes to push")
-            return
+            return True
         result = subprocess.run(
             ["git", "-C", str(vault), "commit", "-m", "Vault sync"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
             logger.error("git commit failed: %s", result.stderr)
-            return
+            return False
         result = subprocess.run(
             ["git", "-C", str(vault), "push"],
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode != 0:
             logger.error("git push failed: %s", result.stderr)
-        else:
-            logger.info("Vault pushed successfully")
+            return False
+        logger.info("Vault pushed successfully")
+        return True
     except Exception as e:
         logger.error("Failed to push vault changes: %s", e)
+        return False
 
 
 async def _vault_push_loop() -> None:
@@ -698,14 +738,25 @@ async def _vault_push_loop() -> None:
         vault = Path(VAULT_PATH)
         if not (vault / ".git").exists():
             continue
-        _vault_dirty = False
-        def _push_locked() -> None:
+
+        def _push_locked() -> bool:
             with _VAULT_GIT_LOCK:
-                _do_vault_push()
-        await asyncio.to_thread(_push_locked)
+                return _do_vault_push()
+
+        success = await asyncio.to_thread(_push_locked)
+        if success:
+            _vault_dirty = await asyncio.to_thread(_vault_has_unpushed_work, vault)
+        # On failure, leave _vault_dirty True so the next cycle retries.
 
 
 SESSION_SNAPSHOT_PATH = _BOT_DIR / "logs" / "session_snapshot.json"
+PENDING_FINALIZE_PATH = _BOT_DIR / "logs" / "pending_session_finalize.json"
+ONBOARDING_CHECKPOINT_PATH = _BOT_DIR / "logs" / "onboarding_checkpoints.json"
+_pending_finalize_file_lock = threading.Lock()
+_onboarding_checkpoint_lock = threading.Lock()
+_WHOLE_SESSION_FILE_RE = re.compile(r"^Session (\d+)\.md$")
+_DABBLE_SESSION_FILE_RE = re.compile(r"^Session (\d+)\.(\d+)\.md$")
+_finalize_tasks: set[asyncio.Task] = set()
 USAGE_CSV_FIELDNAMES = [
     "log_id",
     "timestamp",
@@ -980,6 +1031,7 @@ async def mark_free_trial_completed(phone: str) -> None:
     ph = phone_to_hash(phone)
     free_trial_completed[phone] = True
     await billing_db.mark_trial_completed(ph)
+    tanya_followup.cancel_all_followup_jobs_for_chat(phone)
 
 
 async def in_first_free_trial_session(phone: str) -> bool:
@@ -988,12 +1040,19 @@ async def in_first_free_trial_session(phone: str) -> bool:
     return not await _has_completed_free_trial(phone)
 
 
-async def _check_monthly_cap_for_followup(phone: str) -> bool:
-    """Async cap check passed to tanya_followup — True when client has no messages left."""
+async def _is_at_monthly_message_cap(phone: str) -> bool:
+    """True when a paid subscriber has used all base + top-up messages this billing period."""
+    if not await has_tanyatalk_access(phone) or _is_bypass_phone(phone):
+        return False
     ph = phone_to_hash(phone)
     count = await billing_db.get_monthly_message_count(ph)
     extra = await billing_db.get_extra_messages(ph)
     return count >= MONTHLY_MESSAGE_CAP + extra
+
+
+async def _check_monthly_cap_for_followup(phone: str) -> bool:
+    """Async cap check passed to tanya_followup — True when client has no messages left."""
+    return await _is_at_monthly_message_cap(phone)
 
 
 conversations: dict[str, list[dict]] = {}
@@ -1023,6 +1082,7 @@ _debounce_tasks: dict[str, asyncio.Task] = {}
 _typing_tasks: dict[str, asyncio.Task] = {}   # 3-second typing bubble timer
 awaiting_delete_confirmation: dict[str, bool] = {}
 awaiting_topup_confirmation: dict[str, bool] = {}
+topup_link_sent: dict[str, bool] = {}  # link delivered; cap gate stays until Stripe webhook credits
 new_client_voice_followup_snippet: dict[str, str] = {}  # kept for opener context; TTS not sent over iMessage
 
 MAX_HISTORY = 40
@@ -1148,6 +1208,34 @@ async def synthesize_and_host_voice(text: str) -> str | None:
     audio_path = AUDIO_DIR / filename
     audio_path.write_bytes(audio_bytes)
     return f"{TANYA_PUBLIC_URL}/audio/{filename}"
+
+
+def _cleanup_stale_audio_files(max_age_sec: float = AUDIO_RETENTION_SEC) -> int:
+    """Remove hosted voice MP3s older than max_age_sec."""
+    if not AUDIO_DIR.exists():
+        return 0
+    cutoff = datetime.datetime.now().timestamp() - max_age_sec
+    removed = 0
+    for path in AUDIO_DIR.glob("*.mp3"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+async def _audio_cleanup_loop() -> None:
+    """Periodically delete expired hosted voice files."""
+    while True:
+        await asyncio.sleep(600)
+        try:
+            removed = await asyncio.to_thread(_cleanup_stale_audio_files)
+            if removed:
+                logger.info("Cleaned up %d stale audio file(s)", removed)
+        except Exception as e:
+            logger.warning("Audio cleanup failed: %s", e)
 
 
 async def blooio_send_audio(phone: str, audio_url: str) -> None:
@@ -1404,20 +1492,47 @@ def profile_indicates_prior_session(content: str) -> bool:
     return False
 
 
+def _whole_session_files(session_dir: Path) -> list[Path]:
+    """Session N.md only — excludes dabble sub-sessions like Session 1.1.md."""
+    if not session_dir.exists():
+        return []
+    return [f for f in session_dir.iterdir() if _WHOLE_SESSION_FILE_RE.fullmatch(f.name)]
+
+
+def _dabble_session_files(session_dir: Path) -> list[Path]:
+    if not session_dir.exists():
+        return []
+    return [f for f in session_dir.iterdir() if _DABBLE_SESSION_FILE_RE.fullmatch(f.name)]
+
+
+def _session_one_completed_on_disk(phone_hash: str) -> bool:
+    """True when Session 1.md exists and was closed normally (not a quiet dabble archive)."""
+    session_file = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash / "Session 1.md"
+    if not session_file.exists():
+        return False
+    try:
+        return "<!-- session:closed -->" in session_file.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
 def is_returning_client(phone_hash: str) -> bool:
-    """True if a real profile exists with session evidence, or if prior session files exist on disk."""
+    """True after a completed whole session — not after quiet free-trial dabbles only."""
     session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
-    if session_dir.exists():
-        prior_sessions = [
-            f for f in session_dir.iterdir()
-            if f.name.startswith("Session ") and f.suffix == ".md"
-        ]
-        if len(prior_sessions) > 1:
+    whole = _whole_session_files(session_dir)
+    for f in whole:
+        m = _WHOLE_SESSION_FILE_RE.fullmatch(f.name)
+        if m and int(m.group(1)) >= 2:
             return True
+    if _session_one_completed_on_disk(phone_hash):
+        return True
+    # Dabble-only clients (1.1, 1.2, …) stay on the new-client onboarding path.
+    if _dabble_session_files(session_dir) and not whole:
+        return False
     path = profile_path_for(phone_hash)
     if not path.exists():
         return False
-    return profile_indicates_prior_session(load_file(path))
+    return profile_indicates_prior_session(load_file(path)) and bool(whole)
 
 
 def _detect_interrupted_previous_session(phone_hash: str, current_session_num: int) -> bool:
@@ -1898,12 +2013,92 @@ Reflective phrases like "that's real," "that lands," or "that's deep" are powerf
 # ---------------------------------------------------------------------------
 
 def get_next_session_number(phone_hash: str) -> int:
-    """Count existing Session N.md files and return the next number."""
+    """Next whole session number; dabble files (Session 1.1.md) do not advance the counter."""
     session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
-    if not session_dir.exists():
+    whole = _whole_session_files(session_dir)
+    if not whole:
         return 1
-    existing = [f for f in session_dir.iterdir() if f.name.startswith("Session ") and f.suffix == ".md"]
-    return len(existing) + 1
+    nums = []
+    for f in whole:
+        m = _WHOLE_SESSION_FILE_RE.fullmatch(f.name)
+        if m:
+            nums.append(int(m.group(1)))
+    return max(nums) + 1
+
+
+def get_next_dabble_subsession_label(phone_hash: str) -> str:
+    """Next free-trial dabble label for session 1: 1.1, 1.2, …"""
+    session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
+    max_sub = 0
+    for f in _dabble_session_files(session_dir):
+        m = _DABBLE_SESSION_FILE_RE.fullmatch(f.name)
+        if m and m.group(1) == "1":
+            max_sub = max(max_sub, int(m.group(2)))
+    return f"1.{max_sub + 1}"
+
+
+def archive_active_session_to_dabble(phone_hash: str, session_path: Path) -> tuple[Path, str]:
+    """Rename the active Session 1 file to Session 1.x and return (new_path, label)."""
+    label = get_next_dabble_subsession_label(phone_hash)
+    new_path = session_path.parent / f"Session {label}.md"
+    text = session_path.read_text(encoding="utf-8")
+    old_label = session_path.stem.replace("Session ", "", 1)
+    text = text.replace(f"# Session {old_label} —", f"# Session {label} —", 1)
+    new_path.write_text(text, encoding="utf-8")
+    session_path.unlink()
+    logger.info(
+        "Archived quiet dabble for phone_key=%s → Session %s",
+        phone_hash[:12],
+        label,
+    )
+    return new_path, label
+
+
+def _load_onboarding_checkpoints() -> dict[str, dict]:
+    with _onboarding_checkpoint_lock:
+        if not ONBOARDING_CHECKPOINT_PATH.exists():
+            return {}
+        try:
+            data = json.loads(ONBOARDING_CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Could not load onboarding checkpoints: %s", e)
+            return {}
+
+
+def _save_onboarding_checkpoints(data: dict[str, dict]) -> None:
+    with _onboarding_checkpoint_lock:
+        ONBOARDING_CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ONBOARDING_CHECKPOINT_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def save_onboarding_checkpoint(
+    phone_hash: str,
+    *,
+    pending_first_message_opener: bool,
+    awaiting_contact_save: bool,
+) -> None:
+    checkpoints = _load_onboarding_checkpoints()
+    checkpoints[phone_hash] = {
+        "pending_first_message_opener": pending_first_message_opener,
+        "awaiting_contact_save": awaiting_contact_save,
+        "saved_at": datetime.datetime.now(timezone.utc).isoformat(),
+    }
+    _save_onboarding_checkpoints(checkpoints)
+    logger.info(
+        "Onboarding checkpoint saved for phone_key=%s opener=%s contact_save=%s",
+        phone_hash[:12],
+        pending_first_message_opener,
+        awaiting_contact_save,
+    )
+
+
+def pop_onboarding_checkpoint(phone_hash: str) -> dict | None:
+    checkpoints = _load_onboarding_checkpoints()
+    ckpt = checkpoints.pop(phone_hash, None)
+    if ckpt is not None:
+        _save_onboarding_checkpoints(checkpoints)
+    return ckpt
 
 
 def start_session_file(phone_hash: str, client_name: str, session_num: int) -> Path:
@@ -1941,6 +2136,104 @@ def append_exchange(session_file: Path, client_name: str, client_msg: str, tanya
             f.write(f"**Tanya:** {tanya_msg}\n\n")
     except Exception as e:
         logger.error("Failed to append to session file: %s", e)
+
+
+def history_from_session_file(session_path: Path, client_name: str) -> list[dict]:
+    """Rebuild conversation history from a session markdown file (for finalize retry)."""
+    try:
+        text = session_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("Could not read session file for history rebuild: %s", e)
+        return []
+    text = text.split("<!-- session:closed -->")[0]
+    text = _strip_follow_up_extraction_section(text)
+    if "---" in text:
+        text = text.split("---", 1)[1]
+    history: list[dict] = []
+    for match in re.finditer(r"\*\*(.+?):\*\* (.+?)(?=\n\n\*\*|\Z)", text.strip(), re.DOTALL):
+        speaker, content = match.group(1).strip(), match.group(2).strip()
+        if speaker.lower() == "tanya":
+            history.append({"role": "assistant", "content": content})
+        else:
+            history.append({"role": "user", "content": content})
+    return history
+
+
+def _load_pending_finalizes() -> dict[str, dict]:
+    with _pending_finalize_file_lock:
+        if not PENDING_FINALIZE_PATH.exists():
+            return {}
+        try:
+            data = json.loads(PENDING_FINALIZE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Could not load pending finalize queue: %s", e)
+            return {}
+
+
+def _save_pending_finalizes(jobs: dict[str, dict]) -> None:
+    with _pending_finalize_file_lock:
+        PENDING_FINALIZE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PENDING_FINALIZE_PATH.write_text(json.dumps(jobs, indent=2), encoding="utf-8")
+
+
+def _pending_finalize_job_id(ph: str, session_num: int, session_label: str | None = None) -> str:
+    return f"{ph}:{session_label or session_num}"
+
+
+def _enqueue_pending_finalize(
+    phone: str,
+    ph: str,
+    client_name: str,
+    session_num: int,
+    session_path: Path | None,
+    *,
+    session_label: str | None = None,
+    is_dabble: bool = False,
+) -> None:
+    jobs = _load_pending_finalizes()
+    job_id = _pending_finalize_job_id(ph, session_num, session_label)
+    jobs[job_id] = {
+        "phone": phone,
+        "ph": ph,
+        "client_name": client_name,
+        "session_num": session_num,
+        "session_label": session_label,
+        "is_dabble": is_dabble,
+        "session_path": str(session_path) if session_path else "",
+        "queued_at": datetime.datetime.now(timezone.utc).isoformat(),
+    }
+    _save_pending_finalizes(jobs)
+    display = session_label or str(session_num)
+    logger.info("Queued session finalize for phone_key=%s session %s", ph[:12], display)
+
+
+def _dequeue_pending_finalize(ph: str, session_num: int, session_label: str | None = None) -> None:
+    jobs = _load_pending_finalizes()
+    job_id = _pending_finalize_job_id(ph, session_num, session_label)
+    if job_id in jobs:
+        jobs.pop(job_id)
+        _save_pending_finalizes(jobs)
+
+
+def _profile_includes_session(profile: str, session_num: int, session_label: str | None = None) -> bool:
+    if session_label:
+        return f"Session {session_label}|" in profile
+    return f"Session {session_num}|" in profile
+
+
+def _session_has_follow_up_extraction(session_path: Path) -> bool:
+    try:
+        return "## Follow-Up Extraction" in session_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def _session_is_finalized(session_path: Path) -> bool:
+    try:
+        return "<!-- session:finalized -->" in session_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
 
 
 def _strip_follow_up_extraction_section(text: str) -> str:
@@ -2008,7 +2301,7 @@ Use concise phrases. No em dashes. No space before commas."""
 
 
 async def merge_focus_for_next_session_profile(phone: str, problem_one_liner: str) -> None:
-    """Append a focus line to ## Focus for Next Session in the vault profile (mini-session)."""
+    """Append check-in context to ## Focus for Next Session in the vault profile (mini-session)."""
     ph = phone_to_hash(phone)
     path = profile_path_for(ph)
     if not path.exists():
@@ -2017,7 +2310,12 @@ async def merge_focus_for_next_session_profile(phone: str, problem_one_liner: st
     existing = await asyncio.to_thread(load_file, path)
     needle = "## Focus for Next Session"
     idx = existing.find(needle)
-    bullet = f"- (from check-in) {problem_one_liner.strip()}\n"
+    text = problem_one_liner.strip()
+    if "\n" in text:
+        indented = "\n".join(f"  {line}" for line in text.splitlines() if line.strip())
+        bullet = f"- (from check-in)\n{indented}\n"
+    else:
+        bullet = f"- (from check-in) {text}\n"
     if idx == -1:
         addition = f"\n\n{needle}\n{bullet}"
         new_text = existing.rstrip() + addition
@@ -2031,7 +2329,14 @@ async def merge_focus_for_next_session_profile(phone: str, problem_one_liner: st
     logger.info("Focus for Next Session updated for phone_key=%s", phone_to_hash(phone)[:12])
 
 
-async def update_client_profile(phone_hash: str, client_name: str, session_num: int, history: list):
+async def update_client_profile(
+    phone_hash: str,
+    client_name: str,
+    session_num: int,
+    history: list,
+    *,
+    session_label: str | None = None,
+):
     """Ask Claude to update (or create) the client profile based on the completed session."""
     if not history:
         return
@@ -2039,7 +2344,8 @@ async def update_client_profile(phone_hash: str, client_name: str, session_num: 
     existing_profile = await asyncio.to_thread(load_client_profile, phone_hash)
     template = await asyncio.to_thread(load_file, template_path())
     today = datetime.date.today().isoformat()
-    session_link = f"[[02-Client-Sessions/{phone_hash}/Session {session_num}|Session {session_num}]]"
+    display = session_label or str(session_num)
+    session_link = f"[[02-Client-Sessions/{phone_hash}/Session {display}|Session {display}]]"
 
     transcript_lines = []
     for msg in history:
@@ -2078,7 +2384,7 @@ Here is the existing profile for {client_name}:
 
 {existing_profile}
 
-Here is the transcript from Session {session_num} ({today}):
+Here is the transcript from Session {display} ({today}):
 
 {transcript}
 
@@ -2095,7 +2401,7 @@ Use this template as your format:
 
 {template}
 
-Here is the transcript from Session {session_num} with {client_name} ({today}):
+Here is the transcript from Session {display} with {client_name} ({today}):
 
 {transcript}
 
@@ -2115,18 +2421,41 @@ Return ONLY the completed profile markdown — nothing else."""
         updated_profile = response.content[0].text.strip()
         updated_profile = cap_profile_sessions(updated_profile)
         await asyncio.to_thread(_write_path_utf8, profile_path_for(phone_hash), updated_profile)
-        logger.info("Profile updated for hash %s (session %d)", phone_hash[:12], session_num)
+        logger.info("Profile updated for hash %s (session %s)", phone_hash[:12], display)
     except Exception as e:
         logger.error("Profile update failed for hash %s: %s", phone_hash[:12], e)
 
 
-async def update_vault_index_files(phone_hash: str, client_name: str, session_num: int, today: str, profile: str, transcript: str):
+async def update_vault_index_files(
+    phone_hash: str,
+    client_name: str,
+    session_num: int,
+    today: str,
+    profile: str,
+    transcript: str,
+    *,
+    session_label: str | None = None,
+    is_dabble: bool = False,
+):
     """Use Claude to update Client Hub and 02-Client-Sessions.md to stay in sync."""
     async with _VAULT_INDEX_LOCK:
-        await _update_vault_index_files_locked(phone_hash, client_name, session_num, today, profile, transcript)
+        await _update_vault_index_files_locked(
+            phone_hash, client_name, session_num, today, profile, transcript,
+            session_label=session_label, is_dabble=is_dabble,
+        )
 
 
-async def _update_vault_index_files_locked(phone_hash: str, client_name: str, session_num: int, today: str, profile: str, transcript: str):
+async def _update_vault_index_files_locked(
+    phone_hash: str,
+    client_name: str,
+    session_num: int,
+    today: str,
+    profile: str,
+    transcript: str,
+    *,
+    session_label: str | None = None,
+    is_dabble: bool = False,
+):
     hub_path = Path(VAULT_PATH) / "02-Client-Sessions" / "Client Hub.md"
     index_path = Path(VAULT_PATH) / "02-Client-Sessions.md"
 
@@ -2138,10 +2467,19 @@ async def _update_vault_index_files_locked(phone_hash: str, client_name: str, se
         return
 
     today_dt = datetime.datetime.strptime(today, "%Y-%m-%d")
-    today_display = today_dt.strftime("%b %-d, %Y")
+    today_display = f"{today_dt.strftime('%b')} {today_dt.day}, {today_dt.year}"
+    display = session_label or str(session_num)
+    dabble_note = ""
+    if is_dabble:
+        dabble_note = """
+IMPORTANT — this was a brief free-trial dabble (sub-session), NOT a completed whole session:
+- Do NOT increment the client's session count in "All Clients — Session History".
+- Do NOT increment the transcript count at the bottom of 02-Client-Sessions.md.
+- You may still add the client to lists if they are new, and append the sub-session link under their section.
+"""
 
     prompt = f"""You are updating two vault index files for Tanya's MESH Coaching practice after a session with {client_name} on {today} ({today_display}).
-
+{dabble_note}
 Here is the client's updated profile:
 
 {profile}
@@ -2160,7 +2498,7 @@ Here is the current Client Hub:
 
 Update it as follows:
 - In "Clients With Profiles": if {client_name} is not already listed, add them with a one-line summary in this exact format: `- [[02-Client-Sessions/Client Profiles/{phone_hash}|{client_name}]] — [Primary wound] / [Secondary wound] · [Stage] · [One-line key focus]`. Use the existing entries as the format reference.
-- In "All Clients — Session History" table: if {client_name} is already listed, increment their session count by 1 and update their profile link to `[[02-Client-Sessions/Client Profiles/{phone_hash}|Profile]]` if not already there — never remove their existing row. If they are not listed, add them alphabetically with session count 1 and profile link.
+- In "All Clients — Session History" table: if {client_name} is already listed, increment their session count by 1 and update their profile link to `[[02-Client-Sessions/Client Profiles/{phone_hash}|Profile]]` if not already there — never remove their existing row. If they are not listed, add them alphabetically with session count 1 and profile link. Do NOT increment session count for dabble sub-sessions (see note above).
 - Update the `*Last updated:*` date at the bottom to {today}.
 - Do not change anything else.
 
@@ -2176,13 +2514,13 @@ Here is the current 02-Client-Sessions.md:
 
 Update it as follows:
 - In the profiles line at the top (starting with `> Clients with a profile`): if {client_name} is not already listed, add `[[02-Client-Sessions/Client Profiles/{phone_hash}|{client_name}]]` alphabetically in the list.
-- In the Clients section: if {client_name} already has a section, append a new session line `- [[02-Client-Sessions/{phone_hash}/Session {session_num}|Session {session_num} — {today_display}]]` under their existing session links — never remove or replace previous session links. Update the primary themes line only if new themes emerged. If {client_name} does not have a section yet, add one alphabetically in this format:
+- In the Clients section: if {client_name} already has a section, append a new session line `- [[02-Client-Sessions/{phone_hash}/Session {display}|Session {display} — {today_display}]]` under their existing session links — never remove or replace previous session links. Update the primary themes line only if new themes emerged. If {client_name} does not have a section yet, add one alphabetically in this format:
 ```
 ### {client_name}
-- [[02-Client-Sessions/{phone_hash}/Session {session_num}|Session {session_num} — {today_display}]]
+- [[02-Client-Sessions/{phone_hash}/Session {display}|Session {display} — {today_display}]]
 *Primary themes: [2-3 key themes from the session]*
 ```
-- Update the `*Last updated:*` line at the bottom — increment the transcript count by 1.
+- Update the `*Last updated:*` line at the bottom — increment the transcript count by 1 unless this was a dabble sub-session (see note above).
 - Do not change anything else.
 
 Return ONLY the full updated 02-Client-Sessions.md markdown.
@@ -2504,32 +2842,53 @@ def cancel_session_timeout(phone: str) -> None:
         timeout_tasks[phone].cancel()
 
 
-async def end_session(phone: str):
-    """Transcript already written in real time — update profile + vault indexes, then clear state."""
-    ph = phone_to_hash(phone)
-    client_name = client_names.get(phone, "Client")
-    history = conversations.get(phone, [])
-    session_num = session_numbers.get(phone, 1)
-    session_path = session_files.get(phone)
-
-    # Write close marker so crash detection can distinguish a clean close from a crash
-    if session_path and session_path.exists():
-        try:
-            with session_path.open("a", encoding="utf-8") as f:
-                f.write("\n<!-- session:closed -->\n")
-        except Exception as e:
-            logger.warning("Could not write session close marker: %s", e)
-
-    if history:
-        logger.info("Ending session for hash %s session %d (%d messages)", ph[:12], session_num, len(history))
+async def _finalize_session_writes(
+    phone: str,
+    ph: str,
+    client_name: str,
+    history: list[dict],
+    session_num: int,
+    session_path: Path | None,
+    *,
+    session_label: str | None = None,
+    is_dabble: bool = False,
+) -> bool:
+    """Profile update, vault indexes, follow-up — runs after in-memory session state is cleared."""
+    if not history:
+        return True
+    display = session_label or str(session_num)
+    try:
+        logger.info(
+            "Ending session for hash %s session %s (%d messages)%s",
+            ph[:12], display, len(history), " [dabble]" if is_dabble else "",
+        )
         today = datetime.date.today().isoformat()
 
-        try:
-            await update_client_profile(ph, client_name, session_num, history)
-        except Exception as e:
-            logger.error("Profile update failed for phone_key=%s session=%d: %s", ph[:12], session_num, e)
+        profile = await asyncio.to_thread(load_client_profile, ph) or ""
+        if not is_dabble and _profile_includes_session(profile, session_num, session_label):
+            logger.info(
+                "Profile already includes session %s for phone_key=%s; skipping profile update",
+                display, ph[:12],
+            )
+        else:
+            try:
+                await update_client_profile(
+                    ph, client_name, session_num, history, session_label=session_label,
+                )
+            except Exception as e:
+                logger.error(
+                    "Profile update failed for phone_key=%s session=%s: %s",
+                    ph[:12], display, e,
+                )
+                return False
+            profile = await asyncio.to_thread(load_file, profile_path_for(ph))
+            if not _profile_includes_session(profile or "", session_num, session_label):
+                logger.error(
+                    "Profile missing session %s after update for phone_key=%s",
+                    display, ph[:12],
+                )
+                return False
 
-        profile = await asyncio.to_thread(load_file, profile_path_for(ph))
         transcript_lines = []
         for msg in history:
             role = "Tanya" if msg["role"] == "assistant" else client_name
@@ -2537,26 +2896,126 @@ async def end_session(phone: str):
         transcript = "\n".join(transcript_lines)
 
         user_turns = sum(1 for m in history if m["role"] == "user")
-        if session_path and user_turns >= MIN_EXCHANGES_FOR_FOLLOWUP and await has_tanyatalk_access(phone):
-            ended_at = datetime.datetime.now(timezone.utc)
-            await append_follow_up_extraction(
-                session_path, client_name, session_num, history, ended_at
-            )
-            tanya_followup.schedule_follow_up_1(
-                phone, client_name, session_path, session_num, ended_at
+        paid = await has_tanyatalk_access(phone)
+        if (
+            not is_dabble
+            and session_path
+            and session_num >= tanya_followup.MIN_SESSION_NUM_FOR_FOLLOWUP
+            and user_turns >= MIN_EXCHANGES_FOR_FOLLOWUP
+            and paid
+        ):
+            ended_at = tanya_followup._session_ended_at_from_extraction(session_path)
+            if not _session_has_follow_up_extraction(session_path):
+                ended_at = datetime.datetime.now(timezone.utc)
+                await append_follow_up_extraction(
+                    session_path, client_name, session_num, history, ended_at
+                )
+            elif ended_at is None:
+                ended_at = datetime.datetime.now(timezone.utc)
+            tanya_followup.ensure_follow_up_scheduled(
+                phone, client_name, session_path, session_num, ended_at,
             )
         elif session_path:
+            if is_dabble:
+                reason = "dabble archive"
+            elif session_num < tanya_followup.MIN_SESSION_NUM_FOR_FOLLOWUP:
+                reason = "session 1"
+            elif user_turns < MIN_EXCHANGES_FOR_FOLLOWUP:
+                reason = f"{user_turns} user turns < {MIN_EXCHANGES_FOR_FOLLOWUP}"
+            elif not paid:
+                reason = "no paid access"
+            else:
+                reason = "unknown"
             logger.info(
-                "Skipping follow-up for hash %s session %d (%d messages < %d threshold)",
-                ph[:12], session_num, user_turns, MIN_EXCHANGES_FOR_FOLLOWUP,
+                "Skipping follow-up for hash %s session %s (%s)",
+                ph[:12], display, reason,
             )
 
         try:
-            await update_vault_index_files(ph, client_name, session_num, today, profile, transcript)
+            await update_vault_index_files(
+                ph, client_name, session_num, today, profile, transcript,
+                session_label=session_label, is_dabble=is_dabble,
+            )
             mark_vault_dirty()
         except Exception as e:
-            logger.error("Vault index update failed for phone_key=%s session=%d: %s", ph[:12], session_num, e)
+            logger.error(
+                "Vault index update failed for phone_key=%s session=%s: %s",
+                ph[:12], display, e,
+            )
+            return False
 
+        if session_path and session_path.exists() and not _session_is_finalized(session_path):
+            try:
+                with session_path.open("a", encoding="utf-8") as f:
+                    f.write("\n<!-- session:finalized -->\n")
+            except Exception as e:
+                logger.warning("Could not write session finalized marker: %s", e)
+
+        _dequeue_pending_finalize(ph, session_num, session_label)
+        return True
+    except Exception as e:
+        logger.exception("Session finalize failed for phone_key=%s: %s", ph[:12], e)
+        return False
+
+
+async def _run_background_finalize(
+    phone: str,
+    ph: str,
+    client_name: str,
+    history: list[dict],
+    session_num: int,
+    session_path: Path | None,
+    *,
+    session_label: str | None = None,
+    is_dabble: bool = False,
+) -> None:
+    await _finalize_session_writes(
+        phone, ph, client_name, history, session_num, session_path,
+        session_label=session_label, is_dabble=is_dabble,
+    )
+
+
+async def _process_pending_finalizes() -> None:
+    """Retry profile/vault writes interrupted by redeploy."""
+    jobs = _load_pending_finalizes()
+    if not jobs:
+        return
+    logger.info("Retrying %d pending session finalize job(s)", len(jobs))
+    for job_id, job in list(jobs.items()):
+        session_path_str = job.get("session_path", "")
+        session_path = Path(session_path_str) if session_path_str else None
+        session_label = job.get("session_label")
+        is_dabble = bool(job.get("is_dabble"))
+        if not session_path or not session_path.exists():
+            logger.warning("Dropping stale finalize job %s — session file missing", job_id)
+            _dequeue_pending_finalize(job["ph"], job["session_num"], session_label)
+            continue
+        if _session_is_finalized(session_path):
+            logger.info("Finalize job %s already complete — removing from queue", job_id)
+            _dequeue_pending_finalize(job["ph"], job["session_num"], session_label)
+            continue
+        history = history_from_session_file(session_path, job.get("client_name", "Client"))
+        if not history:
+            logger.warning("Finalize job %s has no parseable history — dropping", job_id)
+            _dequeue_pending_finalize(job["ph"], job["session_num"], session_label)
+            continue
+        ok = await _finalize_session_writes(
+            job["phone"],
+            job["ph"],
+            job.get("client_name", "Client"),
+            history,
+            job["session_num"],
+            session_path,
+            session_label=session_label,
+            is_dabble=is_dabble,
+        )
+        if ok:
+            logger.info("Pending finalize completed for job %s", job_id)
+        else:
+            logger.warning("Pending finalize failed for job %s — will retry on next start", job_id)
+
+
+def _clear_session_memory(phone: str) -> None:
     cancel_cache_warming(phone)
     _cached_static_prompts.pop(phone, None)
     referral_nudge_used_this_session.pop(phone, None)
@@ -2574,6 +3033,68 @@ async def end_session(phone: str):
     last_activity.pop(phone, None)
     new_client_voice_followup_snippet.pop(phone, None)
     timeout_tasks.pop(phone, None)
+
+
+async def end_session(
+    phone: str,
+    *,
+    background_writes: bool = False,
+    quiet_dabble: bool = False,
+):
+    """Transcript already written in real time — update profile + vault indexes, then clear state."""
+    ph = phone_to_hash(phone)
+    client_name = client_names.get(phone, "Client")
+    history = list(conversations.get(phone, []))
+    session_num = session_numbers.get(phone, 1)
+    session_path = session_files.get(phone)
+    session_label: str | None = None
+    is_dabble = False
+
+    if quiet_dabble and session_path and session_path.exists() and session_num == 1:
+        is_dabble = True
+        session_path, session_label = await asyncio.to_thread(
+            archive_active_session_to_dabble, ph, session_path,
+        )
+        save_onboarding_checkpoint(
+            ph,
+            pending_first_message_opener=pending_first_message_opener.get(phone, False),
+            awaiting_contact_save=awaiting_contact_save.get(phone, False),
+        )
+
+    # Write close marker so crash detection can distinguish a clean close from a crash
+    if session_path and session_path.exists():
+        try:
+            with session_path.open("a", encoding="utf-8") as f:
+                marker = "<!-- session:closed:dabble -->\n" if is_dabble else "<!-- session:closed -->\n"
+                f.write(f"\n{marker}")
+        except Exception as e:
+            logger.warning("Could not write session close marker: %s", e)
+
+    _clear_session_memory(phone)
+
+    if not history:
+        return
+
+    _enqueue_pending_finalize(
+        phone, ph, client_name, session_num, session_path,
+        session_label=session_label, is_dabble=is_dabble,
+    )
+
+    if background_writes:
+        task = asyncio.create_task(
+            _run_background_finalize(
+                phone, ph, client_name, history, session_num, session_path,
+                session_label=session_label, is_dabble=is_dabble,
+            )
+        )
+        _finalize_tasks.add(task)
+        task.add_done_callback(_finalize_tasks.discard)
+        return
+
+    await _finalize_session_writes(
+        phone, ph, client_name, history, session_num, session_path,
+        session_label=session_label, is_dabble=is_dabble,
+    )
 
 
 async def ai_detects_cancel_intent(text: str) -> bool:
@@ -2643,6 +3164,51 @@ async def classify_delete_confirmation_intent(user_text: str) -> str:
         return "unclear"
 
 
+async def classify_topup_confirmation_intent(user_text: str, *, allow_haiku: bool = True) -> str:
+    """Classify reply to monthly-cap top-up offer: affirmative | negative | unclear."""
+    clean = user_text.strip().lower().rstrip(".,!?")
+    yes_exact = {
+        "yes", "yeah", "yep", "yup", "sure", "ok", "okay",
+        "send", "send it", "send the link", "affirmative",
+    }
+    no_exact = {"no", "nope", "nah", "wait", "later", "negative"}
+    if clean in yes_exact:
+        return "affirmative"
+    if clean in no_exact:
+        return "negative"
+    if any(p in clean for p in ("not sure", "not yet", "not now")):
+        return "unclear"
+    if re.search(r"\b(no|nope|nah|not|wait|don't|dont)\b", clean):
+        return "negative"
+    if re.search(r"\blater\b", clean) and "maybe" not in clean:
+        return "negative"
+    if re.search(r"\b(yes|yeah|yep|yup|sure|ok|okay|send)\b", clean):
+        return "affirmative"
+    if not allow_haiku:
+        return "unclear"
+
+    system = (
+        "A client hit their monthly message cap. Tanya asked if they want a $5 top-up link "
+        "(60 messages each). Classify their reply.\n\n"
+        "- affirmative: wants the link sent now (yes, sure, send it, ok, etc.)\n"
+        "- negative: declines or wants to wait until next billing period\n"
+        "- unclear: ambiguous, off-topic, or hedging without commitment (e.g. not sure)\n\n"
+        "Reply with exactly one word: affirmative OR negative OR unclear. Nothing else."
+    )
+    try:
+        response = await _claude_create(
+            model=CLAUDE_HAIKU_MODEL,
+            max_tokens=10,
+            system=system,
+            messages=[{"role": "user", "content": user_text}],
+        )
+        word = response.content[0].text.strip().lower().split()[0].rstrip(".,!?")
+        return word if word in ("affirmative", "negative", "unclear") else "unclear"
+    except Exception as e:
+        logger.warning("Top-up confirmation classify error: %s", e)
+        return "unclear"
+
+
 async def delete_client_data(phone: str) -> None:
     """Anonymize all data for a client who requested deletion.
 
@@ -2697,6 +3263,7 @@ async def delete_client_data(phone: str) -> None:
         awaiting_stripe_confirmation,
         awaiting_delete_confirmation,
         awaiting_topup_confirmation,
+        topup_link_sent,
         awaiting_contact_save,
         pending_first_message_opener,
         referral_nudge_used_this_session,
@@ -2782,11 +3349,14 @@ def becoming_you_phase_for_prompt(profile_md: str) -> str | None:
 # Timeout task
 # ---------------------------------------------------------------------------
 
-async def session_timeout_task(phone: str) -> None:
+async def session_timeout_task(phone: str, *, delay_seconds: float | None = None) -> None:
     """Wait SESSION_TIMEOUT_MINUTES then end session if no activity."""
-    await asyncio.sleep(SESSION_TIMEOUT_MINUTES * 60)
+    await asyncio.sleep(
+        delay_seconds if delay_seconds is not None else SESSION_TIMEOUT_MINUTES * 60
+    )
     lock = await _get_chat_message_lock(phone)
     ended = False
+    ended_quietly = False
     is_ft = False
     async with lock:
         if phone in conversations and conversations[phone]:
@@ -2794,18 +3364,22 @@ async def session_timeout_task(phone: str) -> None:
             ft_count = free_trial_user_msg_count.get(phone, 0)
             if is_ft and ft_count < FREE_TRIAL_MIN_MSGS_FOR_CLOSE:
                 logger.info(
-                    "Free trial timeout suppressed for phone_key=%s — only %d user turn(s), need %d",
+                    "Free trial quiet timeout for phone_key=%s — %d user turn(s), need %d for paywall close",
                     _phone_key(phone), ft_count, FREE_TRIAL_MIN_MSGS_FOR_CLOSE,
                 )
-                return
-            logger.info("Session timeout for phone_key=%s", _phone_key(phone))
-            if is_ft:
-                ph = phone_to_hash(phone)
-                await mark_free_trial_completed(phone)
-                await billing_db.delete_trial_msg_count(ph)
-                awaiting_stripe_confirmation[phone] = True
-            await end_session(phone)
-            ended = True
+                await end_session(phone, quiet_dabble=True)
+                ended_quietly = True
+            else:
+                logger.info("Session timeout for phone_key=%s", _phone_key(phone))
+                if is_ft:
+                    ph = phone_to_hash(phone)
+                    await mark_free_trial_completed(phone)
+                    await billing_db.delete_trial_msg_count(ph)
+                    awaiting_stripe_confirmation[phone] = True
+                await end_session(phone)
+                ended = True
+    if ended_quietly:
+        return
     if ended:
         close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
         try:
@@ -2814,11 +3388,13 @@ async def session_timeout_task(phone: str) -> None:
             pass
 
 
-def reset_timeout(phone: str) -> None:
+def reset_timeout(phone: str, *, delay_seconds: float | None = None) -> None:
     """Cancel any existing timeout and start a fresh one."""
     if phone in timeout_tasks and not timeout_tasks[phone].done():
         timeout_tasks[phone].cancel()
-    timeout_tasks[phone] = asyncio.create_task(session_timeout_task(phone))
+    timeout_tasks[phone] = asyncio.create_task(
+        session_timeout_task(phone, delay_seconds=delay_seconds)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2914,29 +3490,57 @@ async def perform_session_close(phone: str, user_text: str) -> bool:
             awaiting_stripe_confirmation[phone] = True
 
         cancel_session_timeout(phone)
+        await end_session(phone, background_writes=True)
 
-    await asyncio.sleep(1.0)
     await blooio_send_message(phone, close_text)
-    asyncio.ensure_future(end_session(phone))
     return True
 
 
-async def begin_session_with_opening(phone: str, client_name: str, phone_hash: str) -> None:
+async def begin_session_with_opening(phone: str, client_name: str, phone_hash: str) -> bool:
     """Create session on disk + outline + profile cache + timeout; opener is sent from handle_inbound_message."""
+    sess_num = await asyncio.to_thread(get_next_session_number, phone_hash)
+    if (
+        sess_num == 1
+        and BLOCK_AFTER_FREE_TRIAL
+        and not _is_bypass_phone(phone)
+        and await _has_completed_free_trial(phone)
+        and not await has_tanyatalk_access(phone)
+    ):
+        await blooio_send_message(phone, POST_TRIAL_RESET_DENIED_MESSAGE)
+        awaiting_stripe_confirmation[phone] = True
+        logger.info(
+            "Refused session 1 for completed-trial phone_key=%s",
+            phone_hash[:12],
+        )
+        return False
+
     tanya_followup.cancel_all_followup_jobs_for_chat(phone)
     voice_note_redirects[phone] = 0
     referral_nudge_used_this_session.pop(phone, None)
 
     logger.info("Session opening setup: client=%s", client_name)
 
-    sess_num = await asyncio.to_thread(get_next_session_number, phone_hash)
     session_numbers[phone] = sess_num
     session_files[phone] = await asyncio.to_thread(start_session_file, phone_hash, client_name, sess_num)
     session_outlines[phone] = await asyncio.to_thread(load_session_outline)
     session_profiles[phone] = await asyncio.to_thread(load_client_profile, phone_hash)
 
-    pending_first_message_opener[phone] = True
+    ckpt = await asyncio.to_thread(pop_onboarding_checkpoint, phone_hash)
+    if ckpt is not None:
+        if ckpt.get("pending_first_message_opener"):
+            pending_first_message_opener[phone] = True
+        if ckpt.get("awaiting_contact_save"):
+            awaiting_contact_save[phone] = True
+        logger.info(
+            "Restored onboarding checkpoint for phone_key=%s opener=%s contact_save=%s",
+            phone_hash[:12],
+            ckpt.get("pending_first_message_opener"),
+            ckpt.get("awaiting_contact_save"),
+        )
+    else:
+        pending_first_message_opener[phone] = True
     reset_timeout(phone)
+    return True
 
 
 async def open_coaching_session_after_mini(phone: str, client_name: str) -> None:
@@ -2949,7 +3553,8 @@ async def open_coaching_session_after_mini(phone: str, client_name: str) -> None
         resolved = client_name or client_names.get(phone) or await get_stripe_customer_name(phone)
         client_names[phone] = sanitize_name_for_path(resolved)
         last_activity[phone] = datetime.datetime.now()
-        await begin_session_with_opening(phone, client_names[phone], ph)
+        if not await begin_session_with_opening(phone, client_names[phone], ph):
+            return
 
 
 async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> None:
@@ -3014,7 +3619,8 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
 
         if phone not in session_files:
             conversations[phone] = []
-            await begin_session_with_opening(phone, user_name, ph)
+            if not await begin_session_with_opening(phone, user_name, ph):
+                return
         elif phone not in conversations:
             conversations[phone] = []
 
@@ -3105,15 +3711,14 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
 
             if not is_ret:
                 if not awaiting_contact_save.get(phone):
-                    # Step 1: check cap, send vCard + save prompt, then wait for their reply.
-                    daily_count = await billing_db.get_new_user_count_last_24h()
-                    if daily_count >= DAILY_NEW_USER_CAP:
+                    # Step 1: atomically claim a slot, send vCard + save prompt, wait for reply.
+                    if not await billing_db.try_claim_new_user_slot(ph, DAILY_NEW_USER_CAP):
                         cap_msg = build_daily_cap_message()
                         pending_first_message_opener.pop(phone, None)
                         cancel_session_timeout(phone)
                         await end_session(phone)
                         await blooio_send_message(phone, cap_msg)
-                        logger.info("Daily new-user cap reached (%d). Blocked: %s", daily_count, ph[:12])
+                        logger.info("Daily new-user cap reached (%d). Blocked: %s", DAILY_NEW_USER_CAP, ph[:12])
                         return
                     await blooio_send_vcard(phone)
                     await blooio_send_message(phone, CONTACT_SAVE_PROMPT)
@@ -3148,7 +3753,6 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 if remaining_open > 0:
                     await asyncio.sleep(remaining_open)
                 await deliver_new_client_opener_messages(phone, user_name, bridge, followup)
-                await billing_db.record_new_user_onboard(ph)
                 return
 
             # Resend vCard on session 2 only — once is a reminder, more is annoying.
@@ -3286,8 +3890,93 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
             await billing_db.save_trial_msg_count(ph, n_ft)
 
 
+async def _handle_at_monthly_cap(phone: str, user_name: str, user_text: str) -> bool:
+    """Top-up gate when out of messages. Returns True if handled (caller should return)."""
+    if not await _is_at_monthly_message_cap(phone):
+        awaiting_topup_confirmation.pop(phone, None)
+        topup_link_sent.pop(phone, None)
+        return False
+
+    tanya_followup.on_user_message_cancel_followup(phone)
+    if tanya_followup.in_mini_session(phone):
+        tanya_followup.clear_mini(phone)
+
+    if is_session_end_message(user_text):
+        existing = _debounce_tasks.pop(phone, None)
+        if existing and not existing.done():
+            existing.cancel()
+        existing_typing = _typing_tasks.pop(phone, None)
+        if existing_typing and not existing_typing.done():
+            existing_typing.cancel()
+        _pending_messages.pop(phone, None)
+        _pending_phones.pop(phone, None)
+        await perform_session_close(phone, user_text)
+        return True
+
+    user_text_lower = user_text.strip().lower()
+    if any(t in user_text_lower for t in CANCEL_TRIGGERS):
+        portal_url = await create_stripe_portal_url(phone) or STRIPE_PORTAL_LINK
+        if portal_url:
+            await blooio_send_message(
+                phone,
+                CANCEL_MESSAGE_WITH_LINK.format(portal_link=portal_url),
+            )
+        else:
+            await blooio_send_message(
+                phone,
+                "To cancel, just reply here and I'll help you sort it out.",
+            )
+        return True
+
+    if not awaiting_topup_confirmation.get(phone):
+        awaiting_topup_confirmation[phone] = True
+        await blooio_typing_on(phone)
+        await blooio_send_message(phone, MONTHLY_CAP_BLOCK_MESSAGE)
+        return True
+
+    await blooio_typing_on(phone)
+    intent = await classify_topup_confirmation_intent(
+        user_text,
+        allow_haiku=not topup_link_sent.get(phone),
+    )
+    if intent == "affirmative":
+        checkout_url = None
+        for attempt in range(2):
+            try:
+                checkout_url = await create_topup_checkout_url(phone)
+                break
+            except Exception as e:
+                if attempt == 0:
+                    await asyncio.sleep(2)
+                else:
+                    logger.error("Top-up checkout URL failed after retry: %s", e)
+        if checkout_url:
+            topup_link_sent[phone] = True
+            await blooio_send_message(
+                phone,
+                f"Here you go. Each $5 adds 60 messages and you can add as many as you'd like.\n\n{checkout_url}",
+            )
+        else:
+            await blooio_send_message(
+                phone,
+                "Having a small tech hiccup. Text me back in a minute and I'll send you the link.",
+            )
+    elif intent == "negative":
+        await blooio_send_message(phone, TOPUP_LINK_DECLINED)
+    else:
+        reply = TOPUP_UNCLEAR_REPLY
+        if topup_link_sent.get(phone):
+            reply = (
+                "Your top-up link is above. Complete checkout there to add messages, "
+                "or say no if you'd like to wait until your subscription refills."
+            )
+        await blooio_send_message(phone, reply)
+    return True
+
+
 async def handle_inbound_message(phone: str, user_text: str) -> None:
     """Route one inbound iMessage from phone through the full Tanya logic."""
+    phone = normalize_phone(phone)
     if re.search(r'https?://\S+|www\.\S+', user_text, re.IGNORECASE):
         await blooio_send_message(phone, LINK_RESPONSE)
         return
@@ -3298,6 +3987,10 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         client_names[phone] = resolved
     user_name = client_names[phone]
     last_activity[phone] = datetime.datetime.now()
+
+    # Hard stop: no coaching, mini-session, or billing AI while out of monthly messages.
+    if await _handle_at_monthly_cap(phone, user_name, user_text):
+        return
 
     # Cancel any pending follow-up jobs; enter mini-session if in post-FU window
     in_post_fu = tanya_followup.on_user_message_cancel_followup(phone)
@@ -3371,39 +4064,6 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
             await blooio_send_message(phone, "Just want to make sure — do you want me to delete everything?")
         return
 
-    # Top-up confirmation: client hit monthly cap and we asked if they want the link.
-    if awaiting_topup_confirmation.get(phone):
-        await blooio_typing_on(phone)
-        normalized = user_text.strip().lower().rstrip("!.? ")
-        is_yes = any(word in normalized for word in ("yes", "yeah", "yep", "sure", "send", "ok", "okay"))
-        is_no = any(word in normalized for word in ("no", "nope", "not", "wait", "later", "next month"))
-        if is_yes:
-            awaiting_topup_confirmation.pop(phone, None)
-            checkout_url = None
-            for attempt in range(2):
-                try:
-                    checkout_url = await create_topup_checkout_url(phone)
-                    break
-                except Exception as e:
-                    if attempt == 0:
-                        await asyncio.sleep(2)
-                    else:
-                        logger.error("Top-up checkout URL failed after retry: %s", e)
-            if checkout_url:
-                await blooio_send_message(
-                    phone,
-                    f"Here you go. Each $5 adds 60 messages and you can add as many as you'd like.\n\n{checkout_url}",
-                )
-            else:
-                awaiting_topup_confirmation[phone] = True
-                await blooio_send_message(phone, "Having a small tech hiccup. Text me back in a minute and I'll send you the link.")
-        elif is_no:
-            awaiting_topup_confirmation.pop(phone, None)
-            await blooio_send_message(phone, TOPUP_LINK_DECLINED)
-        else:
-            await blooio_send_message(phone, TOPUP_UNCLEAR_REPLY)
-        return
-
     # Session end check runs first — before cancel/delete AI — so "done session" etc.
     # never reaches the cancellation classifier.
     if is_session_end_message(user_text):
@@ -3449,7 +4109,19 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         return
 
     if delete_intent:
+        existing = _debounce_tasks.pop(phone, None)
+        if existing and not existing.done():
+            existing.cancel()
+        _pending_messages.pop(phone, None)
+        _pending_phones.pop(phone, None)
         awaiting_delete_confirmation[phone] = True
+        prompt = (
+            DELETE_CONFIRMATION_PROMPT
+            if await has_tanyatalk_access(phone)
+            else DELETE_CONFIRMATION_PROMPT_TRIAL
+        )
+        await blooio_send_message(phone, prompt)
+        return
 
     # Debounce: buffer this message and wait for more before firing to Claude.
     _pending_messages.setdefault(phone, []).append(user_text)
@@ -3528,6 +4200,38 @@ async def create_subscription_checkout_url(phone: str) -> str:
     return session.url
 
 
+async def _resolve_phone_from_stripe_customer(customer_id: str) -> str:
+    """Load canonical phone from Stripe customer metadata."""
+    if not customer_id:
+        return ""
+    import stripe as stripe_lib
+    try:
+        stripe_lib.api_key = STRIPE_SECRET_KEY
+        customer = await asyncio.to_thread(stripe_lib.Customer.retrieve, customer_id)
+        phone = ((customer.get("metadata") or {}).get("phone") or "").strip()
+        if phone:
+            return normalize_phone(phone)
+    except Exception as e:
+        logger.error("Could not retrieve Stripe customer %s for phone lookup: %s", customer_id, e)
+    return ""
+
+
+async def _resolve_stripe_checkout_phone(session_obj: dict) -> str:
+    """Resolve canonical E.164 phone from checkout session metadata, customer, or collected details."""
+    metadata = session_obj.get("metadata") or {}
+    phone = (metadata.get("phone") or "").strip()
+    if phone:
+        return normalize_phone(phone)
+    phone = await _resolve_phone_from_stripe_customer(session_obj.get("customer") or "")
+    if phone:
+        return phone
+    customer_details = session_obj.get("customer_details") or {}
+    details_phone = (customer_details.get("phone") or "").strip()
+    if details_phone:
+        return normalize_phone(details_phone)
+    return ""
+
+
 async def handle_stripe_webhook(request: Request) -> Response:
     import stripe as stripe_lib
     import json as _json
@@ -3543,108 +4247,104 @@ async def handle_stripe_webhook(request: Request) -> Response:
     if event["type"] == "checkout.session.completed":
         session_obj = event["data"]["object"]
         metadata = session_obj.get("metadata") or {}
-        phone = metadata.get("phone", "")
         product_type = metadata.get("product_type", "topup")
-        if phone:
-            try:
-                if product_type == "subscription":
-                    # Access control first — if this fails, return 500 so Stripe retries
-                    ph = phone_to_hash(phone)
-                    await billing_db.grant_access(ph)
-                    paid_tanyatalk_access[phone] = True  # update memory cache immediately
-                    awaiting_stripe_confirmation.pop(phone, None)  # clear gate so next message routes normally
-                    await billing_db.record_subscription_start(ph)
-                    customer_id = session_obj.get("customer", "")
-                    if customer_id:
-                        await billing_db.store_stripe_customer_id(ph, customer_id)
-                        try:
-                            stripe_lib.api_key = STRIPE_SECRET_KEY
-                            await asyncio.to_thread(
-                                stripe_lib.Customer.modify,
-                                customer_id,
-                                metadata={"phone": phone},
-                            )
-                        except Exception as e:
-                            logger.warning("Could not set customer metadata.phone: %s", e)
-                    logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
+        phone = await _resolve_stripe_checkout_phone(session_obj)
+        if not phone:
+            logger.error(
+                "checkout.session.completed: could not resolve phone (session=%s) — returning 500 for Stripe retry",
+                session_obj.get("id", "?"),
+            )
+            return Response(status_code=500)
+        try:
+            if product_type == "subscription":
+                # Access control first — if this fails, return 500 so Stripe retries
+                ph = phone_to_hash(phone)
+                await billing_db.grant_access(ph)
+                paid_tanyatalk_access[phone] = True  # update memory cache immediately
+                awaiting_stripe_confirmation.pop(phone, None)  # clear gate so next message routes normally
+                await billing_db.record_subscription_start(ph)
+                customer_id = session_obj.get("customer", "")
+                if customer_id:
+                    await billing_db.store_stripe_customer_id(ph, customer_id)
                     try:
-                        await blooio_send_message(
-                            phone,
-                            "You're in. Your subscription is active and your 250 messages are ready. "
-                            "Come back whenever and we will pick up right where we left off.",
+                        stripe_lib.api_key = STRIPE_SECRET_KEY
+                        await asyncio.to_thread(
+                            stripe_lib.Customer.modify,
+                            customer_id,
+                            metadata={"phone": phone},
                         )
                     except Exception as e:
-                        logger.error("Subscription welcome message failed (access already granted): %s", e)
-                else:
-                    stripe_lib.api_key = STRIPE_SECRET_KEY
-                    session_expanded = await asyncio.to_thread(
-                        stripe_lib.checkout.Session.retrieve,
-                        session_obj["id"],
-                        expand=["line_items"],
+                        logger.warning("Could not set customer metadata.phone: %s", e)
+                logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
+                try:
+                    await blooio_send_message(
+                        phone,
+                        "You're in. Your subscription is active and your 250 messages are ready. "
+                        "Come back whenever and we will pick up right where we left off.",
                     )
-                    qty = session_expanded.line_items.data[0].quantity if session_expanded.line_items.data else 1
-                    # Credits first — if this fails, return 500 so Stripe retries
-                    total_extra = await billing_db.add_extra_messages(phone_to_hash(phone), qty * 60)
-                    logger.info(
-                        "Top-up: added %d bonus messages to phone_key=%s (total bonus now %d)",
-                        qty * 60,
-                        _phone_key(phone),
-                        total_extra,
-                    )
-                    try:
-                        await blooio_send_message(phone, TOPUP_CREDITED_MESSAGE)
-                    except Exception as e:
-                        logger.error("Top-up confirmation message failed (credits already added): %s", e)
-            except Exception as e:
-                logger.error("Stripe checkout.session.completed processing failed: %s", e)
-                return Response(status_code=500)
+                except Exception as e:
+                    logger.error("Subscription welcome message failed (access already granted): %s", e)
+            else:
+                stripe_lib.api_key = STRIPE_SECRET_KEY
+                session_expanded = await asyncio.to_thread(
+                    stripe_lib.checkout.Session.retrieve,
+                    session_obj["id"],
+                    expand=["line_items"],
+                )
+                qty = session_expanded.line_items.data[0].quantity if session_expanded.line_items.data else 1
+                # Credits first — if this fails, return 500 so Stripe retries
+                total_extra = await billing_db.add_extra_messages(phone_to_hash(phone), qty * 60)
+                awaiting_topup_confirmation.pop(phone, None)
+                topup_link_sent.pop(phone, None)
+                logger.info(
+                    "Top-up: added %d bonus messages to phone_key=%s (total bonus now %d)",
+                    qty * 60,
+                    _phone_key(phone),
+                    total_extra,
+                )
+                try:
+                    await blooio_send_message(phone, TOPUP_CREDITED_MESSAGE)
+                except Exception as e:
+                    logger.error("Top-up confirmation message failed (credits already added): %s", e)
+        except Exception as e:
+            logger.error("Stripe checkout.session.completed processing failed: %s", e)
+            return Response(status_code=500)
 
     elif event["type"] == "customer.subscription.deleted":
         sub_obj = event["data"]["object"]
         metadata = sub_obj.get("metadata") or {}
-        phone = metadata.get("phone", "")
-        if not phone:
-            try:
-                stripe_lib.api_key = STRIPE_SECRET_KEY
-                customer = await asyncio.to_thread(
-                    stripe_lib.Customer.retrieve, sub_obj.get("customer", "")
-                )
-                phone = (customer.get("metadata") or {}).get("phone", "")
-            except Exception as e:
-                logger.error("Could not resolve phone for subscription.deleted: %s", e)
+        phone = (metadata.get("phone") or "").strip()
+        if phone:
+            phone = normalize_phone(phone)
+        else:
+            phone = await _resolve_phone_from_stripe_customer(sub_obj.get("customer") or "")
         if not phone:
             logger.warning("subscription.deleted ignored — could not resolve phone from metadata or customer")
             return Response(status_code=200)
-        if phone:
-            try:
-                await billing_db.revoke_access(phone_to_hash(phone))
-                paid_tanyatalk_access.pop(phone, None)  # clear memory cache immediately
-                tanya_followup.cancel_all_followup_jobs_for_chat(phone)
-                logger.info("Access revoked for phone_key=%s via subscription.deleted", _phone_key(phone))
-            except Exception as e:
-                logger.error("Access revocation failed: %s", e)
-                return Response(status_code=500)
-            try:
-                await blooio_send_message(
-                    phone,
-                    "Your subscription has ended. Your session history is saved and I'll be here if you decide to come back.",
-                )
-            except Exception as e:
-                logger.error("Subscription ended message failed (access already revoked): %s", e)
+        try:
+            await billing_db.revoke_access(phone_to_hash(phone))
+            paid_tanyatalk_access.pop(phone, None)  # clear memory cache immediately
+            tanya_followup.cancel_all_followup_jobs_for_chat(phone)
+            logger.info("Access revoked for phone_key=%s via subscription.deleted", _phone_key(phone))
+        except Exception as e:
+            logger.error("Access revocation failed: %s", e)
+            return Response(status_code=500)
+        try:
+            await blooio_send_message(
+                phone,
+                "Your subscription has ended. Your session history is saved and I'll be here if you decide to come back.",
+            )
+        except Exception as e:
+            logger.error("Subscription ended message failed (access already revoked): %s", e)
 
     elif event["type"] == "invoice.payment_failed":
         invoice_obj = event["data"]["object"]
         metadata = invoice_obj.get("metadata") or {}
-        phone = metadata.get("phone", "")
-        if not phone:
-            try:
-                stripe_lib.api_key = STRIPE_SECRET_KEY
-                customer = await asyncio.to_thread(
-                    stripe_lib.Customer.retrieve, invoice_obj.get("customer", "")
-                )
-                phone = (customer.get("metadata") or {}).get("phone", "")
-            except Exception as e:
-                logger.error("Could not resolve phone for invoice.payment_failed: %s", e)
+        phone = (metadata.get("phone") or "").strip()
+        if phone:
+            phone = normalize_phone(phone)
+        else:
+            phone = await _resolve_phone_from_stripe_customer(invoice_obj.get("customer") or "")
         if phone:
             try:
                 await blooio_send_message(
@@ -3675,7 +4375,7 @@ _fastapi_app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://www.tanya-talk.com", "https://tanya-talk.com"],
     allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -3686,6 +4386,12 @@ async def health() -> Response:
 
 @_fastapi_app.post("/report-error")
 async def report_error(request: Request) -> Response:
+    if not REPORT_ERROR_KEY:
+        return Response(status_code=503)
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if token != REPORT_ERROR_KEY:
+        return Response(status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -3728,7 +4434,6 @@ async def serve_audio(filename: str) -> Response:
     if not audio_path.exists():
         return Response(status_code=404)
     content = audio_path.read_bytes()
-    audio_path.unlink(missing_ok=True)
     return Response(content=content, media_type="audio/mpeg")
 
 
@@ -3801,6 +4506,7 @@ def _write_session_snapshot() -> None:
             "last_activity": {p: v.isoformat() for p, v in last_activity.items()},
             "awaiting_stripe_confirmation": awaiting_stripe_confirmation,
             "awaiting_topup_confirmation": awaiting_topup_confirmation,
+            "topup_link_sent": topup_link_sent,
             "awaiting_delete_confirmation": awaiting_delete_confirmation,
             "awaiting_contact_save": awaiting_contact_save,
             "pending_first_message_opener": pending_first_message_opener,
@@ -3867,15 +4573,19 @@ def _restore_session_snapshot() -> None:
         for src, dst in (
             ("awaiting_stripe_confirmation", awaiting_stripe_confirmation),
             ("awaiting_topup_confirmation", awaiting_topup_confirmation),
+            ("topup_link_sent", topup_link_sent),
             ("awaiting_delete_confirmation", awaiting_delete_confirmation),
             ("awaiting_contact_save", awaiting_contact_save),
         ):
             for phone, val in data.get(src, {}).items():
-                dst[phone] = val  # type: ignore[index]
+                if phone in active_phones:
+                    dst[phone] = val  # type: ignore[index]
 
         # Restore pending_first_message_opener only if the opener wasn't already committed
         # to conversation history before the snapshot was taken.
         for phone, val in data.get("pending_first_message_opener", {}).items():
+            if phone not in active_phones:
+                continue
             if val and any(m.get("role") == "assistant" for m in conversations.get(phone, [])):
                 logger.info("Skipping pending_first_message_opener restore for hash %s — already in conversation", phone_to_hash(phone)[:12])
             else:
@@ -3908,6 +4618,20 @@ def _restore_session_snapshot() -> None:
                         outlines_loaded += 1
                 except Exception:
                     pass
+
+        for phone in active_phones:
+            if phone not in session_files:
+                continue
+            la = last_activity.get(phone)
+            if la is not None:
+                remaining = SESSION_TIMEOUT_MINUTES * 60 - (
+                    datetime.datetime.now() - la
+                ).total_seconds()
+                if remaining > 0:
+                    reset_timeout(phone, delay_seconds=remaining)
+            else:
+                reset_timeout(phone)
+
         logger.info(
             "Snapshot restore: profiles reloaded=%d (skipped=%d new clients), outlines reloaded=%d",
             profiles_loaded, profiles_skipped, outlines_loaded,
@@ -3931,10 +4655,13 @@ async def _startup() -> None:
     billing_db.configure(_BOT_DIR / "logs" / "billing.db")
     await billing_db.init_db()
     await billing_db.migrate_from_json(_BOT_DIR / "logs")
+    vault = Path(VAULT_PATH)
+    if (vault / ".git").exists() and await asyncio.to_thread(_vault_has_unpushed_work, vault):
+        mark_vault_dirty()
     _restore_session_snapshot()
     init_usage_csv_file()
     for _mp in _MESH_PHONES:
-        mesh_tanyatalk_included[_mp] = True
+        mesh_tanyatalk_included[normalize_phone(_mp)] = True
     tanya_followup.init_scheduler(_BOT_DIR / "logs" / "apscheduler.sqlite")
     tanya_followup.configure(
         claude=claude,
@@ -3947,18 +4674,31 @@ async def _startup() -> None:
         typing_on=blooio_typing_on,
     )
     await tanya_followup.start_scheduler()
+    await _process_pending_finalizes()
     asyncio.ensure_future(_blooio_failure_poll_loop())
     asyncio.ensure_future(_vault_push_loop())
+    asyncio.ensure_future(_audio_cleanup_loop())
+    await asyncio.to_thread(_cleanup_stale_audio_files)
     logger.info("Tanya Talk iMessage server started")
 
 
 async def _shutdown() -> None:
+    if _finalize_tasks:
+        _done, pending = await asyncio.wait(_finalize_tasks, timeout=45)
+        if pending:
+            logger.warning(
+                "%d session finalize task(s) still running at shutdown; queued jobs will retry on next start",
+                len(pending),
+            )
     _write_session_snapshot()
     if _vault_dirty and GITHUB_PAT:
         vault = Path(VAULT_PATH)
         if (vault / ".git").exists():
             with _VAULT_GIT_LOCK:
-                _do_vault_push()
+                if not _do_vault_push():
+                    mark_vault_dirty()
+                elif _vault_has_unpushed_work(vault):
+                    mark_vault_dirty()
     await tanya_followup.shutdown_scheduler()
     await _http.aclose()
 

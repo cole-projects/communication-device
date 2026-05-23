@@ -341,23 +341,74 @@ async def record_subscription_start(phone_hash: str) -> None:
         await db.commit()
 
 
-async def get_billing_period_key(phone_hash: str) -> str:
-    """Return ISO start date of this client's current 30-day billing period."""
+def _rolling_period_start(anchor: datetime.date, today: datetime.date | None = None) -> str:
+    """ISO date string for the start of the current 30-day billing period."""
+    today = today or datetime.date.today()
+    days_elapsed = max(0, (today - anchor).days)
+    period_start = anchor + datetime.timedelta(days=30 * (days_elapsed // 30))
+    return period_start.isoformat()
+
+
+async def _get_billing_anchor(phone_hash: str) -> datetime.date:
+    """Subscription anchor date, else paid-access grant date, else today."""
     async with _conn() as db:
         async with db.execute(
             "SELECT start_date FROM subscription_starts WHERE phone_hash = ?", (phone_hash,)
         ) as cur:
             row = await cur.fetchone()
+        if row:
+            try:
+                return datetime.date.fromisoformat(row[0])
+            except ValueError:
+                pass
+        async with db.execute(
+            "SELECT granted_at FROM paid_access WHERE phone_hash = ?", (phone_hash,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            try:
+                return datetime.date.fromisoformat(row[0])
+            except ValueError:
+                pass
+    return datetime.date.today()
 
-    if not row:
-        return datetime.date.today().strftime("%Y-%m")
-    try:
-        start = datetime.date.fromisoformat(row[0])
-        days_elapsed = (datetime.date.today() - start).days
-        period_start = start + datetime.timedelta(days=30 * (days_elapsed // 30))
-        return period_start.isoformat()
-    except Exception:
-        return datetime.date.today().strftime("%Y-%m")
+
+async def get_billing_period_key(phone_hash: str) -> str:
+    """Return ISO start date of this client's current 30-day billing period."""
+    anchor = await _get_billing_anchor(phone_hash)
+    return _rolling_period_start(anchor)
+
+
+async def _maybe_migrate_legacy_period_count(phone_hash: str, period_key: str) -> None:
+    """Move usage stored under old YYYY-MM keys into the rolling ISO period key."""
+    if len(period_key) == 7 and period_key[4] == "-":
+        return  # already legacy shape
+    legacy_key = datetime.date.today().strftime("%Y-%m")
+    if legacy_key == period_key:
+        return
+    async with _conn() as db:
+        async with db.execute(
+            "SELECT count FROM monthly_usage WHERE phone_hash = ? AND period_key = ?",
+            (phone_hash, legacy_key),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row or row[0] <= 0:
+            return
+        legacy_count = row[0]
+        await db.execute(
+            """INSERT INTO monthly_usage (phone_hash, period_key, count) VALUES (?, ?, ?)
+               ON CONFLICT(phone_hash, period_key) DO UPDATE SET count = MAX(count, excluded.count)""",
+            (phone_hash, period_key, legacy_count),
+        )
+        await db.execute(
+            "DELETE FROM monthly_usage WHERE phone_hash = ? AND period_key = ?",
+            (phone_hash, legacy_key),
+        )
+        await db.commit()
+        logger.info(
+            "Migrated legacy monthly usage for %s: %s → %s",
+            phone_hash[:12], legacy_key, period_key,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +417,7 @@ async def get_billing_period_key(phone_hash: str) -> str:
 
 async def get_monthly_message_count(phone_hash: str) -> int:
     period_key = await get_billing_period_key(phone_hash)
+    await _maybe_migrate_legacy_period_count(phone_hash, period_key)
     async with _conn() as db:
         async with db.execute(
             "SELECT count FROM monthly_usage WHERE phone_hash = ? AND period_key = ?",
@@ -378,6 +430,7 @@ async def get_monthly_message_count(phone_hash: str) -> int:
 async def increment_monthly_message_count(phone_hash: str) -> int:
     """Increment count for current billing period; return new total."""
     period_key = await get_billing_period_key(phone_hash)
+    await _maybe_migrate_legacy_period_count(phone_hash, period_key)
     async with _conn() as db:
         await db.execute(
             """INSERT INTO monthly_usage (phone_hash, period_key, count) VALUES (?, ?, 1)
@@ -396,6 +449,7 @@ async def increment_monthly_message_count(phone_hash: str) -> int:
 async def credit_monthly_messages(phone_hash: str, amount: int) -> int:
     """Decrease count by amount (floor 0). Returns new count."""
     period_key = await get_billing_period_key(phone_hash)
+    await _maybe_migrate_legacy_period_count(phone_hash, period_key)
     async with _conn() as db:
         await db.execute(
             """UPDATE monthly_usage SET count = MAX(0, count - ?)
@@ -423,6 +477,39 @@ async def get_new_user_count_last_24h() -> int:
         ) as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
+
+
+async def try_claim_new_user_slot(phone_hash: str, cap: int) -> bool:
+    """Atomically claim a new-user slot if under cap. Idempotent for the same phone_hash."""
+    async with _conn() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                "SELECT 1 FROM new_user_onboards WHERE phone_hash = ?", (phone_hash,)
+            ) as cur:
+                if await cur.fetchone():
+                    await db.commit()
+                    return True
+
+            async with db.execute(
+                "SELECT COUNT(*) FROM new_user_onboards WHERE onboarded_at > datetime('now', '-24 hours')"
+            ) as cur:
+                row = await cur.fetchone()
+                count = row[0] if row else 0
+
+            if count >= cap:
+                await db.rollback()
+                return False
+
+            await db.execute(
+                "INSERT INTO new_user_onboards (phone_hash, onboarded_at) VALUES (?, datetime('now'))",
+                (phone_hash,),
+            )
+            await db.commit()
+            return True
+        except Exception:
+            await db.rollback()
+            raise
 
 
 async def record_new_user_onboard(phone_hash: str) -> None:
