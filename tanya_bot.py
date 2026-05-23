@@ -612,6 +612,7 @@ COACHING_BLEND_CONFIG_PATH = _BOT_DIR / "logs" / "coaching_blend.json"
 PID_FILE_PATH = _BOT_DIR / "logs" / "tanya_bot.pid"
 USAGE_CSV_PATH = _BOT_DIR / "logs" / "tanya_usage.csv"
 _USAGE_CSV_LEGACY = _BOT_DIR / "tanya_usage.csv"  # old location; migrated on first write
+_PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 REFERRAL_STATE_PATH = _BOT_DIR / "logs" / "referral_nudges.json"
 
 
@@ -701,16 +702,40 @@ def _do_vault_push() -> bool:
             ["git", "-C", str(vault), "status", "--porcelain"],
             capture_output=True, text=True, timeout=10,
         )
-        if not status.stdout.strip():
+        has_uncommitted = bool(status.stdout.strip())
+        if has_uncommitted:
+            result = subprocess.run(
+                ["git", "-C", str(vault), "commit", "-m", "Vault sync"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                logger.error("git commit failed: %s", result.stderr)
+                return False
+
+        # Check for committed-but-unpushed work (e.g. push was rejected previously)
+        ahead = subprocess.run(
+            ["git", "-C", str(vault), "rev-list", "--count", "@{upstream}..HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        has_unpushed = (
+            ahead.returncode == 0
+            and ahead.stdout.strip().isdigit()
+            and int(ahead.stdout.strip()) > 0
+        )
+
+        if not has_uncommitted and not has_unpushed:
             logger.info("No vault changes to push")
             return True
-        result = subprocess.run(
-            ["git", "-C", str(vault), "commit", "-m", "Vault sync"],
-            capture_output=True, text=True, timeout=30,
+
+        # Pull --rebase so Railway can merge any commits pushed from elsewhere
+        pull = subprocess.run(
+            ["git", "-C", str(vault), "pull", "--rebase"],
+            capture_output=True, text=True, timeout=60,
         )
-        if result.returncode != 0:
-            logger.error("git commit failed: %s", result.stderr)
+        if pull.returncode != 0:
+            logger.error("git pull --rebase failed: %s", pull.stderr)
             return False
+
         result = subprocess.run(
             ["git", "-C", str(vault), "push"],
             capture_output=True, text=True, timeout=60,
@@ -770,6 +795,11 @@ USAGE_CSV_FIELDNAMES = [
     "approx_usd",
 ]
 last_coaching_usage: dict[str, dict] = {}
+
+
+def _pacific_now_iso(*, timespec: str = "seconds") -> str:
+    """Usage CSV timestamps in US Pacific (PST/PDT via America/Los_Angeles)."""
+    return datetime.datetime.now(_PACIFIC_TZ).isoformat(timespec=timespec)
 
 
 def acquire_single_instance_lock() -> None:
@@ -960,7 +990,7 @@ def record_coaching_usage(phone: str, username: str, response) -> None:
             log_id = _compute_next_usage_log_id_unlocked()
             row = {
                 "log_id": log_id,
-                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "timestamp": _pacific_now_iso(),
                 "phone_hash": ph,
                 "user": username,
                 "model": CLAUDE_MODEL,
