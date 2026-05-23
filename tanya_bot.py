@@ -633,7 +633,7 @@ def ensure_vault() -> None:
         logger.info("Vault exists, pulling latest...")
         try:
             result = subprocess.run(
-                ["git", "-C", str(vault), "pull", "--ff-only"],
+                ["git", "-C", str(vault), "pull", "--rebase"],
                 capture_output=True, text=True, timeout=60,
             )
             if result.returncode != 0:
