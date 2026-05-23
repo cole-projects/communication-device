@@ -750,6 +750,25 @@ def _do_vault_push() -> bool:
         return False
 
 
+async def _immediate_vault_push() -> None:
+    """Fire-and-forget push triggered immediately after session finalize."""
+    if not GITHUB_PAT:
+        return
+    vault = Path(VAULT_PATH)
+    if not (vault / ".git").exists():
+        return
+    try:
+        def _push_locked() -> bool:
+            with _VAULT_GIT_LOCK:
+                return _do_vault_push()
+        success = await asyncio.to_thread(_push_locked)
+        if success:
+            global _vault_dirty
+            _vault_dirty = False
+    except Exception as e:
+        logger.error("Immediate vault push failed: %s", e)
+
+
 async def _vault_push_loop() -> None:
     """Background loop: push vault to GitHub every 2 minutes when dirty."""
     await asyncio.sleep(60)  # brief startup delay
@@ -2084,6 +2103,27 @@ def archive_active_session_to_dabble(phone_hash: str, session_path: Path) -> tup
     return new_path, label
 
 
+def load_dabble_transcripts(phone_hash: str) -> list[tuple[str, str]]:
+    """Return (label, content) for every Session 1.x dabble file, sorted by subsession number.
+
+    Only covers Session 1 dabbles — paid-session short closes (session 2+) are never dabbles.
+    """
+    session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
+    if not session_dir.exists():
+        return []
+    results: list[tuple[int, str, str]] = []
+    for f in _dabble_session_files(session_dir):
+        m = _DABBLE_SESSION_FILE_RE.fullmatch(f.name)
+        if m and m.group(1) == "1":
+            sub = int(m.group(2))
+            try:
+                results.append((sub, f"1.{sub}", f.read_text(encoding="utf-8")))
+            except OSError:
+                pass
+    results.sort(key=lambda x: x[0])
+    return [(label, content) for _, label, content in results]
+
+
 def _load_onboarding_checkpoints() -> dict[str, dict]:
     with _onboarding_checkpoint_lock:
         if not ONBOARDING_CHECKPOINT_PATH.exists():
@@ -2366,6 +2406,7 @@ async def update_client_profile(
     history: list,
     *,
     session_label: str | None = None,
+    prior_dabble_texts: list[tuple[str, str]] | None = None,
 ):
     """Ask Claude to update (or create) the client profile based on the completed session."""
     if not history:
@@ -2382,6 +2423,27 @@ async def update_client_profile(
         role = "Tanya" if msg["role"] == "assistant" else client_name
         transcript_lines.append(f"{role}: {msg['content']}")
     transcript = "\n".join(transcript_lines)
+
+    # Build prior dabble context block (Session 1 free-trial only)
+    prior_sessions_block = ""
+    dabble_table_rows = ""
+    if prior_dabble_texts:
+        parts = []
+        row_parts = []
+        for label, content in prior_dabble_texts:
+            parts.append(f"--- Session {label} (brief free-trial dabble) ---\n{content}")
+            link = f"[[02-Client-Sessions/{phone_hash}/Session {label}|Session {label}]]"
+            row_parts.append(f"| {today} | [brief free-trial contact] | {link} |")
+        prior_sessions_block = (
+            "\n\nThis client had brief prior sessions (free-trial dabbles) before reaching "
+            "this first full session. Include any relevant information from them — patterns, "
+            "what they brought up, how they showed up — but do NOT treat them as full sessions. "
+            "They are context only.\n\n" + "\n\n".join(parts) + "\n"
+        )
+        dabble_table_rows = (
+            "\n\nAlso add a row to the Sessions table for each prior dabble, in order before "
+            "Session 1:\n" + "\n".join(row_parts)
+        )
 
     wound_map = await asyncio.to_thread(wound_to_framework_map_excerpt)
     routing_instructions = f"""
@@ -2413,12 +2475,12 @@ Maintain or add: ## BecomingYou Phase with **Current phase:** one of circumstanc
 Here is the existing profile for {client_name}:
 
 {existing_profile}
-
+{prior_sessions_block}
 Here is the transcript from Session {display} ({today}):
 
 {transcript}
 
-Update the profile based on what emerged in this session. Add new themes, wounds surfaced, breakthroughs, what they responded well to, patterns noticed, and update where they are in their journey. Update and consolidate existing sections — merge similar bullets, refine existing entries rather than duplicating them, and remove bullets that are no longer accurate or relevant. Only add entries that represent genuinely new information not already captured. Append a new row to the Sessions table: | {today} | [key theme in 5 words] | {session_link} |. Update the Last updated date to {today}.
+Update the profile based on what emerged in this session. Add new themes, wounds surfaced, breakthroughs, what they responded well to, patterns noticed, and update where they are in their journey. Update and consolidate existing sections — merge similar bullets, refine existing entries rather than duplicating them, and remove bullets that are no longer accurate or relevant. Only add entries that represent genuinely new information not already captured. Append a new row to the Sessions table: | {today} | [key theme in 5 words] | {session_link} |.{dabble_table_rows} Update the Last updated date to {today}.
 
 {routing_instructions}
 {becoming_you_extra}
@@ -2430,12 +2492,12 @@ Return ONLY the full updated profile markdown — nothing else."""
 Use this template as your format:
 
 {template}
-
+{prior_sessions_block}
 Here is the transcript from Session {display} with {client_name} ({today}):
 
 {transcript}
 
-Fill in as much as you can from the session. Add a row to the Sessions table: | {today} | [key theme in 5 words] | {session_link} |. Set "Last updated" to {today}.
+Fill in as much as you can from the session. Add a row to the Sessions table: | {today} | [key theme in 5 words] | {session_link} |.{dabble_table_rows} Set "Last updated" to {today}.
 
 {routing_instructions}
 {becoming_you_extra}
@@ -2895,15 +2957,30 @@ async def _finalize_session_writes(
         today = datetime.date.today().isoformat()
 
         profile = await asyncio.to_thread(load_client_profile, ph) or ""
-        if not is_dabble and _profile_includes_session(profile, session_num, session_label):
+        if is_dabble:
+            logger.info(
+                "Skipping profile update for dabble session %s phone_key=%s",
+                display, ph[:12],
+            )
+        elif _profile_includes_session(profile, session_num, session_label):
             logger.info(
                 "Profile already includes session %s for phone_key=%s; skipping profile update",
                 display, ph[:12],
             )
         else:
+            # For the first real session, fold in any prior Session 1.x dabble transcripts
+            prior_dabbles: list[tuple[str, str]] | None = None
+            if session_num == 1:
+                prior_dabbles = await asyncio.to_thread(load_dabble_transcripts, ph)
+                if prior_dabbles:
+                    logger.info(
+                        "Including %d prior dabble(s) in Session 1 profile for phone_key=%s",
+                        len(prior_dabbles), ph[:12],
+                    )
             try:
                 await update_client_profile(
                     ph, client_name, session_num, history, session_label=session_label,
+                    prior_dabble_texts=prior_dabbles,
                 )
             except Exception as e:
                 logger.error(
@@ -2967,6 +3044,7 @@ async def _finalize_session_writes(
                 session_label=session_label, is_dabble=is_dabble,
             )
             mark_vault_dirty()
+            asyncio.create_task(_immediate_vault_push())
         except Exception as e:
             logger.error(
                 "Vault index update failed for phone_key=%s session=%s: %s",
