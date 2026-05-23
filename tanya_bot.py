@@ -632,12 +632,25 @@ def ensure_vault() -> None:
     if vault.exists() and (vault / ".git").exists():
         logger.info("Vault exists, pulling latest...")
         try:
+            # Abort any in-progress rebase left over from a previous failed pull
+            if (vault / ".git" / "rebase-merge").exists() or (vault / ".git" / "rebase-apply").exists():
+                subprocess.run(["git", "-C", str(vault), "rebase", "--abort"], capture_output=True, timeout=30)
+                logger.info("Aborted stuck rebase before pulling")
+
             result = subprocess.run(
                 ["git", "-C", str(vault), "pull", "--rebase"],
                 capture_output=True, text=True, timeout=60,
             )
             if result.returncode != 0:
-                logger.error("git pull failed: %s", result.stderr)
+                logger.error("git pull --rebase failed: %s", result.stderr)
+                # Abort the failed rebase and hard-reset to origin/main so the vault is usable
+                subprocess.run(["git", "-C", str(vault), "rebase", "--abort"], capture_output=True, timeout=30)
+                subprocess.run(["git", "-C", str(vault), "fetch", "origin"], capture_output=True, timeout=60)
+                subprocess.run(
+                    ["git", "-C", str(vault), "reset", "--hard", "origin/main"],
+                    capture_output=True, timeout=30,
+                )
+                logger.info("Vault hard-reset to origin/main after rebase conflict")
             else:
                 logger.info("Vault updated: %s", result.stdout.strip())
         except Exception as e:
