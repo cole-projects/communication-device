@@ -4598,6 +4598,12 @@ async def health() -> Response:
 
 @_fastapi_app.post("/report-error")
 async def report_error(request: Request) -> Response:
+    if not REPORT_ERROR_KEY:
+        return Response(status_code=503)
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if token != REPORT_ERROR_KEY:
+        return Response(status_code=401)
     try:
         body = await request.json()
     except Exception:
