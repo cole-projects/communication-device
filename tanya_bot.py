@@ -171,6 +171,12 @@ CONTACT_SAVE_PROMPT_RETURNING = (
     "In case you didn't save my contact the first time, here it is again."
 )
 
+SERVICE_INQUIRY_RESPONSE = (
+    "TanyaTalk is your personal coaching experience, built on Tanya's heart and master-level coaching expertise, "
+    "available 24/7 right in your pocket. Whether you're working through something hard, building on something good, "
+    "or simply trying to move through life with more intention, just text me."
+)
+
 OPENER_INTRO = (
     "Hi, I'm Tanya. I've spent years helping people work through what's on their mind, "
     "and I'm here for you too. Everything here is built with my heart, so you always "
@@ -443,7 +449,7 @@ async def blooio_send_vcard(phone: str) -> None:
     """Send TanyaTalk contact card on first interaction so clients can save the number."""
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
-    vcf_url = "https://worker-production-32fb.up.railway.app/tanya.vcf"
+    vcf_url = f"{TANYA_PUBLIC_URL}/tanya.vcf"
     await _blooio_post(
         url,
         {"attachments": [{"url": vcf_url, "name": "My Contact.vcf"}]},
@@ -2305,6 +2311,36 @@ def _profile_includes_session(profile: str, session_num: int, session_label: str
     return f"Session {label}|" in profile or f"Session {label}" in profile
 
 
+_SERVICE_INQUIRY_PHRASES = [
+    "what is this app",
+    "what is this program",
+    "what is this service",
+    "what is tanya",
+    "what is tanyatalk",
+    "what's this app",
+    "what's tanyatalk",
+    "how does this work",
+    "who is this",
+    "what is this number",
+    "is this an app",
+    "what do you do",
+    "what kind of app",
+    "tell me about tanyatalk",
+    "tell me about this app",
+    "what exactly is this",
+]
+
+
+def _is_service_inquiry(text: str) -> bool:
+    t = text.lower().strip()
+    if any(phrase in t for phrase in _SERVICE_INQUIRY_PHRASES):
+        return True
+    # Short standalone "what is this" — unlikely to be mid-session coaching content
+    if len(t) < 35 and ("what is this" in t or "what's this" in t):
+        return True
+    return False
+
+
 def _session_has_follow_up_extraction(session_path: Path) -> bool:
     try:
         return "## Follow-Up Extraction" in session_path.read_text(encoding="utf-8")
@@ -2674,6 +2710,8 @@ Write a single short opening message — 2 to 4 sentences — that:
 - Never mentions Telegram, bots, AI, microphones, tech, platforms, debugging, beta, prototypes, or app mechanics
 
 Do not invent prior conversations, topics, or sessions that are not clearly supported by the profile text. Do not say you reviewed their file. Speak naturally, as if you simply remember them. No em dashes. No filler phrases like "I've been thinking about you."
+
+Never ask questions that assume the client has been struggling, unwell, or in need of care — for example, never say anything like "who's been taking care of you lately," "has someone been looking after you," or "have you been okay." These feel presumptuous and clinically off. Only reference difficulty if the profile explicitly describes it.
 
 This is a returning client only. Never imply a first meeting. Return only the greeting — nothing else."""
 
@@ -3821,6 +3859,13 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
             await end_session(phone)
             return
 
+        if _is_service_inquiry(user_text):
+            await blooio_send_message(phone, SERVICE_INQUIRY_RESPONSE)
+            if not pending_first_message_opener.get(phone):
+                # Mid-session: answered, done. Don't generate a coaching response.
+                return
+            # New user: fall through so the vCard + contact prompt still fires normally.
+
         if pending_first_message_opener.get(phone):
             is_ret = await asyncio.to_thread(is_returning_client, ph)
             _profile_path = profile_path_for(ph)
@@ -4595,12 +4640,17 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
         payload = json.loads(raw_body)
     except Exception:
         return Response(status_code=400)
+    event_type = request.headers.get("x-blooio-event", "")
+    if event_type and event_type != "message.received":
+        logger.info("Blooio webhook event=%s — ignored (not message.received)", event_type)
+        return Response(status_code=200)
     phone = payload.get("sender") or payload.get("from", "")
     text = payload.get("text", "")
     is_group = payload.get("is_group", False)
     logger.info("Webhook payload: phone_key=%s text_len=%s is_group=%s keys=%s", _phone_key(phone) if phone else "", len(text) if text else 0, is_group, list(payload.keys()))
     if payload.get("error_code") or payload.get("error_message"):
         logger.warning("Blooio delivery error: error_code=%s error_message=%s message_id=%s", payload.get("error_code"), payload.get("error_message"), payload.get("message_id"))
+        return Response(status_code=200)
     if phone and not is_group:
         if text:
             asyncio.ensure_future(handle_inbound_message(phone, text))
