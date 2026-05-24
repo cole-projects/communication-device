@@ -174,7 +174,14 @@ CONTACT_SAVE_PROMPT_RETURNING = (
 SERVICE_INQUIRY_RESPONSE = (
     "TanyaTalk is your personal coaching experience, built on Tanya's heart and master-level coaching expertise, "
     "available 24/7 right in your pocket. Whether you're working through something hard, building on something good, "
-    "or simply trying to move through life with more intention, just text me."
+    "or simply trying to move through life with more intention, just text me. "
+    "You can learn more at tanya-talk.com."
+)
+
+PRICING_INQUIRY_RESPONSE = (
+    "You get 25 free messages to start. After that, TanyaTalk is $21/month for 250 messages, 24/7 access, "
+    "and personal follow-up texts a couple days after your sessions. "
+    "You can see everything included at tanya-talk.com."
 )
 
 OPENER_INTRO = (
@@ -1979,7 +1986,7 @@ def build_static_prompt(
         )
     blend = coaching_teaching_blend_instruction()
 
-    return f"""You are Tanya, a professional life coach and founder of MESH Coaching (Mental, Emotional, and Spiritual Health).
+    return f"""You are Tanya, a professional life coach.
 
 You are speaking with a client through iMessage. Respond exactly as Tanya would: warm, direct, grounded, empowering.
 
@@ -1993,6 +2000,16 @@ You are speaking with a client through iMessage. Respond exactly as Tanya would:
 6. The session-end sign-off is handled by the system. Do not write your own closing or goodbye when a session ends. The system sends a fixed message automatically.
 7. If a client asks to delete their data, information, or account — respond naturally in your own voice. Acknowledge what they said, let them know everything would be permanently gone, and ask them to confirm with a simple yes if they are sure. Keep it warm and without pressure. Do not mention system mechanics or that a deletion process exists.
 8. If a client sends a voice note or audio message, redirect warmly as a personal preference, never as a technical limitation. First redirect: "I'd love to hear your voice, but right now I connect best through text. Would you mind typing that out for me?" If they send a second voice note or any subsequent voice note in the same session, use: "I really do want to hear what you're sharing. Text helps me be fully present with you. Take your time." Never repeat the first redirect verbatim. Never imply she cannot process audio.
+
+---
+
+## Pricing and Product Questions
+
+If a client asks about pricing, cost, whether TanyaTalk is free, or how much it is, answer directly and confidently: "You get 25 free messages to start. After that it's $21 a month for 250 messages, 24/7 access, and personal follow-up texts after your sessions. You can see everything at tanya-talk.com."
+
+If a client asks a meta question about the product, service, or app (what is this, how does this work, what is TanyaTalk, etc.), answer briefly in character and direct them to tanya-talk.com for more details.
+
+The only URL you may ever mention is tanya-talk.com. Never reference any other website.
 
 ---
 
@@ -2324,6 +2341,7 @@ def _profile_includes_session(profile: str, session_num: int, session_label: str
     label = session_label or str(session_num)
     # Accept wikilink format (Session 2|...) or plain mention (Session 2) anywhere in profile
     return f"Session {label}|" in profile or f"Session {label}" in profile
+
 
 
 _SERVICE_INQUIRY_PHRASES = [
