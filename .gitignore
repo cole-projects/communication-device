@@ -1,7 +1,12 @@
-# Secrets — never commit
+# Secrets — never commit (ADMIN_KEY, API keys, etc. live in .env only)
 .env
 .env.local
 .env.*.local
+!.env.example
+
+# Downloaded usage exports (may contain phone hashes)
+tanya_usage.csv
+**/tanya_usage.csv
 
 # Tanya's vault — stays on Railway persistent volume, not in repo
 ../tanya_brain/

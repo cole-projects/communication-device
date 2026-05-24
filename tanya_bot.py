@@ -817,8 +817,8 @@ PENDING_FINALIZE_PATH = _BOT_DIR / "logs" / "pending_session_finalize.json"
 ONBOARDING_CHECKPOINT_PATH = _BOT_DIR / "logs" / "onboarding_checkpoints.json"
 _pending_finalize_file_lock = threading.Lock()
 _onboarding_checkpoint_lock = threading.Lock()
-_WHOLE_SESSION_FILE_RE = re.compile(r"^Session (\d+)\.md$")
-_DABBLE_SESSION_FILE_RE = re.compile(r"^Session (\d+)\.(\d+)\.md$")
+_WHOLE_SESSION_FILE_RE = re.compile(r"^Session ([1-9]\d*)\.md$")
+_DABBLE_SESSION_FILE_RE = re.compile(r"^Session 0(?:\.(\d+))?\.md$")
 _finalize_tasks: set[asyncio.Task] = set()
 USAGE_CSV_FIELDNAMES = [
     "log_id",
@@ -1561,7 +1561,7 @@ def profile_indicates_prior_session(content: str) -> bool:
 
 
 def _whole_session_files(session_dir: Path) -> list[Path]:
-    """Session N.md only — excludes dabble sub-sessions like Session 1.1.md."""
+    """Session N.md only — excludes dabble files like Session 0.md, Session 0.1.md."""
     if not session_dir.exists():
         return []
     return [f for f in session_dir.iterdir() if _WHOLE_SESSION_FILE_RE.fullmatch(f.name)]
@@ -1594,7 +1594,7 @@ def is_returning_client(phone_hash: str) -> bool:
             return True
     if _session_one_completed_on_disk(phone_hash):
         return True
-    # Dabble-only clients (1.1, 1.2, …) stay on the new-client onboarding path.
+    # Dabble-only clients (Session 0, 0.1, 0.2, …) stay on the new-client onboarding path.
     if _dabble_session_files(session_dir) and not whole:
         return False
     path = profile_path_for(phone_hash)
@@ -2081,7 +2081,7 @@ Reflective phrases like "that's real," "that lands," or "that's deep" are powerf
 # ---------------------------------------------------------------------------
 
 def get_next_session_number(phone_hash: str) -> int:
-    """Next whole session number; dabble files (Session 1.1.md) do not advance the counter."""
+    """Next whole session number; dabble files (Session 0.md, 0.1.md, …) do not advance the counter."""
     session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
     whole = _whole_session_files(session_dir)
     if not whole:
@@ -2095,18 +2095,31 @@ def get_next_session_number(phone_hash: str) -> int:
 
 
 def get_next_dabble_subsession_label(phone_hash: str) -> str:
-    """Next free-trial dabble label for session 1: 1.1, 1.2, …"""
+    """Next free-trial dabble label: 0, 0.1, 0.2, …
+
+    First dabble → "0" (Session 0.md).
+    Each subsequent dabble → "0.N" where N increments from the highest existing subsession.
+    """
     session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
+    dabbles = _dabble_session_files(session_dir)
+    if not dabbles:
+        return "0"
+    has_base = any(
+        _DABBLE_SESSION_FILE_RE.fullmatch(f.name) and _DABBLE_SESSION_FILE_RE.fullmatch(f.name).group(1) is None
+        for f in dabbles
+    )
+    if not has_base:
+        return "0"
     max_sub = 0
-    for f in _dabble_session_files(session_dir):
+    for f in dabbles:
         m = _DABBLE_SESSION_FILE_RE.fullmatch(f.name)
-        if m and m.group(1) == "1":
-            max_sub = max(max_sub, int(m.group(2)))
-    return f"1.{max_sub + 1}"
+        if m and m.group(1) is not None:
+            max_sub = max(max_sub, int(m.group(1)))
+    return f"0.{max_sub + 1}"
 
 
 def archive_active_session_to_dabble(phone_hash: str, session_path: Path) -> tuple[Path, str]:
-    """Rename the active Session 1 file to Session 1.x and return (new_path, label)."""
+    """Rename the active Session 1 file to a dabble label (0, 0.1, 0.2, …) and return (new_path, label)."""
     label = get_next_dabble_subsession_label(phone_hash)
     new_path = session_path.parent / f"Session {label}.md"
     text = session_path.read_text(encoding="utf-8")
@@ -2123,9 +2136,9 @@ def archive_active_session_to_dabble(phone_hash: str, session_path: Path) -> tup
 
 
 def load_dabble_transcripts(phone_hash: str) -> list[tuple[str, str]]:
-    """Return (label, content) for every Session 1.x dabble file, sorted by subsession number.
+    """Return (label, content) for every dabble file, sorted chronologically.
 
-    Only covers Session 1 dabbles — paid-session short closes (session 2+) are never dabbles.
+    Covers Session 0 (first dabble) and Session 0.1, 0.2, … (subsequent dabbles).
     """
     session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / phone_hash
     if not session_dir.exists():
@@ -2133,10 +2146,12 @@ def load_dabble_transcripts(phone_hash: str) -> list[tuple[str, str]]:
     results: list[tuple[int, str, str]] = []
     for f in _dabble_session_files(session_dir):
         m = _DABBLE_SESSION_FILE_RE.fullmatch(f.name)
-        if m and m.group(1) == "1":
-            sub = int(m.group(2))
+        if m:
+            # Session 0 sorts before Session 0.1 by using -1 as sort key
+            sub = int(m.group(1)) if m.group(1) is not None else -1
+            label = "0" if m.group(1) is None else f"0.{m.group(1)}"
             try:
-                results.append((sub, f"1.{sub}", f.read_text(encoding="utf-8")))
+                results.append((sub, label, f.read_text(encoding="utf-8")))
             except OSError:
                 pass
     results.sort(key=lambda x: x[0])
@@ -3019,7 +3034,7 @@ async def _finalize_session_writes(
                 display, ph[:12],
             )
         else:
-            # For the first real session, fold in any prior Session 1.x dabble transcripts
+            # For the first real session, fold in any prior Session 0.x dabble transcripts
             prior_dabbles: list[tuple[str, str]] | None = None
             if session_num == 1:
                 prior_dabbles = await asyncio.to_thread(load_dabble_transcripts, ph)
