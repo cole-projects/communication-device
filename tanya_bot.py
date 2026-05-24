@@ -3625,7 +3625,9 @@ async def perform_session_close(phone: str, user_text: str) -> bool:
             return False
 
         is_ft = await in_first_free_trial_session(phone)
-        close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
+        ft_count = free_trial_user_msg_count.get(phone, 0)
+        is_quiet_dabble = is_ft and ft_count < FREE_TRIAL_MIN_MSGS_FOR_CLOSE
+        close_text = FREE_TRIAL_CLOSE_TEXT if (is_ft and not is_quiet_dabble) else SESSION_CLOSE_CONFIRMATION
 
         client_name = client_names.get(phone, "Client")
         user_close = user_text.strip() or "end session"
@@ -3642,14 +3644,14 @@ async def perform_session_close(phone: str, user_text: str) -> bool:
         if len(conversations[phone]) > MAX_HISTORY * 2:
             conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
 
-        if is_ft:
+        if is_ft and not is_quiet_dabble:
             ph = phone_to_hash(phone)
             await mark_free_trial_completed(phone)
             await billing_db.delete_trial_msg_count(ph)
             awaiting_stripe_confirmation[phone] = True
 
         cancel_session_timeout(phone)
-        await end_session(phone, background_writes=True)
+        await end_session(phone, background_writes=True, quiet_dabble=is_quiet_dabble)
 
     await blooio_send_message(phone, close_text)
     return True
