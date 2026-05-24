@@ -4678,7 +4678,17 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
         return Response(status_code=400)
     event_type = request.headers.get("x-blooio-event", "")
     if event_type and event_type != "message.received":
-        logger.info("Blooio webhook event=%s — ignored (not message.received)", event_type)
+        if event_type == "message.failed":
+            logger.error(
+                "Blooio message.failed — message_id=%s error_code=%s error_message=%s to=%s payload=%s",
+                payload.get("message_id") or payload.get("id"),
+                payload.get("error_code"),
+                payload.get("error_message"),
+                payload.get("to") or payload.get("recipient"),
+                json.dumps(payload),
+            )
+        else:
+            logger.info("Blooio webhook event=%s — ignored (not message.received)", event_type)
         return Response(status_code=200)
     phone = payload.get("sender") or payload.get("from", "")
     text = payload.get("text", "")
