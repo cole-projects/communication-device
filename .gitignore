@@ -13,6 +13,7 @@ tanya_usage.csv
 
 # Usage logs and runtime files
 logs/
+sync_usage.sh
 *.pid
 *.sqlite
 
