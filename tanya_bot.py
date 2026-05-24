@@ -2814,12 +2814,13 @@ async def generate_new_client_opener_followup_line(first_message: str) -> str:
 
 Write for the ear: natural spoken English, no bullet lists, no markdown, no parentheses with stage directions.
 
-This is someone's first-ever exchange with her. Avoid generic acquaintance-check-ins ('how have you been', 'how are you doing', 'these days', 'what's new with you')—they signal a shallow relationship she does not have yet.
+This line must be a direct, grounded question asking what is on their mind today — right now, in this moment. It is the gateway into the coaching session. It should feel like a coach cutting to it, not a soft invitation to explore.
 
-Prefer a grounded coaching invitation instead: what's present to explore, where they want to start, what feels important to unpack. Warm, grounded, plain language.
+The question must be present-tense and direct. Variations should stay in the family of: "What's on your mind today?", "What's weighing on you today?", "What's coming up for you right now?", "What do you want to work through today?", "Where do you want to start?". Do NOT use passive or reflective phrasing like "what's drawing you", "what brought you here", "what feels alive", "what's present to explore", or anything that asks WHY they showed up rather than WHAT they want to work on.
 
 Rules:
-- One sentence, at most 14 words
+- One sentence, at most 12 words
+- Must contain "today" or "right now"
 - No em dashes
 - Standard punctuation spacing: space after a comma, never before it
 - Do not start with "I"
@@ -2836,7 +2837,7 @@ Rules:
         return response.content[0].text.strip().replace("\u2014", ",").replace("\u2013", ",")
     except Exception as e:
         logger.error("New client opener follow-up line failed: %s", e)
-        return "What feels most alive to put on the table today?"
+        return "What's on your mind today?"
 
 
 async def prepare_new_client_opener_parts(user_text: str) -> tuple[str, str]:
@@ -4737,6 +4738,28 @@ def _restore_session_snapshot() -> None:
                 p = Path(raw_files[phone])
                 if p.exists():
                     session_files[phone] = p
+                else:
+                    # File was renamed while a session was open — scan for any unclosed whole session
+                    ph = phone_to_hash(phone)
+                    session_dir = Path(VAULT_PATH) / "02-Client-Sessions" / ph
+                    candidates = sorted(
+                        _whole_session_files(session_dir),
+                        key=lambda f: int(_WHOLE_SESSION_FILE_RE.fullmatch(f.name).group(1)),
+                    )
+                    for f in candidates:
+                        try:
+                            if "<!-- session:closed -->" not in f.read_text(encoding="utf-8"):
+                                session_files[phone] = f
+                                m = _WHOLE_SESSION_FILE_RE.fullmatch(f.name)
+                                if m:
+                                    session_numbers[phone] = int(m.group(1))
+                                logger.info(
+                                    "Snapshot recovery: stale path %s → found open session %s",
+                                    p.name, f.name,
+                                )
+                                break
+                        except OSError:
+                            pass
 
         raw_convs: dict = data.get("conversations", {})
         for phone in active_phones:
