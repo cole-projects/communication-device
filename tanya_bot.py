@@ -422,12 +422,14 @@ async def blooio_typing_off(phone: str) -> None:
         logger.debug("Typing off error: %s", e)
 
 
-async def _blooio_post(url: str, payload: dict, *, label: str = "send") -> None:
+async def _blooio_post(url: str, payload: dict, *, label: str = "send", idempotency_key: str | None = None) -> None:
     """POST to Blooio with 2 attempts (3s delay). Retries on 5xx and network errors; not on 4xx."""
     headers = {
         "Authorization": f"Bearer {BLOOIO_API_KEY}",
         "Content-Type": "application/json",
     }
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
     for attempt in range(1, 3):
         try:
             resp = await _http.post(url, headers=headers, json=payload, timeout=30.0)
@@ -444,12 +446,20 @@ async def _blooio_post(url: str, payload: dict, *, label: str = "send") -> None:
     logger.error("Blooio %s failed after 2 attempts", label)
 
 
-async def blooio_send_message(phone: str, text: str) -> None:
+async def blooio_send_message(phone: str, text: str, *, idempotency_key: str | None = None) -> None:
     """Send a text message via Blooio API v2."""
     await blooio_typing_off(phone)
     chat_id_encoded = quote(phone, safe="")
     url = f"{BLOOIO_BASE_URL}/chats/{chat_id_encoded}/messages"
-    await _blooio_post(url, {"text": text}, label="send_message")
+    await _blooio_post(url, {"text": text}, label="send_message", idempotency_key=idempotency_key)
+
+
+async def _retry_device_unreachable(phone: str, text: str, original_message_id: str) -> None:
+    """Retry a message that failed with device_unreachable after a short delay."""
+    await asyncio.sleep(15)
+    idempotency_key = f"{original_message_id}-retry"
+    logger.info("Retrying device_unreachable message to phone_key=%s original_id=%s", _phone_key(phone), original_message_id)
+    await blooio_send_message(phone, text, idempotency_key=idempotency_key)
 
 
 async def blooio_send_vcard(phone: str) -> None:
@@ -4679,14 +4689,22 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
     event_type = request.headers.get("x-blooio-event", "")
     if event_type and event_type != "message.received":
         if event_type == "message.failed":
+            error_code = payload.get("error_code")
+            message_id = payload.get("message_id") or payload.get("id")
             logger.error(
                 "Blooio message.failed — message_id=%s error_code=%s error_message=%s to=%s payload=%s",
-                payload.get("message_id") or payload.get("id"),
-                payload.get("error_code"),
+                message_id,
+                error_code,
                 payload.get("error_message"),
                 payload.get("to") or payload.get("recipient"),
                 json.dumps(payload),
             )
+            if error_code == "device_unreachable":
+                retry_phone = payload.get("external_id")
+                retry_text = payload.get("text")
+                if retry_phone and retry_text and message_id:
+                    logger.info("Scheduling retry for device_unreachable message_id=%s in 15s", message_id)
+                    asyncio.create_task(_retry_device_unreachable(retry_phone, retry_text, message_id))
         else:
             logger.info("Blooio webhook event=%s — ignored (not message.received)", event_type)
         return Response(status_code=200)
