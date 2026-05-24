@@ -2300,9 +2300,9 @@ def _dequeue_pending_finalize(ph: str, session_num: int, session_label: str | No
 
 
 def _profile_includes_session(profile: str, session_num: int, session_label: str | None = None) -> bool:
-    if session_label:
-        return f"Session {session_label}|" in profile
-    return f"Session {session_num}|" in profile
+    label = session_label or str(session_num)
+    # Accept wikilink format (Session 2|...) or plain mention (Session 2) anywhere in profile
+    return f"Session {label}|" in profile or f"Session {label}" in profile
 
 
 def _session_has_follow_up_extraction(session_path: Path) -> bool:
