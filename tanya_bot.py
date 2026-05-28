@@ -1067,7 +1067,7 @@ def record_coaching_usage(phone: str, username: str, response) -> None:
         logger.error("Could not write %s: %s", USAGE_CSV_PATH, e)
 
 
-FREE_TRIAL_MIN_MSGS_FOR_CLOSE = 5
+FREE_TRIAL_MIN_MSGS_FOR_CLOSE = FREE_TRIAL_USER_MESSAGE_CAP
 
 
 # ---------------------------------------------------------------------------
