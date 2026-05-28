@@ -4651,44 +4651,6 @@ async def serve_vcard(request: Request) -> Response:
     )
 
 
-@_fastapi_app.post("/admin/reset-user")
-async def admin_reset_user(request: Request) -> Response:
-    auth = request.headers.get("Authorization", "")
-    token = auth.removeprefix("Bearer ").strip()
-    if not ADMIN_KEY or token != ADMIN_KEY:
-        return Response(status_code=401)
-    body = await request.json()
-    phone = body.get("phone", "").strip()
-    if not phone:
-        return Response(content="phone required", status_code=400)
-    import shutil
-    ph = phone_to_hash(normalize_phone(phone))
-    norm = normalize_phone(phone)
-    removed = []
-    async with billing_db._conn() as db:
-        for tbl in ("free_trial_completed", "free_trial_msg_counts", "new_user_onboards",
-                    "monthly_usage", "paid_access", "subscription_starts", "extra_messages"):
-            try:
-                await db.execute(f"DELETE FROM {tbl} WHERE phone_hash = ?", (ph,))
-                removed.append(tbl)
-            except Exception:
-                pass
-        await db.commit()
-    vault = Path(VAULT_PATH)
-    profile = vault / "02-Client-Sessions" / "Client Profiles" / f"{ph}.md"
-    session_dir = vault / "02-Client-Sessions" / ph
-    if profile.exists():
-        profile.unlink()
-        removed.append("vault_profile")
-    if session_dir.exists():
-        shutil.rmtree(session_dir)
-        removed.append("vault_sessions")
-    free_trial_completed.pop(norm, None)
-    session_numbers.pop(norm, None)
-    conversations.pop(norm, None)
-    return Response(content=f"cleared: {', '.join(removed)} for {ph[:12]}", status_code=200)
-
-
 @_fastapi_app.get("/admin/usage-csv")
 async def admin_usage_csv(request: Request) -> Response:
     auth = request.headers.get("Authorization", "")
