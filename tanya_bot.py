@@ -2883,15 +2883,14 @@ async def deliver_new_client_opener_messages(
     bridge: str,
     followup: str,
 ) -> str:
-    """Outbound flow: (1) bridge + OPENER_INTRO; (2) coaching invite. vCard was sent in step 1."""
-    main_combined = f"{bridge}\n\n{OPENER_INTRO}"
-    await blooio_send_message(phone, main_combined)
-    logger.info("New client opener: main block sent for %s", user_name)
+    """Outbound flow: (1) bridge; (2) coaching invite. OPENER_INTRO shown via landing page pop-up."""
+    await blooio_send_message(phone, bridge)
+    logger.info("New client opener: bridge sent for %s", user_name)
 
     await blooio_send_message(phone, followup)
     logger.info("New client opener: follow-up line sent for %s", user_name)
 
-    return f"{main_combined}\n\n{followup}"
+    return f"{bridge}\n\n{followup}"
 
 
 def _parse_stripe_confirmation_label(raw: str) -> str:
