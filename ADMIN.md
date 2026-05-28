@@ -50,4 +50,36 @@ Then open `logs/tanya_usage.csv` in Numbers or Excel. Filter out rows where `log
 
 ---
 
+## Reset a User to First-Time State
+
+Wipes everything for a phone number — billing DB, vault files, in-memory state, and session snapshot on Railway. Use this when a friend or tester needs to start over from scratch.
+
+### Ask Claude Code
+
+Just say:
+
+> "Wipe [phone number] and reset them as a first-time user"
+
+Claude will handle the full process automatically.
+
+### What gets cleared
+
+| Layer | What's removed |
+|---|---|
+| Railway billing DB | `free_trial_completed`, `free_trial_msg_counts`, `new_user_onboards`, `monthly_usage`, `paid_access`, `subscription_starts`, `extra_messages` |
+| Railway vault | Session folder + client profile (if they exist) |
+| Railway memory | All in-memory state dicts for that phone |
+| Railway snapshot | `logs/session_snapshot.json` entry for that phone |
+
+### How Claude does it (for reference)
+
+1. Adds a temporary `/admin/reset-user` POST endpoint to `tanya_bot.py`
+2. Commits and pushes → Railway auto-deploys
+3. Calls the endpoint with the phone number and `ADMIN_KEY`
+4. Immediately removes the endpoint, commits and pushes again
+
+The endpoint is never left in production.
+
+---
+
 > Keep `ADMIN_KEY` out of git (`.env` is ignored). If the token is ever exposed, rotate it in Railway and update `.env`.
