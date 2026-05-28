@@ -4661,9 +4661,11 @@ async def admin_reset_user(request: Request) -> Response:
     phone = body.get("phone", "").strip()
     if not phone:
         return Response(content="phone required", status_code=400)
+    import shutil
     ph = phone_to_hash(normalize_phone(phone))
+    norm = normalize_phone(phone)
     removed = []
-    async with aiosqlite.connect(_BOT_DIR / "logs" / "billing.db") as db:
+    async with billing_db._conn() as db:
         for tbl in ("free_trial_completed", "free_trial_msg_counts", "new_user_onboards",
                     "monthly_usage", "paid_access", "subscription_starts", "extra_messages"):
             try:
@@ -4675,16 +4677,15 @@ async def admin_reset_user(request: Request) -> Response:
     vault = Path(VAULT_PATH)
     profile = vault / "02-Client-Sessions" / "Client Profiles" / f"{ph}.md"
     session_dir = vault / "02-Client-Sessions" / ph
-    import shutil
     if profile.exists():
         profile.unlink()
         removed.append("vault_profile")
     if session_dir.exists():
         shutil.rmtree(session_dir)
         removed.append("vault_sessions")
-    free_trial_completed.pop(normalize_phone(phone), None)
-    session_numbers.pop(normalize_phone(phone), None)
-    conversations.pop(normalize_phone(phone), None)
+    free_trial_completed.pop(norm, None)
+    session_numbers.pop(norm, None)
+    conversations.pop(norm, None)
     return Response(content=f"cleared: {', '.join(removed)} for {ph[:12]}", status_code=200)
 
 
