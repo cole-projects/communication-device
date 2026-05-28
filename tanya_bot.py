@@ -4651,6 +4651,62 @@ async def serve_vcard(request: Request) -> Response:
     )
 
 
+@_fastapi_app.post("/admin/reset-user")
+async def admin_reset_user(request: Request) -> Response:
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if not ADMIN_KEY or token != ADMIN_KEY:
+        return Response(status_code=401)
+    body = await request.json()
+    phone = body.get("phone", "").strip()
+    if not phone:
+        return Response(content="phone required", status_code=400)
+    import shutil, json as _json
+    ph = phone_to_hash(normalize_phone(phone))
+    norm = normalize_phone(phone)
+    removed = []
+    # Clear billing DB
+    async with billing_db._conn() as db:
+        for tbl in ("free_trial_completed", "free_trial_msg_counts", "new_user_onboards",
+                    "monthly_usage", "paid_access", "subscription_starts", "extra_messages"):
+            try:
+                await db.execute(f"DELETE FROM {tbl} WHERE phone_hash = ?", (ph,))
+                removed.append(tbl)
+            except Exception:
+                pass
+        await db.commit()
+    # Clear vault
+    vault = Path(VAULT_PATH)
+    profile = vault / "02-Client-Sessions" / "Client Profiles" / f"{ph}.md"
+    session_dir = vault / "02-Client-Sessions" / ph
+    if profile.exists():
+        profile.unlink()
+        removed.append("vault_profile")
+    if session_dir.exists():
+        shutil.rmtree(session_dir)
+        removed.append("vault_sessions")
+    # Clear all in-memory state
+    for d in (free_trial_completed, session_numbers, conversations, awaiting_stripe_confirmation,
+              awaiting_contact_save, pending_first_message_opener, paid_tanyatalk_access,
+              free_trial_user_msg_count, free_trial_90_warned):
+        d.pop(norm, None)
+    # Clear session snapshot entry
+    if SESSION_SNAPSHOT_PATH.exists():
+        try:
+            snap = _json.loads(SESSION_SNAPSHOT_PATH.read_text())
+            changed = False
+            for key, val in snap.items():
+                if isinstance(val, dict) and norm in val:
+                    del val[norm]
+                    changed = True
+            if changed:
+                SESSION_SNAPSHOT_PATH.write_text(_json.dumps(snap))
+                removed.append("snapshot")
+        except Exception:
+            pass
+    return Response(content=f"cleared: {', '.join(removed)} for {ph[:12]}", status_code=200)
+
+
 @_fastapi_app.get("/admin/usage-csv")
 async def admin_usage_csv(request: Request) -> Response:
     auth = request.headers.get("Authorization", "")
