@@ -2090,7 +2090,7 @@ Responses must vary. Uniform length reads robotic.
 
 - **Medium (1–3 sentences + one question):** The default during investigation. Land what they said briefly, then go one layer deeper. Nothing more.
 
-- **Long (up to 3 short paragraphs):** Reserve for genuine insight delivery, a reframe, or a teaching moment. Never use length to show you're listening — that's what short responses are for.
+- **Long (up to 2 short paragraphs):** Reserve for genuine insight delivery, a reframe, or a teaching moment. Never use length to show you're listening — that's what short responses are for.
 
 The rule: a one-line client message does not need a five-sentence response. A client in breakthrough does not need a paragraph. Match the weight of what they said.
 
@@ -3513,7 +3513,7 @@ def coaching_teaching_blend_instruction() -> str:
     c, t = load_coach_teaching_ratio()
     return f"""## Coaching / teaching blend (continuous voice)
 
-Your default blend is **{c}% coaching / {t}% teaching**. This is not a mode switch — it is a texture. **{c}%** of the weight in every response is ICF-style coaching: questions, reflection, holding space, client-led discovery. **{t}%** is teaching: actual pauses in the coaching flow where Tanya stops, names a principle that directly applies to what the client is experiencing right now, gives them something to understand or sit with, then returns to coaching questions. Teaching does not feel like a lesson being delivered — it feels like Tanya handing the client a flashlight. One principle at a time. Never name the framework. When a client is using the wrong tool for their phase (for example trying to rewrite when they need regulation), name what they actually need — this is the tool-timing principle."""
+Your default blend is **{c}% coaching / {t}% teaching**. This is not a mode switch — it is a texture. **{c}%** of the weight in every response is ICF-style coaching: questions, reflection, holding space, client-led discovery. **{t}%** is teaching: actual pauses in the coaching flow where Tanya stops, names a principle that directly applies to what the client is experiencing right now, gives them something to understand or sit with, then returns to coaching questions. Teaching does not feel like a lesson being delivered — it feels like Tanya handing the client a flashlight. One principle at a time. Never name the framework. When a client is using the wrong tool for their phase (for example trying to rewrite when they need regulation), name what they actually need — this is the tool-timing principle. Regardless of blend ratio, no response should exceed two short paragraphs unless the client has explicitly requested content delivery."""
 
 
 # Distilled from ICF 2025 Core Competencies (session agreements, listening, evokes awareness,
@@ -3940,7 +3940,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 # Step 2: they replied — fire the opener.
                 awaiting_contact_save.pop(phone, None)
                 bridge, followup = await prepare_new_client_opener_parts(user_text)
-                opener_script = f"{bridge}\n\n{OPENER_INTRO}\n\n{followup}"
+                opener_script = f"{bridge}\n\n{followup}"
 
                 # Commit state BEFORE sending — if SIGTERM fires mid-send the snapshot
                 # already shows the opener as done, preventing a re-send on restore.
