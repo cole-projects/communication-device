@@ -163,10 +163,7 @@ def _build_vcard(phone: str) -> str:
 
 TANYA_VCARD = _build_vcard(BLOOIO_PHONE_NUMBER)
 
-CONTACT_SAVE_PROMPT = (
-    "Save my contact so you can always find me. "
-    "When you're done, introduce yourself briefly, I'd love to know a little about you before we get started."
-)
+CONTACT_SAVE_PROMPT = "Save my contact so you can always find me."
 CONTACT_SAVE_PROMPT_RETURNING = (
     "In case you didn't save my contact the first time, here it is again."
 )
@@ -2044,6 +2041,8 @@ Every conversation moves through three layers. Your job is to always advance to 
 2. **Significance** — what it means to them (why it matters, what they're afraid of)
 3. **Truth** — the core belief or identity wound driving it (a Five Wounds pattern)
 
+**"What should I do?" is never a request for advice.** When a client opens with this phrase, they are almost always caught in something impossible — a loyalty conflict, a moral bind, a secret they didn't ask to carry, a situation with no clean answer. Do not answer the question. Name the weight of what they are holding, then ask what makes it impossible for them. The pattern to recognize: "what should I do?" almost always appears alongside a situation involving someone else — a person the client loves, a relationship at risk, a secret, a conflict. That is the signal. Land the situation, not the question.
+
 **Step 1 — Set session direction first.**
 After the client's first message, before any investigation begins, briefly acknowledge what they just said — one short phrase that proves you heard it — then ask the intention question. Never ask it cold.
 
@@ -2087,6 +2086,7 @@ Responses must vary. Uniform length reads robotic.
   - "Hmm." / "Okay." / "Say more." / "Tell me more." / "Tell me about that." / "What do you mean by that?"
   - Use "Tell me more" when the client said something worth unpacking but you don't want to redirect yet — it keeps the space open without pulling them in a direction.
   - These are intentional moves, not filler. Use them.
+  - **Exception:** when something genuinely heavy surfaces for the first time, a minimal probe is the wrong register. The pattern to recognize: the client disclosed something with clear pain or consequence already embedded in it — a loss, a betrayal, a secret they are now carrying, a relationship ending, a moral conflict, something they did not choose to know. In these moments "Say more about that." reads as emotionally flat. Name the weight of what they said first, then ask. One sentence that lands it, then the question. This is still short — it is not short and empty.
 
 - **Medium (1–3 sentences + one question):** The default during investigation. Land what they said briefly, then go one layer deeper. Nothing more.
 
@@ -2837,18 +2837,17 @@ Rules:
 
 
 async def generate_new_client_opener_followup_line(first_message: str) -> str:
-    """Third outbound line for new clients: invite coaching without faux-intimacy."""
-    system = """Tanya already sent her short personalized opener and her fixed welcome/terms in text. You write ONLY her single next iMessage line.
+    """Second outbound line for new clients: one coaching question that follows from what they said."""
+    system = """Tanya already sent her short personalized opener. You write ONLY her single next iMessage line.
 
 Write for the ear: natural spoken English, no bullet lists, no markdown, no parentheses with stage directions.
 
-This line must be a direct, grounded question asking what is on their mind today — right now, in this moment. It is the gateway into the coaching session. It should feel like a coach cutting to it, not a soft invitation to explore.
+If the client shared something specific (a worry, a person, a situation, a feeling), ask ONE direct coaching question that goes one layer deeper into what they shared. Do not ask what is on their mind — they already told you. Ask about the thing they said.
 
-The question must be present-tense and direct. Variations should stay in the family of: "What's on your mind today?", "What's weighing on you today?", "What's coming up for you right now?", "What do you want to work through today?", "Where do you want to start?". Do NOT use passive or reflective phrasing like "what's drawing you", "what brought you here", "what feels alive", "what's present to explore", or anything that asks WHY they showed up rather than WHAT they want to work on.
+If they only said hi or something minimal, ask what is on their mind right now. Variations: "What's on your mind today?", "What's weighing on you today?", "What's coming up for you right now?".
 
 Rules:
-- One sentence, at most 12 words
-- Must contain "today" or "right now"
+- One sentence, at most 15 words
 - No em dashes
 - Standard punctuation spacing: space after a comma, never before it
 - Do not start with "I"
@@ -3922,7 +3921,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
 
             if not is_ret:
                 if not awaiting_contact_save.get(phone):
-                    # Step 1: atomically claim a slot, send vCard + save prompt, wait for reply.
+                    # Claim slot, send vCard + save prompt, then respond immediately.
                     if not await billing_db.try_claim_new_user_slot(ph, DAILY_NEW_USER_CAP):
                         cap_msg = build_daily_cap_message()
                         pending_first_message_opener.pop(phone, None)
@@ -3933,11 +3932,8 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                         return
                     await blooio_send_vcard(phone)
                     await blooio_send_message(phone, CONTACT_SAVE_PROMPT)
-                    awaiting_contact_save[phone] = True
-                    logger.info("Contact save prompt sent; waiting for intro reply from %s", ph[:12])
-                    return  # pending_first_message_opener stays set — next message triggers opener
+                    logger.info("Contact save prompt sent; responding to first message from %s", ph[:12])
 
-                # Step 2: they replied — fire the opener.
                 awaiting_contact_save.pop(phone, None)
                 bridge, followup = await prepare_new_client_opener_parts(user_text)
                 opener_script = f"{bridge}\n\n{followup}"
