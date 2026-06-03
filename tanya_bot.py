@@ -2874,9 +2874,20 @@ Rules:
         return "What's on your mind today?"
 
 
+_GREETING_PHRASES = {
+    "hey", "hi", "hello", "hiya", "yo", "sup", "howdy",
+    "hey there", "hi there", "hello there",
+    "what's up", "whats up", "what up",
+    "hey hey", "hi hi",
+}
+
 def _is_minimal_opener(text: str) -> bool:
-    """True when the first message is just a greeting with no substance to respond to."""
-    return len(text.split()) < 6
+    """True when the first message is a pure greeting with no question or substance."""
+    import re
+    normalized = re.sub(r"\btanya\b", "", text.lower(), flags=re.IGNORECASE)
+    normalized = re.sub(r"[^\w\s]", "", normalized).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized in _GREETING_PHRASES
 
 
 async def generate_new_client_coaching_opener(first_message: str) -> str:
