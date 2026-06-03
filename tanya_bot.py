@@ -168,6 +168,12 @@ CONTACT_SAVE_PROMPT_RETURNING = (
     "In case you didn't save my contact the first time, here it is again."
 )
 
+NEW_CLIENT_MINIMAL_OPENER = (
+    "Save my contact so you can always find me. So glad you reached out, what's on your mind today?"
+)
+
+RETURNING_CLIENT_MINIMAL_OPENER = "So glad you're back. What's on your mind today?"
+
 SERVICE_INQUIRY_RESPONSE = (
     "TanyaTalk is your personal coaching experience, built on Tanya's heart and master-level coaching expertise, "
     "available 24/7 right in your pocket. Whether you're working through something hard, building on something good, "
@@ -2868,6 +2874,40 @@ Rules:
         return "What's on your mind today?"
 
 
+def _is_minimal_opener(text: str) -> bool:
+    """True when the first message is just a greeting with no substance to respond to."""
+    return len(text.split()) < 6
+
+
+async def generate_new_client_coaching_opener(first_message: str) -> str:
+    """Direct Sonnet coaching response for new clients who opened with something substantive."""
+    system = """You are Tanya, a professional life coach. A brand-new client just sent their first iMessage to you. They shared something specific and real.
+
+Respond warmly and directly to what they said. Acknowledge what they shared briefly, then ask one clear coaching question that goes one layer deeper. This is the first thing they'll hear from you after your contact card.
+
+Rules:
+- 2-3 sentences max
+- No em dashes
+- Do not start with "I"
+- No mention of terms, privacy, legal, or how you work
+- No bullet points or markdown
+- Standard punctuation spacing: space after a comma, never before it
+- Never mention bots, AI, platforms, apps, or tech mechanics
+- Return only the response, nothing else"""
+
+    try:
+        response = await _claude_create(
+            model=CLAUDE_MODEL,
+            max_tokens=200,
+            system=system,
+            messages=[{"role": "user", "content": first_message}],
+        )
+        return response.content[0].text.strip().replace("—", ",").replace("–", ",")
+    except Exception as e:
+        logger.error("New client coaching opener failed: %s", e)
+        return "So glad you reached out. What's on your mind today?"
+
+
 async def prepare_new_client_opener_parts(user_text: str) -> tuple[str, str]:
     """Bridge + second-line Haiku in parallel (always two outbound messages total from Tanya)."""
     bridge, followup = await asyncio.gather(
@@ -3922,7 +3962,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
 
             if not is_ret:
                 if not awaiting_contact_save.get(phone):
-                    # Claim slot, send vCard + save prompt, then respond immediately.
+                    # Claim slot, send vCard, then respond immediately.
                     if not await billing_db.try_claim_new_user_slot(ph, DAILY_NEW_USER_CAP):
                         cap_msg = build_daily_cap_message()
                         pending_first_message_opener.pop(phone, None)
@@ -3932,12 +3972,14 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                         logger.info("Daily new-user cap reached (%d). Blocked: %s", DAILY_NEW_USER_CAP, ph[:12])
                         return
                     await blooio_send_vcard(phone)
-                    await blooio_send_message(phone, CONTACT_SAVE_PROMPT)
-                    logger.info("Contact save prompt sent; responding to first message from %s", ph[:12])
+                    logger.info("vCard sent; generating opener for first message from %s", ph[:12])
 
                 awaiting_contact_save.pop(phone, None)
-                bridge, followup = await prepare_new_client_opener_parts(user_text)
-                opener_script = f"{bridge}\n\n{followup}"
+
+                if _is_minimal_opener(user_text):
+                    opener_script = NEW_CLIENT_MINIMAL_OPENER
+                else:
+                    opener_script = await generate_new_client_coaching_opener(user_text)
 
                 # Commit state BEFORE sending — if SIGTERM fires mid-send the snapshot
                 # already shows the opener as done, preventing a re-send on restore.
@@ -3960,7 +4002,8 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 remaining_open = RESPONSE_DELAY_SECONDS - elapsed_since_anchor
                 if remaining_open > 0:
                     await asyncio.sleep(remaining_open)
-                await deliver_new_client_opener_messages(phone, user_name, bridge, followup)
+                await blooio_send_message(phone, opener_script)
+                logger.info("New client opener sent for %s", user_name)
                 return
 
             # Resend vCard on session 2 only — once is a reminder, more is annoying.
@@ -3968,50 +4011,32 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 await blooio_send_vcard(phone)
                 await blooio_send_message(phone, CONTACT_SAVE_PROMPT_RETURNING)
 
-            # Crash detection: if previous session ended without a clean close, send cut-off acknowledgment
-            cutoff_detected = await asyncio.to_thread(
-                _detect_interrupted_previous_session, ph, session_numbers.get(phone, 1)
-            )
-            if cutoff_detected:
-                cutoff_msg = "It felt like we got cut off. I'm here with you now."
-                await blooio_send_message(phone, cutoff_msg)
-                await asyncio.to_thread(append_tanya_message, session_files[phone], cutoff_msg)
-                conversations[phone].append({"role": "assistant", "content": cutoff_msg})
-                logger.info("Crash detection: interrupted session for hash %s — cut-off acknowledgment sent", ph[:12])
-
-            opener_script = await generate_returning_greeting(
-                user_name,
-                session_profiles.get(phone, ""),
-            )
-            logger.info("Returning client greeting prepared for: %s", user_name)
+            if _is_minimal_opener(user_text):
+                opener_script = RETURNING_CLIENT_MINIMAL_OPENER
+            else:
+                opener_script = await generate_new_client_coaching_opener(user_text)
 
             elapsed_open = asyncio.get_event_loop().time() - session_turn_anchor_time
             remaining_open = RESPONSE_DELAY_SECONDS - elapsed_open
             if remaining_open > 0:
                 await asyncio.sleep(remaining_open)
 
-            audio_url, start_nudge = await asyncio.gather(
-                synthesize_and_host_voice(opener_script),
-                generate_session_start_nudge(user_name, session_profiles.get(phone, "")),
-            )
-            if audio_url:
-                await blooio_send_audio(phone, audio_url)
-                logger.info("Returning client opener sent as voice for %s", user_name)
-            else:
-                await blooio_send_message(phone, opener_script)
-                logger.info("Returning client opener sent as text (ElevenLabs unavailable) for %s", user_name)
-
-            second_text = f"{start_nudge}\n\n{SESSION_CLOSE_PS}"
-            await blooio_send_message(phone, second_text)
-
             pending_first_message_opener.pop(phone, None)
-            await asyncio.to_thread(append_tanya_message, session_files[phone], opener_script)
             conversations[phone].append({"role": "assistant", "content": opener_script})
             if len(conversations[phone]) > MAX_HISTORY * 2:
                 conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
+            await asyncio.to_thread(
+                append_exchange,
+                session_files[phone],
+                user_name,
+                user_text,
+                opener_script,
+            )
             if in_ft:
                 free_trial_user_msg_count[phone] = n_ft
                 await billing_db.save_trial_msg_count(ph, n_ft)
+            await blooio_send_message(phone, opener_script)
+            logger.info("Returning client opener sent for %s", user_name)
             return
 
         message_received_at = asyncio.get_event_loop().time()
