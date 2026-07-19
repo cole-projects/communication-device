@@ -4708,6 +4708,22 @@ async def admin_usage_csv(request: Request) -> Response:
     )
 
 
+@_fastapi_app.post("/admin/grant-access")
+async def admin_grant_access(request: Request) -> Response:
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if not ADMIN_KEY or token != ADMIN_KEY:
+        return Response(status_code=401)
+    body = await request.json()
+    phone = normalize_phone(body.get("phone", ""))
+    if not phone:
+        return Response(content="missing phone", status_code=400)
+    ph = phone_to_hash(phone)
+    await billing_db.grant_access(ph)
+    paid_tanyatalk_access[phone] = True
+    return Response(content=f"granted: {ph[:12]}", status_code=200)
+
+
 @_fastapi_app.post("/webhook")
 async def blooio_webhook_endpoint(request: Request) -> Response:
     raw_body = await request.body()
