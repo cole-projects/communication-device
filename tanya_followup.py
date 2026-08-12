@@ -668,4 +668,4 @@ async def handle_mini_session_turn(phone: str, user_text: str) -> None:
     clear_mini(phone)
 
     if opening_session and _open_session_cb:
-        await _open_session_cb(phone, "")
+        asyncio.ensure_future(_open_session_cb(phone, ""))
