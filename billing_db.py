@@ -88,11 +88,10 @@ async def init_db() -> None:
                 );
             """)
             await db.commit()
-        # Add expires_at column if upgrading from older schema
-        await db.execute(
-            "ALTER TABLE paid_access ADD COLUMN expires_at TEXT"
-        ) if not await _column_exists(db, "paid_access", "expires_at") else None
-        await db.commit()
+            # Add expires_at column if upgrading from older schema
+            if not await _column_exists(db, "paid_access", "expires_at"):
+                await db.execute("ALTER TABLE paid_access ADD COLUMN expires_at TEXT")
+                await db.commit()
         _initialized = True
         logger.info("billing.db initialized at %s", _DB_PATH)
 
