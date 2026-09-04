@@ -654,9 +654,10 @@ async def handle_mini_session_turn(phone: str, user_text: str) -> None:
 
     reply = reply.replace(" — ", ", ").replace("—", ", ").replace(" – ", ", ").replace("–", ", ").replace(" ,", ",")
     ctxm.history.append({"role": "assistant", "content": reply})
-    await _send_message(phone, reply)
-
     opening_session = choice != "declined"
+
+    # Clear mini state and schedule session open BEFORE the send so a Blooio failure
+    # cannot leave the client permanently stuck in SESSION_PROMPT with no way out.
     if opening_session and _merge_focus_cb:
         transcript = _format_mini_session_transcript(ctxm.history)
         if transcript:
@@ -669,3 +670,8 @@ async def handle_mini_session_turn(phone: str, user_text: str) -> None:
 
     if opening_session and _open_session_cb:
         asyncio.ensure_future(_open_session_cb(phone, ""))
+
+    try:
+        await _send_message(phone, reply)
+    except Exception as e:
+        logger.error("Mini-session SESSION_PROMPT send failed for %s: %s", _phone_key(phone), e)

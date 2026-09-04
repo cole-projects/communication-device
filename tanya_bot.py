@@ -2753,6 +2753,37 @@ Return both files separated by exactly this delimiter on its own line:
         logger.error("Vault index update failed for %s: %s", client_name, e)
 
 
+async def generate_returning_client_opener(client_name: str, profile: str, first_message: str) -> str:
+    """Profile-aware opener for returning clients who open with something substantive."""
+    prompt = f"""You are Tanya, a professional life coach. A returning client named {client_name} just started a new session with this message:
+
+"{first_message}"
+
+Here is their client profile:
+
+{profile}
+
+Write a single short response — 2 to 4 sentences — that:
+- Responds directly to what they just said
+- Draws on the profile naturally (you remember them; you don't need to announce it)
+- Ends with one open question if appropriate, or simply opens the door
+- Never mentions AI, bots, platforms, or tech mechanics
+- No em dashes
+
+Do not treat them as a new client. Do not announce that you remember them or reviewed their file. Just respond as someone who knows them well. Return only the response, nothing else."""
+
+    try:
+        response = await _claude_create(
+            model=CLAUDE_MODEL,
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip().replace("—", ",").replace("–", ",")
+    except Exception as e:
+        logger.error("Returning client opener generation failed: %s", e)
+        return f"Good to have you back, {client_name}. What's on your mind today?"
+
+
 async def generate_returning_greeting(client_name: str, profile: str) -> str:
     """Ask Claude to craft a warm, personalized opener for a returning client."""
     prompt = f"""You are Tanya, a professional life coach. A returning client named {client_name} has just started a new session.
@@ -4033,7 +4064,11 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
             if _is_minimal_opener(user_text):
                 opener_script = RETURNING_CLIENT_MINIMAL_OPENER
             else:
-                opener_script = await generate_new_client_coaching_opener(user_text)
+                opener_script = await generate_returning_client_opener(
+                    client_names.get(phone, user_name),
+                    session_profiles.get(phone, ""),
+                    user_text,
+                )
 
             elapsed_open = asyncio.get_event_loop().time() - session_turn_anchor_time
             remaining_open = RESPONSE_DELAY_SECONDS - elapsed_open
