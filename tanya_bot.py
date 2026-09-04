@@ -122,9 +122,9 @@ except ValueError:
     RESPONSE_DELAY_SECONDS = 0.0
 
 # First session free trial: cap user turns (each turn = one user message + one Tanya reply).
-FREE_TRIAL_USER_MESSAGE_CAP = 25
-# ~90% of 25 → warn on this user message number (after 22 completed turns).
-FREE_TRIAL_90_PCT_USER_MESSAGE = 23
+FREE_TRIAL_USER_MESSAGE_CAP = 15
+# ~90% of 15 → warn on this user message number.
+FREE_TRIAL_90_PCT_USER_MESSAGE = 13
 FREE_TRIAL_90_WARNING = (
     "Quick heads up, you have used most of your free back and forth with me. "
     "After a couple more messages from you, I will share how to keep going with TanyaTalk."
@@ -186,7 +186,7 @@ SERVICE_INQUIRY_RESPONSE = (
 )
 
 PRICING_INQUIRY_RESPONSE = (
-    "You get 25 free messages to start. After that, TanyaTalk is $21/month for 250 messages, 24/7 access, "
+    "You get 15 free messages to start. After that, TanyaTalk is $21/month for 250 messages, 24/7 access, "
     "and personal follow-up texts a couple days after your sessions. "
     "You can see everything included at tanya-talk.com."
 )
@@ -2028,7 +2028,7 @@ You are speaking with a client through iMessage. Respond exactly as Tanya would:
 
 ## Pricing and Product Questions
 
-If a client asks about pricing, cost, whether TanyaTalk is free, or how much it is, answer directly and confidently: "You get 25 free messages to start. After that it's $21 a month for 250 messages, 24/7 access, and personal follow-up texts after your sessions. You can see everything at tanya-talk.com."
+If a client asks about pricing, cost, whether TanyaTalk is free, or how much it is, answer directly and confidently: "You get 15 free messages to start. After that it's $21 a month for 250 messages, 24/7 access, and personal follow-up texts after your sessions. You can see everything at tanya-talk.com."
 
 If a client asks a meta question about the product, service, or app (what is this, how does this work, what is TanyaTalk, etc.), answer briefly in character and direct them to tanya-talk.com for more details.
 
