@@ -54,6 +54,10 @@ STRIPE_PAYMENT_LINK_PLACEHOLDER = os.getenv("STRIPE_PAYMENT_LINK_PLACEHOLDER", "
 STRIPE_TOPUP_LINK = os.getenv("STRIPE_TOPUP_LINK", "").strip()
 STRIPE_PORTAL_LINK = os.getenv("STRIPE_PORTAL_LINK", "").strip()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+TIMED_ACCESS_COUPON_IDS: frozenset[str] = frozenset(
+    c.strip() for c in os.getenv("TIMED_ACCESS_COUPON_IDS", "").split(",") if c.strip()
+)
+TIMED_ACCESS_DAYS = int(os.getenv("TIMED_ACCESS_DAYS", "60"))
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_TOPUP_PRICE_ID = os.getenv("STRIPE_TOPUP_PRICE_ID", "").strip()
 STRIPE_SUBSCRIPTION_PRICE_ID = os.getenv("STRIPE_SUBSCRIPTION_PRICE_ID", "").strip()
@@ -4577,11 +4581,21 @@ async def handle_stripe_webhook(request: Request) -> Response:
             return Response(status_code=500)
         try:
             if product_type == "subscription":
-                # Access control first — if this fails, return 500 so Stripe retries
+                # Check if a timed-access coupon was applied
+                applied_coupon_ids: set[str] = set()
+                for d in (session_obj.get("total_details") or {}).get("breakdown", {}).get("discounts", []):
+                    cid = (d.get("discount") or {}).get("coupon", {}).get("id", "")
+                    if cid:
+                        applied_coupon_ids.add(cid)
+                is_timed = bool(TIMED_ACCESS_COUPON_IDS & applied_coupon_ids)
+
                 ph = phone_to_hash(phone)
-                await billing_db.grant_access(ph)
-                paid_tanyatalk_access[phone] = True  # update memory cache immediately
-                awaiting_stripe_confirmation.pop(phone, None)  # clear gate so next message routes normally
+                if is_timed:
+                    await billing_db.grant_timed_access(ph, TIMED_ACCESS_DAYS)
+                else:
+                    await billing_db.grant_access(ph)
+                paid_tanyatalk_access[phone] = True
+                awaiting_stripe_confirmation.pop(phone, None)
                 await billing_db.record_subscription_start(ph)
                 customer_id = session_obj.get("customer", "")
                 if customer_id:
@@ -4595,15 +4609,44 @@ async def handle_stripe_webhook(request: Request) -> Response:
                         )
                     except Exception as e:
                         logger.warning("Could not set customer metadata.phone: %s", e)
-                logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
-                try:
-                    await blooio_send_message(
-                        phone,
-                        "You're in. Your subscription is active and your 250 messages are ready. "
-                        "Come back whenever and we will pick up right where we left off.",
-                    )
-                except Exception as e:
-                    logger.error("Subscription welcome message failed (access already granted): %s", e)
+                    if is_timed:
+                        # Cancel the Stripe subscription so it never auto-charges
+                        try:
+                            stripe_lib.api_key = STRIPE_SECRET_KEY
+                            subs = await asyncio.to_thread(
+                                stripe_lib.Subscription.list,
+                                customer=customer_id,
+                                status="active",
+                                limit=5,
+                            )
+                            for sub in subs.get("data", []):
+                                await asyncio.to_thread(
+                                    stripe_lib.Subscription.cancel,
+                                    sub["id"],
+                                )
+                            logger.info("Cancelled Stripe subscription(s) for timed-access phone_key=%s", _phone_key(phone))
+                        except Exception as e:
+                            logger.warning("Could not cancel Stripe subscription for timed access: %s", e)
+                if is_timed:
+                    logger.info("Timed access (%d days) granted for phone_key=%s", TIMED_ACCESS_DAYS, _phone_key(phone))
+                    try:
+                        await blooio_send_message(
+                            phone,
+                            f"You're in. You have {TIMED_ACCESS_DAYS // 30} months of access and 250 messages per month. "
+                            "Come back whenever and we will pick up right where we left off.",
+                        )
+                    except Exception as e:
+                        logger.error("Timed access welcome message failed (access already granted): %s", e)
+                else:
+                    logger.info("Subscription granted for phone_key=%s", _phone_key(phone))
+                    try:
+                        await blooio_send_message(
+                            phone,
+                            "You're in. Your subscription is active and your 250 messages are ready. "
+                            "Come back whenever and we will pick up right where we left off.",
+                        )
+                    except Exception as e:
+                        logger.error("Subscription welcome message failed (access already granted): %s", e)
             else:
                 stripe_lib.api_key = STRIPE_SECRET_KEY
                 session_expanded = await asyncio.to_thread(

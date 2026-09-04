@@ -37,6 +37,12 @@ def _conn() -> aiosqlite.Connection:
     return aiosqlite.connect(_DB_PATH)
 
 
+async def _column_exists(db: aiosqlite.Connection, table: str, column: str) -> bool:
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    return any(row[1] == column for row in rows)
+
+
 async def init_db() -> None:
     global _initialized
     async with _init_lock:
@@ -48,7 +54,8 @@ async def init_db() -> None:
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS paid_access (
                     phone_hash TEXT PRIMARY KEY,
-                    granted_at TEXT NOT NULL
+                    granted_at TEXT NOT NULL,
+                    expires_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS extra_messages (
                     phone_hash TEXT PRIMARY KEY,
@@ -81,6 +88,11 @@ async def init_db() -> None:
                 );
             """)
             await db.commit()
+        # Add expires_at column if upgrading from older schema
+        await db.execute(
+            "ALTER TABLE paid_access ADD COLUMN expires_at TEXT"
+        ) if not await _column_exists(db, "paid_access", "expires_at") else None
+        await db.commit()
         _initialized = True
         logger.info("billing.db initialized at %s", _DB_PATH)
 
@@ -218,8 +230,18 @@ async def migrate_from_json(logs_dir: Path) -> None:
 async def grant_access(phone_hash: str) -> None:
     async with _conn() as db:
         await db.execute(
-            "INSERT OR REPLACE INTO paid_access (phone_hash, granted_at) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO paid_access (phone_hash, granted_at, expires_at) VALUES (?, ?, NULL)",
             (phone_hash, datetime.date.today().isoformat()),
+        )
+        await db.commit()
+
+
+async def grant_timed_access(phone_hash: str, days: int) -> None:
+    expires = (datetime.date.today() + datetime.timedelta(days=days)).isoformat()
+    async with _conn() as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO paid_access (phone_hash, granted_at, expires_at) VALUES (?, ?, ?)",
+            (phone_hash, datetime.date.today().isoformat(), expires),
         )
         await db.commit()
 
@@ -233,9 +255,15 @@ async def revoke_access(phone_hash: str) -> None:
 async def has_access(phone_hash: str) -> bool:
     async with _conn() as db:
         async with db.execute(
-            "SELECT 1 FROM paid_access WHERE phone_hash = ?", (phone_hash,)
+            "SELECT expires_at FROM paid_access WHERE phone_hash = ?", (phone_hash,)
         ) as cur:
-            return await cur.fetchone() is not None
+            row = await cur.fetchone()
+    if row is None:
+        return False
+    expires_at = row[0]
+    if expires_at is None:
+        return True
+    return datetime.date.fromisoformat(expires_at) >= datetime.date.today()
 
 
 # ---------------------------------------------------------------------------
