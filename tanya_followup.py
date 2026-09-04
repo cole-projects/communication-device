@@ -47,7 +47,7 @@ import os as _os
 FU_INTERVAL_SEC = int(_os.getenv("FOLLOWUP_DELAY_SECONDS", "172800"))  # default 48 hours; override for testing
 FU_EXTRACTION_RETRY_SEC = int(_os.getenv("FOLLOWUP_EXTRACTION_RETRY_SECONDS", "300"))  # 5 min
 FU_EXTRACTION_MAX_RETRIES = int(_os.getenv("FOLLOWUP_EXTRACTION_MAX_RETRIES", "24"))  # ~2 hours
-MIN_SESSION_NUM_FOR_FOLLOWUP = 2
+MIN_SESSION_NUM_FOR_FOLLOWUP = 1
 
 
 def _phone_key(phone: str) -> str:

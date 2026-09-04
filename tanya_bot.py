@@ -110,7 +110,7 @@ PRICE_CACHE_READ_PER_MTOK = float(os.getenv("ANTHROPIC_PRICE_CACHE_READ_PER_MTOK
 PRICE_CACHE_WRITE_PER_MTOK = float(os.getenv("ANTHROPIC_PRICE_CACHE_WRITE_PER_MTOK", "3.75"))
 
 SESSION_TIMEOUT_MINUTES = 60
-MIN_EXCHANGES_FOR_FOLLOWUP = 5
+MIN_EXCHANGES_FOR_FOLLOWUP = 2
 # Human-like pause before sending reply (anchor clock). Override via RESPONSE_DELAY_SECONDS in .env for quick tests (e.g. 3).
 try:
     RESPONSE_DELAY_SECONDS = float(os.getenv("RESPONSE_DELAY_SECONDS", "0"))
@@ -234,6 +234,9 @@ REFERRAL_NUDGE_MARKER = "<<<REFERRAL_NUDGE>>>"
 DEBOUNCE_SECONDS = 2.0
 # Typing bubble appears this many seconds after a message arrives, before debounce fires.
 TYPING_BUBBLE_DELAY_SEC = 3.0
+# Cancel an in-flight Claude call and restart with the combined messages only if the call
+# started less than this many seconds ago. If it's almost done, let it finish.
+COACHING_TASK_CANCEL_WINDOW_SEC = 4.0
 # Re-fire typing_on this often while waiting for Claude, so the indicator doesn't expire.
 _TYPING_KEEPALIVE_SEC = 20.0
 
@@ -1168,6 +1171,9 @@ _pending_messages: dict[str, list[str]] = {}  # debounce buffer
 _pending_phones: dict[str, str] = {}          # phone -> phone (replaces _pending_updates)
 _debounce_tasks: dict[str, asyncio.Task] = {}
 _typing_tasks: dict[str, asyncio.Task] = {}   # 3-second typing bubble timer
+_active_coaching_tasks: dict[str, asyncio.Task] = {}   # in-flight Claude call task per phone
+_active_task_starts: dict[str, float] = {}             # when each task started (event loop time)
+_active_task_user_text: dict[str, str] = {}            # combined user text being processed
 awaiting_delete_confirmation: dict[str, bool] = {}
 awaiting_topup_confirmation: dict[str, bool] = {}
 topup_link_sent: dict[str, bool] = {}  # link delivered; cap gate stays until Stripe webhook credits
@@ -3189,11 +3195,9 @@ async def _finalize_session_writes(
         user_turns = sum(1 for m in history if m["role"] == "user")
         paid = await has_tanyatalk_access(phone)
         if (
-            not is_dabble
-            and session_path
+            session_path
             and session_num >= tanya_followup.MIN_SESSION_NUM_FOR_FOLLOWUP
             and user_turns >= MIN_EXCHANGES_FOR_FOLLOWUP
-            and paid
         ):
             ended_at = tanya_followup._session_ended_at_from_extraction(session_path)
             if not _session_has_follow_up_extraction(session_path):
@@ -3207,14 +3211,10 @@ async def _finalize_session_writes(
                 phone, client_name, session_path, session_num, ended_at,
             )
         elif session_path:
-            if is_dabble:
-                reason = "dabble archive"
-            elif session_num < tanya_followup.MIN_SESSION_NUM_FOR_FOLLOWUP:
-                reason = "session 1"
+            if session_num < tanya_followup.MIN_SESSION_NUM_FOR_FOLLOWUP:
+                reason = f"session {session_num} below minimum"
             elif user_turns < MIN_EXCHANGES_FOR_FOLLOWUP:
                 reason = f"{user_turns} user turns < {MIN_EXCHANGES_FOR_FOLLOWUP}"
-            elif not paid:
-                reason = "no paid access"
             else:
                 reason = "unknown"
             logger.info(
@@ -4410,6 +4410,22 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         await blooio_send_message(phone, prompt)
         return
 
+    # If a Claude call is already in flight for this phone and started recently enough,
+    # cancel it and fold its user text back into the pending buffer so the next fire
+    # includes everything in one combined call.
+    active_task = _active_coaching_tasks.get(phone)
+    if active_task and not active_task.done():
+        elapsed = asyncio.get_event_loop().time() - _active_task_starts.get(phone, 0.0)
+        if elapsed < COACHING_TASK_CANCEL_WINDOW_SEC:
+            prior_text = _active_task_user_text.get(phone)
+            if prior_text:
+                _pending_messages.setdefault(phone, []).insert(0, prior_text)
+            active_task.cancel()
+            logger.info(
+                "Cancelled in-flight coaching task (%.1fs elapsed) for %s — merging with new message",
+                elapsed, _phone_key(phone),
+            )
+
     # Debounce: buffer this message and wait for more before firing to Claude.
     _pending_messages.setdefault(phone, []).append(user_text)
     _pending_phones[phone] = phone
@@ -4439,9 +4455,26 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         _debounce_tasks.pop(phone, None)
         msgs = _pending_messages.pop(phone, [])
         _pending_phones.pop(phone, None)
-        if msgs:
-            combined = "\n\n".join(msgs)
+        if not msgs:
+            return
+        combined = "\n\n".join(msgs)
+        task = asyncio.current_task()
+        _active_coaching_tasks[phone] = task
+        _active_task_starts[phone] = asyncio.get_event_loop().time()
+        _active_task_user_text[phone] = combined
+        try:
             await _fire_coaching_message(phone, user_name, combined)
+        except asyncio.CancelledError:
+            # A new message arrived mid-generation. Clean up any orphaned user message
+            # that was appended to conversations before the Claude call was cancelled.
+            conv = conversations.get(phone)
+            if conv and conv[-1].get("role") == "user" and conv[-1].get("content") in combined:
+                conv.pop()
+            raise
+        finally:
+            _active_coaching_tasks.pop(phone, None)
+            _active_task_starts.pop(phone, None)
+            _active_task_user_text.pop(phone, None)
 
     _debounce_tasks[phone] = asyncio.ensure_future(_fire())
 
