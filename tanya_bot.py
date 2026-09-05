@@ -1164,6 +1164,8 @@ free_trial_user_msg_count: dict[str, int] = {}
 free_trial_90_warned: dict[str, bool] = {}
 free_trial_completed: dict[str, bool] = {}  # survives end_session; do not pop
 awaiting_stripe_confirmation: dict[str, bool] = {}
+stripe_declined_at: dict[str, float] = {}   # phone -> event-loop time of last decline
+stripe_checkout_sent: dict[str, bool] = {}  # phone -> True once a checkout URL was sent this cycle
 awaiting_contact_save: dict[str, bool] = {}
 pending_first_message_opener: dict[str, bool] = {}
 paid_tanyatalk_access: dict[str, bool] = {}  # True when Stripe subscription active
@@ -2409,6 +2411,34 @@ def _is_service_inquiry(text: str) -> bool:
     return False
 
 
+_POST_DECLINE_ACK_PHRASES = {
+    "ok", "okay", "k", "kk", "thanks", "thank you", "ty", "thx",
+    "alright", "got it", "understood", "sure", "fine", "i see",
+    "ok thanks", "ok thank you", "okay thanks", "okay thank you",
+    "sounds good", "no problem", "np",
+}
+
+def _is_post_decline_acknowledgment(text: str) -> bool:
+    """True when the message is a simple acknowledgment with no new intent."""
+    normalized = re.sub(r"[^\w\s]", "", text.lower()).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized in _POST_DECLINE_ACK_PHRASES
+
+
+_PRICING_QUESTION_SIGNALS = [
+    "free", "cheaper", "cost", "price", "how much", "payment", "pay",
+    "subscription", "monthly", "charge", "fee", "afford", "discount",
+    "trial", "app", "advice", "what is this", "what does this",
+]
+
+def _is_pricing_or_product_question(text: str) -> bool:
+    """True when the message is a question about pricing, the product, or the free trial."""
+    t = text.lower()
+    has_question = "?" in t or any(w in t for w in ("what", "how", "is this", "is it", "or", "thought"))
+    has_signal = any(s in t for s in _PRICING_QUESTION_SIGNALS)
+    return has_question and has_signal and len(t) < 120
+
+
 def _session_has_follow_up_extraction(session_path: Path) -> bool:
     try:
         return "## Follow-Up Extraction" in session_path.read_text(encoding="utf-8")
@@ -3324,6 +3354,7 @@ def _clear_session_memory(phone: str) -> None:
     pending_first_message_opener.pop(phone, None)
     awaiting_contact_save.pop(phone, None)
     awaiting_topup_confirmation.pop(phone, None)
+    stripe_checkout_sent.pop(phone, None)
     free_trial_user_msg_count.pop(phone, None)
     free_trial_90_warned.pop(phone, None)
     last_activity.pop(phone, None)
@@ -3882,35 +3913,56 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
     async with lock:
         if await should_block_unpaid_after_free_trial(phone):
             if awaiting_stripe_confirmation.get(phone):
-                intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
-                if intent == "affirmative":
-                    awaiting_stripe_confirmation.pop(phone, None)
-                    if STRIPE_SECRET_KEY and STRIPE_SUBSCRIPTION_PRICE_ID:
-                        checkout_url = None
-                        for attempt in range(2):
-                            try:
-                                checkout_url = await create_subscription_checkout_url(phone)
-                                break
-                            except Exception as e:
-                                if attempt == 0:
-                                    await asyncio.sleep(2)
-                                else:
-                                    logger.error("Checkout URL failed after retry: %s", e)
-                        if checkout_url:
-                            await blooio_send_message(phone, f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}")
-                        else:
-                            awaiting_stripe_confirmation[phone] = True
-                            await blooio_send_message(phone, "Having a small tech hiccup. Text me back in a minute and I'll send you the link.")
-                    elif STRIPE_PAYMENT_LINK:
-                        await blooio_send_message(phone, f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}")
-                elif intent == "negative":
-                    awaiting_stripe_confirmation.pop(phone, None)
-                    await blooio_send_message(phone, FREE_TRIAL_STRIPE_DECLINED)
+                if _is_pricing_or_product_question(user_text):
+                    await blooio_send_message(phone, PRICING_INQUIRY_RESPONSE)
+                    await blooio_send_message(phone, "Just reply yes whenever you're ready and I'll send you the link.")
                 else:
-                    await blooio_send_message(phone, STRIPE_CONFIRMATION_UNCLEAR_REPLY)
+                    intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
+                    if intent == "affirmative":
+                        awaiting_stripe_confirmation.pop(phone, None)
+                        if stripe_checkout_sent.get(phone):
+                            await blooio_send_message(phone, "I already sent you the link just above. Come back whenever you're ready.")
+                        elif STRIPE_SECRET_KEY and STRIPE_SUBSCRIPTION_PRICE_ID:
+                            checkout_url = None
+                            for attempt in range(2):
+                                try:
+                                    checkout_url = await create_subscription_checkout_url(phone)
+                                    break
+                                except Exception as e:
+                                    if attempt == 0:
+                                        await asyncio.sleep(2)
+                                    else:
+                                        logger.error("Checkout URL failed after retry: %s", e)
+                            if checkout_url:
+                                stripe_checkout_sent[phone] = True
+                                await blooio_send_message(phone, f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}")
+                            else:
+                                awaiting_stripe_confirmation[phone] = True
+                                await blooio_send_message(phone, "Having a small tech hiccup. Text me back in a minute and I'll send you the link.")
+                        elif STRIPE_PAYMENT_LINK:
+                            stripe_checkout_sent[phone] = True
+                            await blooio_send_message(phone, f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}")
+                    elif intent == "negative":
+                        awaiting_stripe_confirmation.pop(phone, None)
+                        stripe_declined_at[phone] = asyncio.get_event_loop().time()
+                        await blooio_send_message(phone, FREE_TRIAL_STRIPE_DECLINED)
+                    else:
+                        await blooio_send_message(phone, STRIPE_CONFIRMATION_UNCLEAR_REPLY)
             else:
-                awaiting_stripe_confirmation[phone] = True
-                await blooio_send_message(phone, POST_FREE_TRIAL_BLOCK_MESSAGE)
+                # Not in stripe confirmation state. Check if they recently declined and are
+                # just acknowledging — if so, respond warmly without re-pitching.
+                declined_at = stripe_declined_at.get(phone, 0.0)
+                recently_declined = declined_at and (asyncio.get_event_loop().time() - declined_at) < 3600
+                if recently_declined and _is_post_decline_acknowledgment(user_text):
+                    await blooio_send_message(phone, "Of course. I'll be right here when you're ready.")
+                elif recently_declined and _is_pricing_or_product_question(user_text):
+                    await blooio_send_message(phone, PRICING_INQUIRY_RESPONSE)
+                    awaiting_stripe_confirmation[phone] = True
+                    await blooio_send_message(phone, "Just reply yes whenever you're ready and I'll send you the link.")
+                else:
+                    stripe_checkout_sent.pop(phone, None)
+                    awaiting_stripe_confirmation[phone] = True
+                    await blooio_send_message(phone, POST_FREE_TRIAL_BLOCK_MESSAGE)
             return
 
         session_turn_anchor_time = asyncio.get_event_loop().time()
@@ -4297,38 +4349,48 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         await blooio_typing_on(phone)
         lock = await _get_chat_message_lock(phone)
         async with lock:
-            intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
-            if intent == "affirmative":
-                awaiting_stripe_confirmation.pop(phone, None)
-                if STRIPE_SECRET_KEY and STRIPE_SUBSCRIPTION_PRICE_ID:
-                    checkout_url = None
-                    for attempt in range(2):
-                        try:
-                            checkout_url = await create_subscription_checkout_url(phone)
-                            break
-                        except Exception as e:
-                            if attempt == 0:
-                                await asyncio.sleep(2)
-                            else:
-                                logger.error("Subscription checkout URL failed after retry: %s", e)
-                    if checkout_url:
+            # Answer product/pricing questions naturally rather than running them through the classifier.
+            if _is_pricing_or_product_question(user_text):
+                await blooio_send_message(phone, PRICING_INQUIRY_RESPONSE)
+                await blooio_send_message(phone, "Just reply yes whenever you're ready and I'll send you the link.")
+            else:
+                intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
+                if intent == "affirmative":
+                    awaiting_stripe_confirmation.pop(phone, None)
+                    if stripe_checkout_sent.get(phone):
+                        await blooio_send_message(phone, "I already sent you the link just above. Come back whenever you're ready.")
+                    elif STRIPE_SECRET_KEY and STRIPE_SUBSCRIPTION_PRICE_ID:
+                        checkout_url = None
+                        for attempt in range(2):
+                            try:
+                                checkout_url = await create_subscription_checkout_url(phone)
+                                break
+                            except Exception as e:
+                                if attempt == 0:
+                                    await asyncio.sleep(2)
+                                else:
+                                    logger.error("Subscription checkout URL failed after retry: %s", e)
+                        if checkout_url:
+                            stripe_checkout_sent[phone] = True
+                            await blooio_send_message(
+                                phone,
+                                f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}",
+                            )
+                        else:
+                            awaiting_stripe_confirmation[phone] = True
+                            await blooio_send_message(phone, "Having a small tech hiccup. Text me back in a minute and I'll send you the link.")
+                    elif STRIPE_PAYMENT_LINK:
+                        stripe_checkout_sent[phone] = True
                         await blooio_send_message(
                             phone,
-                            f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}",
+                            f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}",
                         )
-                    else:
-                        awaiting_stripe_confirmation[phone] = True
-                        await blooio_send_message(phone, "Having a small tech hiccup. Text me back in a minute and I'll send you the link.")
-                elif STRIPE_PAYMENT_LINK:
-                    await blooio_send_message(
-                        phone,
-                        f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}",
-                    )
-            elif intent == "negative":
-                awaiting_stripe_confirmation.pop(phone, None)
-                await blooio_send_message(phone, FREE_TRIAL_STRIPE_DECLINED)
-            else:
-                await blooio_send_message(phone, STRIPE_CONFIRMATION_UNCLEAR_REPLY)
+                elif intent == "negative":
+                    awaiting_stripe_confirmation.pop(phone, None)
+                    stripe_declined_at[phone] = asyncio.get_event_loop().time()
+                    await blooio_send_message(phone, FREE_TRIAL_STRIPE_DECLINED)
+                else:
+                    await blooio_send_message(phone, STRIPE_CONFIRMATION_UNCLEAR_REPLY)
         return
 
     # Delete confirmation: client already triggered the delete flow, waiting on yes/no.
