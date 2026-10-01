@@ -1417,6 +1417,74 @@ def load_client_profile(phone_hash: str) -> str:
     return content
 
 
+async def generate_trial_closing_nugget(phone: str, ph: str) -> str:
+    """Generate a personalized coaching nugget for the free trial warning message.
+
+    Reads the client's BecomingYou phase and session history, calls Haiku to
+    produce a short paragraph in Tanya's voice teaching the concept that fits
+    where they actually are, then appends the Becoming You program mention.
+    Falls back to the static warning if anything goes wrong.
+    """
+    try:
+        profile = await asyncio.to_thread(load_client_profile, ph)
+        becoming_you = await asyncio.to_thread(
+            load_file,
+            Path(VAULT_PATH) / "01-Frameworks" / "BecomingYou.md",
+        )
+        history = conversations.get(phone, [])
+        convo_text = "\n".join(
+            f"{'Client' if m['role'] == 'user' else 'Tanya'}: {m['content']}"
+            for m in history
+            if isinstance(m.get("content"), str)
+        )
+
+        system = (
+            "You are writing one short paragraph in Tanya's voice -- a warm, direct, "
+            "emotionally attuned life coach. No em dashes. No filler phrases. "
+            "Do not mention the framework by its full name or make it feel like a lesson. "
+            "Write as if Tanya is speaking naturally, leaving the client with a parting gift.\n\n"
+            "The paragraph must:\n"
+            "1. Name what the client is experiencing using a concept from the BecomingYou "
+            "framework that matches their current phase -- not always Circumstance and Contrast. "
+            "Use whichever phase they are actually in.\n"
+            "2. Relate it directly to the specific thing they talked about in this session.\n"
+            "3. Offer one concrete micro-practice or shift in perspective they can carry with "
+            "them to strengthen their capacity at this phase.\n"
+            "4. Sound like a parting gift, not a sales pitch or a lesson.\n\n"
+            f"BecomingYou Framework (for reference):\n{becoming_you}\n\n"
+            f"Client profile:\n{profile}"
+        )
+
+        user_msg = (
+            f"Here is today's session so far:\n\n{convo_text}\n\n"
+            "Write the closing coaching paragraph now. One paragraph only. No header, "
+            "no sign-off, no extra lines."
+        )
+
+        response = await _claude_create(
+            model=CLAUDE_HAIKU_MODEL,
+            max_tokens=300,
+            system=system,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        nugget = response.content[0].text.strip()
+
+        closing = (
+            "\n\nWhat I just shared with you is actually part of a larger framework called "
+            "Becoming You -- a six month coaching program built to help people navigate life "
+            "with more clarity, fulfillment, and certainty. You can learn more at "
+            "meshcoaching.com and follow along at @mesh_coaching on Instagram. "
+            "Since you only have a couple messages left, use them well -- ask me anything "
+            "you're still sitting with from today."
+        )
+
+        return f"{FREE_TRIAL_90_WARNING}\n\n{nugget}{closing}"
+
+    except Exception as e:
+        logger.warning("Trial closing nugget generation failed: %s", e)
+        return FREE_TRIAL_90_WARNING
+
+
 def profile_path_for(phone_hash: str) -> Path:
     return Path(VAULT_PATH) / "02-Client-Sessions" / "Client Profiles" / f"{phone_hash}.md"
 
@@ -4004,7 +4072,8 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
 
         if in_ft and n_ft == FREE_TRIAL_90_PCT_USER_MESSAGE and not free_trial_90_warned.get(phone):
             free_trial_90_warned[phone] = True
-            await blooio_send_message(phone, FREE_TRIAL_90_WARNING)
+            warning_msg = await generate_trial_closing_nugget(phone, ph)
+            await blooio_send_message(phone, warning_msg)
 
         archive_context = ""
         if any(sig in user_text.lower() for sig in ARCHIVE_REFERENCE_SIGNALS):
