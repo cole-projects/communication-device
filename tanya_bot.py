@@ -4985,12 +4985,13 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
         else:
             logger.info("Blooio webhook event=%s — ignored (not message.received)", event_type)
         return Response(status_code=200)
-    phone = payload.get("sender") or payload.get("from", "")
-    text = payload.get("text", "")
-    is_group = payload.get("is_group", False)
-    logger.info("Webhook payload: phone_key=%s text_len=%s is_group=%s keys=%s", _phone_key(phone) if phone else "", len(text) if text else 0, is_group, list(payload.keys()))
-    if payload.get("error_code") or payload.get("error_message"):
-        logger.warning("Blooio delivery error: error_code=%s error_message=%s message_id=%s", payload.get("error_code"), payload.get("error_message"), payload.get("message_id"))
+    data = payload.get("data", {})
+    phone = data.get("sender") or data.get("from", "")
+    text = data.get("text", "")
+    is_group = data.get("group") is not None
+    logger.info("Webhook payload: phone_key=%s text_len=%s is_group=%s keys=%s", _phone_key(phone) if phone else "", len(text) if text else 0, is_group, list(data.keys()))
+    if data.get("error_code") or data.get("error_message"):
+        logger.warning("Blooio delivery error: error_code=%s error_message=%s message_id=%s", data.get("error_code"), data.get("error_message"), data.get("message_id"))
         return Response(status_code=200)
     if phone and not is_group:
         if text:
