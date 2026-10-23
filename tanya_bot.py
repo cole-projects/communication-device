@@ -4963,6 +4963,7 @@ async def blooio_webhook_endpoint(request: Request) -> Response:
         payload = json.loads(raw_body)
     except Exception:
         return Response(status_code=400)
+    logger.info("Blooio raw payload: %s", json.dumps(payload))
     event_type = request.headers.get("x-blooio-event", "")
     if event_type and event_type != "message.received":
         if event_type == "message.failed":
