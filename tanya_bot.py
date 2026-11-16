@@ -62,6 +62,14 @@ TIMED_ACCESS_DAYS = int(os.getenv("TIMED_ACCESS_DAYS", "60"))
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_TOPUP_PRICE_ID = os.getenv("STRIPE_TOPUP_PRICE_ID", "").strip()
 STRIPE_SUBSCRIPTION_PRICE_ID = os.getenv("STRIPE_SUBSCRIPTION_PRICE_ID", "").strip()
+# Black Friday sale. While BLACK_FRIDAY_CODE is set and it is before PROMO_END, price texts tell
+# clients to enter that Stripe promotion code at checkout ($21 -> $10/month for life). Checkout
+# itself is unchanged: clients type the code in Stripe's promo code box, so other codes keep working.
+# Clients whose free trial started before PROMO_END keep the offer for PROMO_GRACE_HOURS after it.
+# After that the texts revert to $21 on their own; unset BLACK_FRIDAY_CODE to end it early.
+BLACK_FRIDAY_CODE = os.getenv("BLACK_FRIDAY_CODE", "").strip()
+PROMO_END = datetime.datetime.fromisoformat(os.getenv("PROMO_END", "2026-12-01T23:59:59-05:00").strip())
+PROMO_GRACE_HOURS = float(os.getenv("PROMO_GRACE_HOURS", "48"))
 # Blooio iMessage API
 BLOOIO_API_KEY = os.getenv("BLOOIO_API_KEY", "").strip()
 BLOOIO_WEBHOOK_SECRET = os.getenv("BLOOIO_WEBHOOK_SECRET", "").strip()
@@ -130,10 +138,20 @@ FREE_TRIAL_90_WARNING = (
     "Quick heads up, you have used most of your free back and forth with me. "
     "After a couple more messages from you, I will share how to keep going with TanyaTalk."
 )
-POST_FREE_TRIAL_BLOCK_MESSAGE = (
-    "If you'd like to use TanyaTalk, it's $21 a month for 250 messages. "
-    "Reply yes and I'll send you the link."
-)
+def _black_friday_offer() -> str:
+    return (
+        "TanyaTalk is on sale for Black Friday. Use code " + BLACK_FRIDAY_CODE + " at checkout "
+        "to lock in $10 a month for life instead of $21, with 250 messages a month. "
+    )
+
+
+def post_free_trial_block_message(promo: bool) -> str:
+    if promo:
+        return "If you'd like to keep going, " + _black_friday_offer() + "Reply yes and I'll send you the link."
+    return (
+        "If you'd like to use TanyaTalk, it's $21 a month for 250 messages. "
+        "Reply yes and I'll send you the link."
+    )
 POST_TRIAL_RESET_DENIED_MESSAGE = (
     "That cannot start another free session. Your trial is complete. "
     "Subscribe through TanyaTalk when you are ready, and we continue from there. "
@@ -186,11 +204,20 @@ SERVICE_INQUIRY_RESPONSE = (
     "You can learn more at tanya-talk.com."
 )
 
-PRICING_INQUIRY_RESPONSE = (
-    "You get 15 free messages to start. After that, TanyaTalk is $21/month for 250 messages, 24/7 access, "
-    "and personal follow-up texts a couple days after your sessions. "
-    "You can see everything included at tanya-talk.com."
-)
+def pricing_inquiry_response(promo: bool) -> str:
+    if promo:
+        return (
+            "You get 15 free messages to start. After that, TanyaTalk is normally $21/month, but for Black Friday "
+            "you can use code " + BLACK_FRIDAY_CODE + " at checkout to lock in $10/month for life. "
+            "That includes 250 messages a month, 24/7 access, "
+            "and personal follow-up texts a couple days after your sessions. "
+            "You can see everything included at tanya-talk.com."
+        )
+    return (
+        "You get 15 free messages to start. After that, TanyaTalk is $21/month for 250 messages, 24/7 access, "
+        "and personal follow-up texts a couple days after your sessions. "
+        "You can see everything included at tanya-talk.com."
+    )
 
 OPENER_INTRO = (
     "Hi, I'm Tanya. I've spent years helping people work through what's on their mind, "
@@ -214,11 +241,42 @@ OPENER_INTRO = (
 # Brief pause between separate new-client opener bubbles (after typing delay).
 NEW_CLIENT_OPENER_BEAT_SEC = 1.0
 
-FREE_TRIAL_CLOSE_TEXT = (
-    "Unfortunately, this is where our time wraps up. That was a great session. "
-    "If you want to keep going, it's $21 a month for 250 messages. "
-    "Reply yes and I'll send you the link."
-)
+def free_trial_close_text(promo: bool) -> str:
+    if promo:
+        return (
+            "Unfortunately, this is where our time wraps up. That was a great session. "
+            "If you want to keep going, " + _black_friday_offer() + "Reply yes and I'll send you the link."
+        )
+    return (
+        "Unfortunately, this is where our time wraps up. That was a great session. "
+        "If you want to keep going, it's $21 a month for 250 messages. "
+        "Reply yes and I'll send you the link."
+    )
+
+
+async def promo_applies(phone: str) -> bool:
+    """True if this client should get the Black Friday price right now."""
+    if not BLACK_FRIDAY_CODE:
+        return False
+    now = datetime.datetime.now(timezone.utc)
+    if now <= PROMO_END:
+        return True
+    if now > PROMO_END + datetime.timedelta(hours=PROMO_GRACE_HOURS):
+        return False
+    # Grace window: honor the sale for clients whose trial started before it ended.
+    try:
+        started = await billing_db.get_onboarded_at(phone_to_hash(phone))
+    except Exception as e:
+        logger.warning("Promo grace lookup failed: %s", e)
+        return False
+    return started is not None and started <= PROMO_END
+
+
+async def checkout_code_reminder(phone: str) -> str:
+    """Line added to the checkout-link text during the sale so clients remember the code."""
+    if await promo_applies(phone):
+        return f" Don't forget to use code {BLACK_FRIDAY_CODE} at checkout for $10 a month for life."
+    return ""
 
 FREE_TRIAL_STRIPE_DECLINED = (
     "That's completely okay. Whenever you feel ready, I'll be right here. "
@@ -2060,6 +2118,7 @@ def build_static_prompt(
     client_profile: str = "",
     session_outline: str = "",
     becoming_you_phase_line: str | None = None,
+    promo: bool = False,
 ) -> str:
     """Static portion of the system prompt — identical for every message in a session.
     Sent with cache_control so Anthropic caches it after the first call."""
@@ -2079,6 +2138,15 @@ def build_static_prompt(
             "Weave framework language naturally when it fits. Do not announce or label the phase to the client unless the moment truly calls for it.\n"
         )
     blend = coaching_teaching_blend_instruction()
+    pricing_answer = (
+        "You get 15 free messages to start. After that it's normally $21 a month, but for Black Friday "
+        "you can use code " + BLACK_FRIDAY_CODE + " at checkout to lock in $10 a month for life. "
+        "That includes 250 messages, 24/7 access, and personal "
+        "follow-up texts after your sessions. You can see everything at tanya-talk.com."
+        if promo
+        else "You get 15 free messages to start. After that it's $21 a month for 250 messages, 24/7 access, "
+        "and personal follow-up texts after your sessions. You can see everything at tanya-talk.com."
+    )
 
     return f"""You are Tanya, a professional life coach.
 
@@ -2099,7 +2167,7 @@ You are speaking with a client through iMessage. Respond exactly as Tanya would:
 
 ## Pricing and Product Questions
 
-If a client asks about pricing, cost, whether TanyaTalk is free, or how much it is, answer directly and confidently: "You get 15 free messages to start. After that it's $21 a month for 250 messages, 24/7 access, and personal follow-up texts after your sessions. You can see everything at tanya-talk.com."
+If a client asks about pricing, cost, whether TanyaTalk is free, or how much it is, answer directly and confidently: "{pricing_answer}"
 
 If a client asks a meta question about the product, service, or app (what is this, how does this work, what is TanyaTalk, etc.), answer briefly in character and direct them to tanya-talk.com for more details.
 
@@ -3777,7 +3845,7 @@ async def session_timeout_task(phone: str, *, delay_seconds: float | None = None
     if ended_quietly:
         return
     if ended:
-        close_text = FREE_TRIAL_CLOSE_TEXT if is_ft else SESSION_CLOSE_CONFIRMATION
+        close_text = free_trial_close_text(await promo_applies(phone)) if is_ft else SESSION_CLOSE_CONFIRMATION
         try:
             await blooio_send_message(phone, close_text)
         except Exception:
@@ -3864,7 +3932,7 @@ async def perform_session_close(phone: str, user_text: str) -> bool:
         is_ft = await in_first_free_trial_session(phone)
         ft_count = free_trial_user_msg_count.get(phone, 0)
         is_quiet_dabble = is_ft and ft_count < FREE_TRIAL_MIN_MSGS_FOR_CLOSE
-        close_text = FREE_TRIAL_CLOSE_TEXT if (is_ft and not is_quiet_dabble) else SESSION_CLOSE_CONFIRMATION
+        close_text = free_trial_close_text(await promo_applies(phone)) if (is_ft and not is_quiet_dabble) else SESSION_CLOSE_CONFIRMATION
 
         client_name = client_names.get(phone, "Client")
         user_close = user_text.strip() or "end session"
@@ -3983,7 +4051,7 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
         if await should_block_unpaid_after_free_trial(phone):
             if awaiting_stripe_confirmation.get(phone):
                 if _is_pricing_or_product_question(user_text):
-                    await blooio_send_message(phone, PRICING_INQUIRY_RESPONSE)
+                    await blooio_send_message(phone, pricing_inquiry_response(await promo_applies(phone)))
                     await blooio_send_message(phone, "Just reply yes whenever you're ready and I'll send you the link.")
                 else:
                     intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
@@ -4004,13 +4072,13 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                                         logger.error("Checkout URL failed after retry: %s", e)
                             if checkout_url:
                                 stripe_checkout_sent[phone] = True
-                                await blooio_send_message(phone, f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}")
+                                await blooio_send_message(phone, f"Here you go. Come back whenever you are ready and we will pick up right where we left off." + await checkout_code_reminder(phone) + f"\n\n{checkout_url}")
                             else:
                                 awaiting_stripe_confirmation[phone] = True
                                 await blooio_send_message(phone, "Having a small tech hiccup. Text me back in a minute and I'll send you the link.")
                         elif STRIPE_PAYMENT_LINK:
                             stripe_checkout_sent[phone] = True
-                            await blooio_send_message(phone, f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}")
+                            await blooio_send_message(phone, f"Here you go. Come back whenever you are ready." + await checkout_code_reminder(phone) + f"\n\n{STRIPE_PAYMENT_LINK}")
                     elif intent == "negative":
                         awaiting_stripe_confirmation.pop(phone, None)
                         stripe_declined_at[phone] = asyncio.get_event_loop().time()
@@ -4025,13 +4093,13 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 if recently_declined and _is_post_decline_acknowledgment(user_text):
                     await blooio_send_message(phone, "Of course. I'll be right here when you're ready.")
                 elif recently_declined and _is_pricing_or_product_question(user_text):
-                    await blooio_send_message(phone, PRICING_INQUIRY_RESPONSE)
+                    await blooio_send_message(phone, pricing_inquiry_response(await promo_applies(phone)))
                     awaiting_stripe_confirmation[phone] = True
                     await blooio_send_message(phone, "Just reply yes whenever you're ready and I'll send you the link.")
                 else:
                     stripe_checkout_sent.pop(phone, None)
                     awaiting_stripe_confirmation[phone] = True
-                    await blooio_send_message(phone, POST_FREE_TRIAL_BLOCK_MESSAGE)
+                    await blooio_send_message(phone, post_free_trial_block_message(await promo_applies(phone)))
             return
 
         session_turn_anchor_time = asyncio.get_event_loop().time()
@@ -4101,7 +4169,8 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
             }
 
         if in_ft and n_ft == FREE_TRIAL_USER_MESSAGE_CAP:
-            conversations[phone].append({"role": "assistant", "content": FREE_TRIAL_CLOSE_TEXT})
+            ft_close_text = free_trial_close_text(await promo_applies(phone))
+            conversations[phone].append({"role": "assistant", "content": ft_close_text})
             if len(conversations[phone]) > MAX_HISTORY * 2:
                 conversations[phone] = conversations[phone][-(MAX_HISTORY * 2):]
             await asyncio.to_thread(
@@ -4109,9 +4178,9 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
                 session_files[phone],
                 user_name,
                 user_text,
-                FREE_TRIAL_CLOSE_TEXT,
+                ft_close_text,
             )
-            await blooio_send_message(phone, FREE_TRIAL_CLOSE_TEXT)
+            await blooio_send_message(phone, ft_close_text)
             await mark_free_trial_completed(phone)
             free_trial_user_msg_count[phone] = FREE_TRIAL_USER_MESSAGE_CAP
             await billing_db.delete_trial_msg_count(ph)
@@ -4224,7 +4293,8 @@ async def _fire_coaching_message(phone: str, user_name: str, user_text: str) -> 
         client_profile = session_profiles.get(phone, "")
         phase_line = becoming_you_phase_for_prompt(client_profile)
         static_prompt = build_static_prompt(
-            client_profile, session_outlines.get(phone, ""), phase_line
+            client_profile, session_outlines.get(phone, ""), phase_line,
+            promo=await promo_applies(phone),
         )
         _cached_static_prompts[phone] = static_prompt
         start_cache_warming(phone)
@@ -4421,7 +4491,7 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
         async with lock:
             # Answer product/pricing questions naturally rather than running them through the classifier.
             if _is_pricing_or_product_question(user_text):
-                await blooio_send_message(phone, PRICING_INQUIRY_RESPONSE)
+                await blooio_send_message(phone, pricing_inquiry_response(await promo_applies(phone)))
                 await blooio_send_message(phone, "Just reply yes whenever you're ready and I'll send you the link.")
             else:
                 intent = await classify_stripe_confirmation_intent(phone, user_name, user_text)
@@ -4444,7 +4514,7 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
                             stripe_checkout_sent[phone] = True
                             await blooio_send_message(
                                 phone,
-                                f"Here you go. Come back whenever you are ready and we will pick up right where we left off.\n\n{checkout_url}",
+                                f"Here you go. Come back whenever you are ready and we will pick up right where we left off." + await checkout_code_reminder(phone) + f"\n\n{checkout_url}",
                             )
                         else:
                             awaiting_stripe_confirmation[phone] = True
@@ -4453,7 +4523,7 @@ async def handle_inbound_message(phone: str, user_text: str) -> None:
                         stripe_checkout_sent[phone] = True
                         await blooio_send_message(
                             phone,
-                            f"Here you go. Come back whenever you are ready.\n\n{STRIPE_PAYMENT_LINK}",
+                            f"Here you go. Come back whenever you are ready." + await checkout_code_reminder(phone) + f"\n\n{STRIPE_PAYMENT_LINK}",
                         )
                 elif intent == "negative":
                     awaiting_stripe_confirmation.pop(phone, None)
@@ -4703,7 +4773,11 @@ async def handle_stripe_webhook(request: Request) -> Response:
     if event["type"] == "checkout.session.completed":
         session_obj = event["data"]["object"]
         metadata = session_obj.get("metadata") or {}
-        product_type = metadata.get("product_type", "topup")
+        # Sessions from Stripe Payment Links carry no metadata, so fall back to the session mode
+        # (otherwise a subscription bought through a Payment Link was credited as a top-up).
+        product_type = metadata.get("product_type") or (
+            "subscription" if session_obj.get("mode") == "subscription" else "topup"
+        )
         phone = await _resolve_stripe_checkout_phone(session_obj)
         if not phone:
             logger.error(

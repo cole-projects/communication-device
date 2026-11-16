@@ -582,3 +582,15 @@ async def get_stripe_customer_id(phone_hash: str) -> str | None:
         ) as cur:
             row = await cur.fetchone()
             return row[0] if row else None
+
+
+async def get_onboarded_at(phone_hash: str) -> datetime.datetime | None:
+    """When this client first started (their free trial), as an aware UTC datetime."""
+    async with _conn() as db:
+        async with db.execute(
+            "SELECT onboarded_at FROM new_user_onboards WHERE phone_hash = ?", (phone_hash,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        return None
+    return datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
