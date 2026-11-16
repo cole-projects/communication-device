@@ -4712,8 +4712,18 @@ async def create_topup_checkout_url(phone: str) -> str:
 async def create_subscription_checkout_url(phone: str) -> str:
     import stripe as stripe_lib
     stripe_lib.api_key = STRIPE_SECRET_KEY
-    session = await asyncio.to_thread(
-        stripe_lib.checkout.Session.create,
+    extra = {}
+    if await promo_applies(phone):
+        # Shown right above the Subscribe button; disappears with the sale.
+        extra["custom_text"] = {
+            "submit": {
+                "message": (
+                    f"Black Friday: tap Add promotion code and enter {BLACK_FRIDAY_CODE} "
+                    "for $10/month for life."
+                )
+            }
+        }
+    params = dict(
         line_items=[{"price": STRIPE_SUBSCRIPTION_PRICE_ID, "quantity": 1}],
         mode="subscription",
         allow_promotion_codes=True,
@@ -4723,6 +4733,14 @@ async def create_subscription_checkout_url(phone: str) -> str:
         success_url="https://stripe.com",
         cancel_url="https://stripe.com",
     )
+    if extra:
+        try:
+            session = await asyncio.to_thread(stripe_lib.checkout.Session.create, **params, **extra)
+            return session.url
+        except Exception as e:
+            # Never lose the link over the sale note.
+            logger.error("Checkout with Black Friday note failed, retrying without it: %s", e)
+    session = await asyncio.to_thread(stripe_lib.checkout.Session.create, **params)
     return session.url
 
 
