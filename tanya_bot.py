@@ -62,12 +62,14 @@ TIMED_ACCESS_DAYS = int(os.getenv("TIMED_ACCESS_DAYS", "60"))
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_TOPUP_PRICE_ID = os.getenv("STRIPE_TOPUP_PRICE_ID", "").strip()
 STRIPE_SUBSCRIPTION_PRICE_ID = os.getenv("STRIPE_SUBSCRIPTION_PRICE_ID", "").strip()
-# Black Friday sale. While BLACK_FRIDAY_CODE is set and it is before PROMO_END, price texts tell
-# clients to enter that Stripe promotion code at checkout ($21 -> $10/month for life). Checkout
-# itself is unchanged: clients type the code in Stripe's promo code box, so other codes keep working.
-# Clients whose free trial started before PROMO_END keep the offer for PROMO_GRACE_HOURS after it.
-# After that the texts revert to $21 on their own; unset BLACK_FRIDAY_CODE to end it early.
+# Black Friday sale. While BLACK_FRIDAY_CODE is set and it is before PROMO_END, the subscription
+# checkout link has the Black Friday coupon already applied ($21 -> $10/month for life, so Stripe
+# shows $10.00 up top) and price texts mention the sale. Clients whose free trial started before
+# PROMO_END keep the offer for PROMO_GRACE_HOURS after it. After that everything reverts to $21
+# on its own; unset BLACK_FRIDAY_CODE to end it early.
 BLACK_FRIDAY_CODE = os.getenv("BLACK_FRIDAY_CODE", "").strip()
+# The Stripe coupon behind the code (its ID is also BLACKFRIDAY unless overridden).
+BLACK_FRIDAY_COUPON_ID = os.getenv("BLACK_FRIDAY_COUPON_ID", BLACK_FRIDAY_CODE).strip()
 PROMO_END = datetime.datetime.fromisoformat(os.getenv("PROMO_END", "2026-12-01T23:59:59-05:00").strip())
 PROMO_GRACE_HOURS = float(os.getenv("PROMO_GRACE_HOURS", "48"))
 # Blooio iMessage API
@@ -140,8 +142,8 @@ FREE_TRIAL_90_WARNING = (
 )
 def _black_friday_offer() -> str:
     return (
-        "TanyaTalk is on sale for Black Friday. Use code " + BLACK_FRIDAY_CODE + " at checkout "
-        "to lock in $10 a month for life instead of $21, with 250 messages a month. "
+        "TanyaTalk is on sale for Black Friday. Lock in $10 a month for life instead of $21, "
+        "with 250 messages a month. "
     )
 
 
@@ -208,7 +210,7 @@ def pricing_inquiry_response(promo: bool) -> str:
     if promo:
         return (
             "You get 15 free messages to start. After that, TanyaTalk is normally $21/month, but for Black Friday "
-            "you can use code " + BLACK_FRIDAY_CODE + " at checkout to lock in $10/month for life. "
+            "you can lock in $10/month for life. "
             "That includes 250 messages a month, 24/7 access, "
             "and personal follow-up texts a couple days after your sessions. "
             "You can see everything included at tanya-talk.com."
@@ -273,9 +275,9 @@ async def promo_applies(phone: str) -> bool:
 
 
 async def checkout_code_reminder(phone: str) -> str:
-    """Line added to the checkout-link text during the sale so clients remember the code."""
+    """Line added to the checkout-link text during the sale."""
     if await promo_applies(phone):
-        return f" Don't forget to use code {BLACK_FRIDAY_CODE} at checkout for $10 a month for life."
+        return " Your Black Friday price is already applied, $10 a month for life."
     return ""
 
 FREE_TRIAL_STRIPE_DECLINED = (
@@ -2140,7 +2142,7 @@ def build_static_prompt(
     blend = coaching_teaching_blend_instruction()
     pricing_answer = (
         "You get 15 free messages to start. After that it's normally $21 a month, but for Black Friday "
-        "you can use code " + BLACK_FRIDAY_CODE + " at checkout to lock in $10 a month for life. "
+        "you can lock in $10 a month for life. The discount is applied automatically at checkout. "
         "That includes 250 messages, 24/7 access, and personal "
         "follow-up texts after your sessions. You can see everything at tanya-talk.com."
         if promo
@@ -4712,35 +4714,40 @@ async def create_topup_checkout_url(phone: str) -> str:
 async def create_subscription_checkout_url(phone: str) -> str:
     import stripe as stripe_lib
     stripe_lib.api_key = STRIPE_SECRET_KEY
-    extra = {}
-    if await promo_applies(phone):
-        # Shown right above the Subscribe button; disappears with the sale.
-        extra["custom_text"] = {
-            "submit": {
-                "message": (
-                    f"Black Friday: tap Add promotion code and enter {BLACK_FRIDAY_CODE} "
-                    "for $10/month for life."
-                )
-            }
-        }
+    def note(text: str) -> dict:
+        # Shown right above the Subscribe button.
+        return {"custom_text": {"submit": {"message": text}}}
+
     params = dict(
         line_items=[{"price": STRIPE_SUBSCRIPTION_PRICE_ID, "quantity": 1}],
         mode="subscription",
-        allow_promotion_codes=True,
         phone_number_collection={"enabled": True},
         name_collection={"individual": {"enabled": True}},
         metadata={"phone": phone, "product_type": "subscription"},
         success_url="https://stripe.com",
         cancel_url="https://stripe.com",
     )
-    if extra:
+    cancel_note = "Cancel anytime by texting 'cancel subscription.'"
+    attempts = []
+    if await promo_applies(phone) and BLACK_FRIDAY_COUPON_ID:
+        # Coupon pre-applied: Stripe shows $10.00 up top with the $11 discount line.
+        # (Stripe hides the promo code box when a discount is pre-applied.)
+        attempts.append({"discounts": [{"coupon": BLACK_FRIDAY_COUPON_ID}], **note(cancel_note)})
+        # Fallback if the coupon is rejected: let them type the code instead.
+        attempts.append({
+            "allow_promotion_codes": True,
+            **note(f"Black Friday: tap Add promotion code and enter {BLACK_FRIDAY_CODE} for $10/month for life."),
+        })
+    else:
+        attempts.append({"allow_promotion_codes": True, **note(cancel_note)})
+    for extra in attempts:
         try:
             session = await asyncio.to_thread(stripe_lib.checkout.Session.create, **params, **extra)
             return session.url
         except Exception as e:
-            # Never lose the link over the sale note.
-            logger.error("Checkout with Black Friday note failed, retrying without it: %s", e)
-    session = await asyncio.to_thread(stripe_lib.checkout.Session.create, **params)
+            # Never lose the link over the discount or the note.
+            logger.error("Subscription checkout attempt failed, trying a simpler link: %s", e)
+    session = await asyncio.to_thread(stripe_lib.checkout.Session.create, allow_promotion_codes=True, **params)
     return session.url
 
 
