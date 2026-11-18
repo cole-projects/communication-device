@@ -735,6 +735,56 @@ def _set_vault_author(vault: Path) -> None:
     subprocess.run(["git", "-C", str(vault), "config", "user.email", VAULT_GIT_EMAIL], capture_output=True, timeout=10)
 
 
+_vault_context_stale: bool = False
+
+
+def _git(vault: Path, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(vault), *args], capture_output=True, text=True, timeout=timeout)
+
+
+def _vault_pull_safely(vault: Path) -> bool:
+    """Commit local work, then pull GitHub changes. Never throws local work away.
+
+    On a real conflict the local state is saved to a backup/railway-<time> branch (pushed to GitHub
+    when possible) before the vault is reset to origin/main. If GitHub can't be reached, nothing is
+    reset. Returns True if new commits came in. Caller holds _VAULT_GIT_LOCK (or is startup).
+    """
+    if (vault / ".git" / "rebase-merge").exists() or (vault / ".git" / "rebase-apply").exists():
+        _git(vault, "rebase", "--abort", timeout=30)
+        logger.info("Aborted stuck rebase before pulling")
+
+    _git(vault, "add", "-A", timeout=30)
+    if _git(vault, "status", "--porcelain", timeout=10).stdout.strip():
+        commit = _git(vault, "commit", "-m", "Vault sync", timeout=30)
+        if commit.returncode != 0:
+            logger.error("git commit failed: %s", _redact(commit.stderr))
+
+    before = _git(vault, "rev-parse", "HEAD", timeout=10).stdout.strip()
+    pull = _git(vault, "pull", "--rebase", "--autostash")
+    if pull.returncode != 0:
+        logger.error("git pull --rebase failed: %s", _redact(pull.stderr))
+        _git(vault, "rebase", "--abort", timeout=30)
+        if _git(vault, "fetch", "origin").returncode != 0:
+            logger.warning("GitHub unreachable; keeping local vault as-is and retrying later")
+            return False
+        stamp = datetime.datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        branch = f"backup/railway-{stamp}"
+        _git(vault, "branch", branch, timeout=10)
+        pushed = _git(vault, "push", "origin", branch)
+        if pushed.returncode != 0:
+            logger.error("Could not push %s (kept locally): %s", branch, _redact(pushed.stderr))
+        _git(vault, "reset", "--hard", "origin/main", timeout=30)
+        logger.warning("Vault conflict: local work saved to %s, then reset to origin/main", branch)
+
+    after = _git(vault, "rev-parse", "HEAD", timeout=10).stdout.strip()
+    changed = bool(before) and before != after
+    if changed:
+        global _vault_context_stale
+        _vault_context_stale = True  # the pull loop reloads the always-loaded vault files
+        logger.info("Vault pulled new changes (%s -> %s)", before[:7], after[:7])
+    return changed
+
+
 def ensure_vault() -> None:
     """Clone the tanya-brain vault from GitHub using git so changes can be pushed back."""
     if not GITHUB_PAT:
@@ -749,27 +799,10 @@ def ensure_vault() -> None:
                        capture_output=True, timeout=10)
         _set_vault_author(vault)
         try:
-            # Abort any in-progress rebase left over from a previous failed pull
-            if (vault / ".git" / "rebase-merge").exists() or (vault / ".git" / "rebase-apply").exists():
-                subprocess.run(["git", "-C", str(vault), "rebase", "--abort"], capture_output=True, timeout=30)
-                logger.info("Aborted stuck rebase before pulling")
-
-            result = subprocess.run(
-                ["git", "-C", str(vault), "pull", "--rebase"],
-                capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode != 0:
-                logger.error("git pull --rebase failed: %s", _redact(result.stderr))
-                # Abort the failed rebase and hard-reset to origin/main so the vault is usable
-                subprocess.run(["git", "-C", str(vault), "rebase", "--abort"], capture_output=True, timeout=30)
-                subprocess.run(["git", "-C", str(vault), "fetch", "origin"], capture_output=True, timeout=60)
-                subprocess.run(
-                    ["git", "-C", str(vault), "reset", "--hard", "origin/main"],
-                    capture_output=True, timeout=30,
-                )
-                logger.info("Vault hard-reset to origin/main after rebase conflict")
-            else:
-                logger.info("Vault updated: %s", result.stdout.strip())
+            # Commits any client notes left over from before the restart, then pulls — never discards them.
+            _vault_pull_safely(vault)
+            if _vault_has_unpushed_work(vault):
+                mark_vault_dirty()  # the push loop sends leftover work to GitHub
         except Exception as e:
             logger.error("Failed to pull vault: %s", e)
         return
@@ -856,14 +889,8 @@ def _do_vault_push() -> bool:
             logger.info("No vault changes to push")
             return True
 
-        # Pull --rebase so Railway can merge any commits pushed from elsewhere
-        pull = subprocess.run(
-            ["git", "-C", str(vault), "pull", "--rebase"],
-            capture_output=True, text=True, timeout=60,
-        )
-        if pull.returncode != 0:
-            logger.error("git pull --rebase failed: %s", _redact(pull.stderr))
-            return False
+        # Merge in commits pushed from elsewhere (Obsidian) without ever discarding local work
+        _vault_pull_safely(vault)
 
         result = subprocess.run(
             ["git", "-C", str(vault), "push"],
@@ -896,6 +923,36 @@ async def _immediate_vault_push() -> None:
             _vault_dirty = False
     except Exception as e:
         logger.error("Immediate vault push failed: %s", e)
+
+
+VAULT_PULL_INTERVAL_SECONDS = int(os.getenv("VAULT_PULL_INTERVAL_SECONDS", "300"))
+
+
+async def _vault_pull_loop() -> None:
+    """Background loop: pull Obsidian edits from GitHub every 5 minutes and reload the core files."""
+    await asyncio.sleep(90)  # brief startup delay
+    while True:
+        await asyncio.sleep(VAULT_PULL_INTERVAL_SECONDS)
+        if not GITHUB_PAT:
+            continue
+        vault = Path(VAULT_PATH)
+        if not (vault / ".git").exists():
+            continue
+
+        def _pull_locked() -> None:
+            with _VAULT_GIT_LOCK:
+                _vault_pull_safely(vault)
+                if _vault_has_unpushed_work(vault):
+                    mark_vault_dirty()
+
+        try:
+            await asyncio.to_thread(_pull_locked)
+            global _vault_context_stale
+            if _vault_context_stale:
+                _vault_context_stale = False
+                _reload_vault_context()
+        except Exception as e:
+            logger.error("Vault pull loop error: %s", e)
 
 
 async def _vault_push_loop() -> None:
@@ -2136,6 +2193,19 @@ logger.info("Core context loaded (%d chars)", len(CORE_CONTEXT))
 BECOMING_YOU_FRAMEWORK = load_file(Path(VAULT_PATH) / "01-Frameworks" / "BecomingYou.md")
 if BECOMING_YOU_FRAMEWORK:
     logger.info("BecomingYou framework loaded (%d chars)", len(BECOMING_YOU_FRAMEWORK))
+
+
+def _reload_vault_context() -> None:
+    """Re-read the always-loaded vault files after a pull so Obsidian edits go live without a restart."""
+    global CORE_CONTEXT, BECOMING_YOU_FRAMEWORK
+    core = load_core_context()
+    if core:  # keep the old copy if the files are briefly missing mid-pull
+        CORE_CONTEXT = core
+    framework = load_file(Path(VAULT_PATH) / "01-Frameworks" / "BecomingYou.md")
+    if framework:
+        BECOMING_YOU_FRAMEWORK = framework
+    logger.info("Vault context reloaded after pull (core %d chars, BecomingYou %d chars)",
+                len(CORE_CONTEXT), len(BECOMING_YOU_FRAMEWORK or ""))
 
 
 def build_static_prompt(
@@ -5334,6 +5404,7 @@ async def _startup() -> None:
     await _process_pending_finalizes()
     asyncio.ensure_future(_blooio_failure_poll_loop())
     asyncio.ensure_future(_vault_push_loop())
+    asyncio.ensure_future(_vault_pull_loop())
     asyncio.ensure_future(_audio_cleanup_loop())
     await asyncio.to_thread(_cleanup_stale_audio_files)
     logger.info("Tanya Talk iMessage server started")
