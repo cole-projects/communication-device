@@ -725,6 +725,16 @@ _VAULT_GIT_LOCK = threading.Lock()
 _VAULT_INDEX_LOCK = asyncio.Lock()
 
 
+VAULT_GIT_NAME = os.getenv("VAULT_GIT_NAME", "cole-projects")
+VAULT_GIT_EMAIL = os.getenv("VAULT_GIT_EMAIL", "228111052+cole-projects@users.noreply.github.com")
+
+
+def _set_vault_author(vault: Path) -> None:
+    """Vault commits are authored as cole-projects (GitHub noreply email)."""
+    subprocess.run(["git", "-C", str(vault), "config", "user.name", VAULT_GIT_NAME], capture_output=True, timeout=10)
+    subprocess.run(["git", "-C", str(vault), "config", "user.email", VAULT_GIT_EMAIL], capture_output=True, timeout=10)
+
+
 def ensure_vault() -> None:
     """Clone the tanya-brain vault from GitHub using git so changes can be pushed back."""
     if not GITHUB_PAT:
@@ -737,6 +747,7 @@ def ensure_vault() -> None:
         # The clone stores the token in its remote URL; refresh it so a rotated GITHUB_PAT takes effect.
         subprocess.run(["git", "-C", str(vault), "remote", "set-url", "origin", repo_url],
                        capture_output=True, timeout=10)
+        _set_vault_author(vault)
         try:
             # Abort any in-progress rebase left over from a previous failed pull
             if (vault / ".git" / "rebase-merge").exists() or (vault / ".git" / "rebase-apply").exists():
@@ -775,8 +786,7 @@ def ensure_vault() -> None:
         if result.returncode != 0:
             logger.error("git clone failed: %s", _redact(result.stderr))
             return
-        subprocess.run(["git", "-C", str(vault), "config", "user.email", "tanyabot@railway.app"], capture_output=True)
-        subprocess.run(["git", "-C", str(vault), "config", "user.name", "TanyaBot"], capture_output=True)
+        _set_vault_author(vault)
         logger.info("Vault cloned to %s", vault)
     except Exception as e:
         logger.error("Failed to clone vault: %s", e)
