@@ -44,6 +44,15 @@ VAULT_PATH = os.getenv(
     str(Path(__file__).resolve().parent.parent / "tanya_brain"),
 )
 GITHUB_PAT = os.getenv("GITHUB_PAT", "").strip()
+os.environ["GIT_TERMINAL_PROMPT"] = "0"  # never wait on a password prompt; fail fast instead
+
+
+def _redact(text: str) -> str:
+    """Strip GitHub tokens out of git output before it reaches the logs."""
+    out = text or ""
+    if GITHUB_PAT:
+        out = out.replace(GITHUB_PAT, "***")
+    return re.sub(r"(gh[pousr]_|github_pat_)[A-Za-z0-9_]+", r"\1***", out)
 GITHUB_VAULT_REPO = os.getenv("GITHUB_VAULT_REPO", "https://github.com/cole-projects/tanya-brain.git")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_HAIKU_MODEL = os.getenv("CLAUDE_HAIKU_MODEL", "claude-haiku-4-5-20251001")
@@ -725,6 +734,9 @@ def ensure_vault() -> None:
 
     if vault.exists() and (vault / ".git").exists():
         logger.info("Vault exists, pulling latest...")
+        # The clone stores the token in its remote URL; refresh it so a rotated GITHUB_PAT takes effect.
+        subprocess.run(["git", "-C", str(vault), "remote", "set-url", "origin", repo_url],
+                       capture_output=True, timeout=10)
         try:
             # Abort any in-progress rebase left over from a previous failed pull
             if (vault / ".git" / "rebase-merge").exists() or (vault / ".git" / "rebase-apply").exists():
@@ -736,7 +748,7 @@ def ensure_vault() -> None:
                 capture_output=True, text=True, timeout=60,
             )
             if result.returncode != 0:
-                logger.error("git pull --rebase failed: %s", result.stderr)
+                logger.error("git pull --rebase failed: %s", _redact(result.stderr))
                 # Abort the failed rebase and hard-reset to origin/main so the vault is usable
                 subprocess.run(["git", "-C", str(vault), "rebase", "--abort"], capture_output=True, timeout=30)
                 subprocess.run(["git", "-C", str(vault), "fetch", "origin"], capture_output=True, timeout=60)
@@ -761,7 +773,7 @@ def ensure_vault() -> None:
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:
-            logger.error("git clone failed: %s", result.stderr)
+            logger.error("git clone failed: %s", _redact(result.stderr))
             return
         subprocess.run(["git", "-C", str(vault), "config", "user.email", "tanyabot@railway.app"], capture_output=True)
         subprocess.run(["git", "-C", str(vault), "config", "user.name", "TanyaBot"], capture_output=True)
@@ -816,7 +828,7 @@ def _do_vault_push() -> bool:
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:
-                logger.error("git commit failed: %s", result.stderr)
+                logger.error("git commit failed: %s", _redact(result.stderr))
                 return False
 
         # Check for committed-but-unpushed work (e.g. push was rejected previously)
@@ -840,7 +852,7 @@ def _do_vault_push() -> bool:
             capture_output=True, text=True, timeout=60,
         )
         if pull.returncode != 0:
-            logger.error("git pull --rebase failed: %s", pull.stderr)
+            logger.error("git pull --rebase failed: %s", _redact(pull.stderr))
             return False
 
         result = subprocess.run(
@@ -848,7 +860,7 @@ def _do_vault_push() -> bool:
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode != 0:
-            logger.error("git push failed: %s", result.stderr)
+            logger.error("git push failed: %s", _redact(result.stderr))
             return False
         logger.info("Vault pushed successfully")
         return True
